@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bats:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats
+
+      - name: Install bats (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bats-core
+
+      - name: Configure test git identity
+        run: |
+          git config --global user.email "ci@test.invalid"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Run tests
+        run: make test JOBS=4

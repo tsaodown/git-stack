@@ -1,0 +1,1959 @@
+#!/usr/bin/env bash
+# git-stack — reflow a stack of branches sharing a numeric-leaf prefix.
+# See `git stack help` for usage. Bash 3.2 compatible (parallel arrays).
+
+set -euo pipefail
+
+PROG="${0##*/}"
+VERBOSE=0
+QUIET=0
+USE_COLOR_PREF="auto"   # auto | always | never; resolved by color_init.
+
+OPT_PUSH=0
+OPT_FORCE=0
+OPT_FROM=""
+OPT_ONTO=""
+OPT_PREFIX=""
+REMAINING_ARGS=()
+
+# ---------- color ----------
+
+# Color palette. Initialized empty; color_init populates if appropriate.
+C_RESET=""; C_BOLD=""; C_DIM=""
+C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+
+color_init() {
+  local on=0
+  case "$USE_COLOR_PREF" in
+    always) on=1 ;;
+    never)  on=0 ;;
+    *)
+      if [[ -n "${NO_COLOR-}" ]]; then on=0
+      elif [[ -t 1 ]]; then on=1
+      else on=0
+      fi
+      ;;
+  esac
+  if (( on )); then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
+    C_CYAN=$'\033[36m'
+  fi
+}
+
+# Stack state. Saved/loaded as bash-sourceable file. STACK_BRANCHES and
+# STACK_ORIG_SHAS are parallel arrays (index N is the same branch in both).
+#
+# Globals contract — adding a field requires updating all three of:
+#   (a) the declaration below
+#   (b) save_state's serialization block
+#   (c) load_state's reset list (arrays only; scalars are overwritten by
+#       sourcing the file, but reset arrays in case a stale process left
+#       them populated and the file's assignment doesn't fully clear)
+#
+#   STACK_VERSION          schema version of the saved state
+#   STACK_STARTED_AT       unix ts when the run began
+#   STACK_STARTING_BRANCH  branch HEAD was on when the run began
+#   STACK_PREFIX           stack prefix, including trailing /
+#   STACK_PUSH             1 if --push, else 0
+#   STACK_FORCE            1 if --force (allow multi-commit branches), else 0
+#   STACK_FROM_IDX         index of the bottom branch we touch
+#   STACK_CURSOR           index of the next branch to process
+#   STACK_ONTO             resolved SHA of --onto target (if any)
+#   STACK_ONTO_REF         original --onto ref name (for display)
+#   STACK_BRANCHES         full branch names in stack order
+#   STACK_ORIG_SHAS        original tip SHAs at run start
+#   STACK_PUSH_FAILURES    branches whose push failed during this run
+#                          (transient — not historical)
+STACK_VERSION=1
+STACK_STARTED_AT=""
+STACK_STARTING_BRANCH=""
+STACK_PREFIX=""
+STACK_PUSH=0
+STACK_FORCE=0
+STACK_FROM_IDX=0
+STACK_CURSOR=0
+STACK_ONTO=""
+STACK_ONTO_REF=""
+STACK_BRANCHES=()
+STACK_ORIG_SHAS=()
+STACK_PUSH_FAILURES=()
+
+# ---------- helpers ----------
+
+die()   { printf '%s%s: error:%s %s\n' "$C_RED" "$PROG" "$C_RESET" "$*" >&2; exit 1; }
+warn()  { printf '%s%s: warn:%s %s\n' "$C_YELLOW" "$PROG" "$C_RESET" "$*" >&2; }
+log()   { (( QUIET )) || echo "$@"; }
+log_v() { (( VERBOSE )) && echo "$@" || :; }
+
+require_in_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+}
+
+require_clean_tree() {
+  if [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+    die "working tree has uncommitted changes; commit or stash first"
+  fi
+}
+
+require_no_op_in_progress() {
+  local gitdir marker
+  gitdir=$(git rev-parse --git-dir)
+  for marker in CHERRY_PICK_HEAD MERGE_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    if [[ -e "$gitdir/$marker" ]]; then
+      die "another git operation is in progress ($marker); resolve it first"
+    fi
+  done
+}
+
+current_branch() {
+  local b
+  b=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
+  [[ -n "$b" ]] || return 1
+  printf '%s\n' "$b"
+}
+
+# Resolve the current branch or die. Use this from non-subshell call sites so
+# the die actually terminates the script.
+require_branch() {
+  local b
+  b=$(current_branch) || die "detached HEAD; checkout a stack branch first"
+  printf '%s\n' "$b"
+}
+
+# Print current branch name or the literal "<detached>" sentinel; never
+# errors. Display-only — use require_branch when detached HEAD should die.
+_current_or_detached() {
+  current_branch || echo "<detached>"
+}
+
+state_file() {
+  printf '%s/stack-rebase-state\n' "$(git rev-parse --git-dir)"
+}
+
+# Resolve the stack prefix without dying.
+# Order: explicit arg, git config stack.prefix, auto-derive from current branch.
+# Exit codes: 0 success; 1 detached HEAD; 2 current branch has no numeric leaf.
+_try_detect_prefix() {
+  local override="${1-}"
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "${override%/}/"
+    return 0
+  fi
+  local cfg
+  cfg=$(git config --get stack.prefix 2>/dev/null || true)
+  if [[ -n "$cfg" ]]; then
+    printf '%s\n' "${cfg%/}/"
+    return 0
+  fi
+  local b leaf prefix
+  b=$(current_branch) || return 1
+  leaf="${b##*/}"
+  [[ "$leaf" =~ ^[0-9]+(\.[0-9]+)?- ]] || return 2
+  if [[ "$b" == */* ]]; then
+    prefix="${b%/*}/"
+  else
+    prefix=""
+  fi
+  printf '%s\n' "$prefix"
+}
+
+# Resolve the stack prefix or die with an explanation.
+detect_prefix() {
+  local p rc=0
+  p=$(_try_detect_prefix "${1-}") || rc=$?
+  case "$rc" in
+    0) printf '%s\n' "$p" ;;
+    1) die "detached HEAD; checkout a stack branch first or pass --prefix" ;;
+    2) local b; b=$(current_branch || echo "?")
+       die "current branch '$b' has no numeric leaf (e.g. 05-...); pass --prefix or set git config stack.prefix" ;;
+    *) die "could not detect stack prefix" ;;
+  esac
+}
+
+# Print branches under the prefix whose leaf matches ^[0-9]+(\.[0-9]+)?-,
+# sorted by sort -V on the numeric portion. One branch per line.
+stack_branches() {
+  local prefix="$1"
+  local pattern="refs/heads/${prefix}*"
+  git for-each-ref --format='%(refname:short)' "$pattern" \
+    | awk -F/ '
+        {
+          leaf = $NF
+          if (match(leaf, /^[0-9]+(\.[0-9]+)?-/)) {
+            key = substr(leaf, 1, RLENGTH - 1)
+            print key "\t" $0
+          }
+        }
+      ' \
+    | sort -V \
+    | cut -f2-
+}
+
+# Populate a named array with the stack branches under <prefix>.
+# Dies with <error_msg> if the resulting list is empty (pass empty string
+# or omit to skip the check).
+# Usage: _load_stack_branches <prefix> <out_array_name> [<error_msg>]
+_load_stack_branches() {
+  local prefix="$1" out_name="$2" err="${3-}"
+  local b list=()
+  while IFS= read -r b; do
+    [[ -n "$b" ]] && list+=("$b")
+  done < <(stack_branches "$prefix")
+  if [[ -n "$err" ]] && (( ${#list[@]} == 0 )); then
+    die "$err"
+  fi
+  # bash 3.2 + set -u: cannot expand "${list[@]}" when empty. Init empty,
+  # then append element-by-element. Mirrors the eval pattern in _emit_array.
+  eval "$out_name=()"
+  local i
+  for ((i = 0; i < ${#list[@]}; i++)); do
+    eval "$out_name+=($(printf '%q' "${list[$i]}"))"
+  done
+}
+
+# Print distinct prefixes (each ending in "/", or "" for top-level) of every
+# local branch whose leaf matches ^[0-9]+(\.[0-9]+)?-. Used by interactive
+# checkout to let the user pick a stack when current branch has no prefix.
+stack_prefixes() {
+  git for-each-ref --format='%(refname:short)' refs/heads/ \
+    | awk -F/ '
+        {
+          leaf = $NF
+          if (match(leaf, /^[0-9]+(\.[0-9]+)?-/)) {
+            n = length($0) - length(leaf)
+            print substr($0, 1, n)
+          }
+        }
+      ' \
+    | sort -u
+}
+
+# branch_index <name> <branch...> — print 0-based index, or fail with exit 1.
+branch_index() {
+  local target="$1"; shift
+  local i=0 b
+  for b in "$@"; do
+    if [[ "$b" == "$target" ]]; then
+      printf '%d\n' "$i"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# orig_sha_for <branch> — print the saved original SHA for the branch.
+orig_sha_for() {
+  local target="$1"
+  local i
+  for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
+    if [[ "${STACK_BRANCHES[$i]}" == "$target" ]]; then
+      printf '%s\n' "${STACK_ORIG_SHAS[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Parse common flags into OPT_* and leave non-flag args in REMAINING_ARGS.
+parse_common_flags() {
+  OPT_PUSH=0
+  OPT_FORCE=0
+  OPT_FROM=""
+  OPT_ONTO=""
+  OPT_PREFIX=""
+  REMAINING_ARGS=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --push)       OPT_PUSH=1; shift ;;
+      --force)      OPT_FORCE=1; shift ;;
+      --from)       shift; [[ $# -gt 0 ]] || die "--from needs an argument"; OPT_FROM="$1"; shift ;;
+      --onto)       shift; [[ $# -gt 0 ]] || die "--onto needs an argument"; OPT_ONTO="$1"; shift ;;
+      --prefix)     shift; [[ $# -gt 0 ]] || die "--prefix needs an argument"; OPT_PREFIX="$1"; shift ;;
+      --color)      USE_COLOR_PREF="always"; color_init; shift ;;
+      --no-color)   USE_COLOR_PREF="never";  color_init; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
+      -q|--quiet)   QUIET=1; shift ;;
+      --) shift; REMAINING_ARGS=("$@"); return ;;
+      -*) die "unknown flag: $1" ;;
+      *)  REMAINING_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+# Consume one common flag from the start of "$@". Sets the matching global
+# (OPT_PREFIX, USE_COLOR_PREF, VERBOSE, QUIET) and writes the consumed-arg
+# count to $_FLAG_SHIFT. Returns 0 if a flag was consumed, 1 if not.
+# Per-command parse loops call this first, then fall through to their own
+# command-specific cases.
+_FLAG_SHIFT=0
+_consume_common_flag() {
+  _FLAG_SHIFT=0
+  case "$1" in
+    --prefix)     [[ -n "${2-}" ]] || die "--prefix needs an argument"; OPT_PREFIX="$2"; _FLAG_SHIFT=2 ;;
+    --color)      USE_COLOR_PREF="always"; color_init; _FLAG_SHIFT=1 ;;
+    --no-color)   USE_COLOR_PREF="never";  color_init; _FLAG_SHIFT=1 ;;
+    -v|--verbose) VERBOSE=1; _FLAG_SHIFT=1 ;;
+    -q|--quiet)   QUIET=1; _FLAG_SHIFT=1 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# ---------- state file ----------
+
+_emit_array() {
+  # Print "name=( q1 q2 ... )" for an array passed by name. Empty-array safe
+  # under bash 3.2 + set -u.
+  local arr_name="$1" out_name="$2"
+  printf '%s=(' "$out_name"
+  local n
+  eval "n=\${#${arr_name}[@]}"
+  if (( n > 0 )); then
+    local i v
+    for ((i = 0; i < n; i++)); do
+      eval "v=\${${arr_name}[$i]}"
+      printf ' %q' "$v"
+    done
+  fi
+  printf ' )\n'
+}
+
+save_state() {
+  local out
+  out=$(state_file)
+  {
+    echo "STACK_VERSION=1"
+    printf 'STACK_STARTED_AT=%q\n'         "$STACK_STARTED_AT"
+    printf 'STACK_STARTING_BRANCH=%q\n'    "$STACK_STARTING_BRANCH"
+    printf 'STACK_PREFIX=%q\n'             "$STACK_PREFIX"
+    printf 'STACK_PUSH=%d\n'               "$STACK_PUSH"
+    printf 'STACK_FORCE=%d\n'              "$STACK_FORCE"
+    printf 'STACK_ONTO=%q\n'               "$STACK_ONTO"
+    printf 'STACK_ONTO_REF=%q\n'           "$STACK_ONTO_REF"
+    printf 'STACK_FROM_IDX=%d\n'           "$STACK_FROM_IDX"
+    printf 'STACK_CURSOR=%d\n'             "$STACK_CURSOR"
+    _emit_array STACK_BRANCHES STACK_BRANCHES
+    _emit_array STACK_ORIG_SHAS STACK_ORIG_SHAS
+    _emit_array STACK_PUSH_FAILURES STACK_PUSH_FAILURES
+  } > "$out"
+}
+
+load_state() {
+  local f
+  f=$(state_file)
+  [[ -f "$f" ]] || die "no stack-rebase in progress (missing $f)"
+  STACK_ONTO=""
+  STACK_ONTO_REF=""
+  STACK_BRANCHES=()
+  STACK_ORIG_SHAS=()
+  STACK_PUSH_FAILURES=()
+  # shellcheck disable=SC1090
+  source "$f"
+  [[ "${STACK_VERSION-}" == "1" ]] || die "incompatible state file version: ${STACK_VERSION-?}"
+}
+
+clear_state() {
+  rm -f -- "$(state_file)"
+}
+
+require_no_state_file() {
+  local f
+  f=$(state_file)
+  [[ -f "$f" ]] && die "stack-rebase in progress ($f); resume with 'git stack continue' or 'git stack abort' first"
+  return 0
+}
+
+# Refuse if branch is checked out in a worktree other than the current one.
+require_branch_not_in_worktree() {
+  local b="$1"
+  local current_top in_path cur_branch
+  current_top=$(git rev-parse --show-toplevel)
+  in_path=""
+  cur_branch=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) in_path="${line#worktree }"; cur_branch="" ;;
+      "branch "*)
+        cur_branch="${line#branch }"
+        if [[ "$cur_branch" == "refs/heads/$b" ]] && [[ "$in_path" != "$current_top" ]]; then
+          die "branch '$b' is checked out in another worktree: $in_path"
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+}
+
+# ---------- snapshot history ----------
+
+# Write one ref per branch under refs/stack-backup/<prefix>/<unix-ts>-<action>-<pid>/<leaf>.
+# Emits a single batch via `git update-ref --stdin` (atomic by default).
+#
+# Usage: snapshot_stack <action> <prefix> <branch>...
+snapshot_stack() {
+  local action="$1" prefix="$2"
+  shift 2
+  local prefix_path="${prefix%/}"
+  [[ -n "$prefix_path" ]] || return 0
+  (( $# > 0 )) || return 0
+  local ts run_id stdin n=$#
+  ts=$(date +%s)
+  run_id="${ts}-${action}-$$"
+  stdin=""
+  local b sha leaf
+  for b in "$@"; do
+    sha=$(git rev-parse --verify --quiet "refs/heads/$b") || continue
+    leaf="${b##*/}"
+    stdin+="create refs/stack-backup/${prefix_path}/${run_id}/${leaf} ${sha}"$'\n'
+  done
+  [[ -n "$stdin" ]] || return 0
+  if printf '%s' "$stdin" | git update-ref --stdin -m "git-stack ${action}" 2>/dev/null; then
+    log_v "snapshot ${run_id} (${n} branches)"
+  else
+    warn "snapshot_stack: failed to write backup refs"
+    return 0
+  fi
+  prune_old_snapshots "$prefix_path"
+}
+
+# Drop snapshots older than the most recent N for <prefix>. N comes from
+# `git config stack.historyKeep` (default 100). Pass 0 to disable.
+prune_old_snapshots() {
+  local prefix_path="${1%/}"
+  local keep
+  keep=$(git config --get stack.historyKeep 2>/dev/null || echo "")
+  [[ -z "$keep" ]] && keep=100
+  [[ "$keep" =~ ^[0-9]+$ ]] || { warn "stack.historyKeep '$keep' is not a non-negative integer; skipping prune"; return 0; }
+  (( keep > 0 )) || return 0
+
+  local victims=() count=0
+  while IFS=$'\t' read -r ts action run_id branch_count; do
+    [[ -z "$run_id" ]] && continue
+    if (( count >= keep )); then
+      victims+=("$run_id")
+    fi
+    count=$((count + 1))
+  done < <(list_snapshots "$prefix_path")
+  (( ${#victims[@]} > 0 )) || return 0
+
+  local v refname sha stdin=""
+  for v in "${victims[@]}"; do
+    while IFS=' ' read -r refname sha; do
+      [[ -z "$refname" ]] && continue
+      stdin+="delete ${refname} ${sha}"$'\n'
+    done < <(git for-each-ref --format='%(refname) %(objectname)' "refs/stack-backup/${prefix_path}/${v}/")
+  done
+  [[ -n "$stdin" ]] || return 0
+  if printf '%s' "$stdin" | git update-ref --stdin -m "git-stack auto-prune" 2>/dev/null; then
+    log_v "auto-pruned ${#victims[@]} snapshot(s) beyond keep=${keep}"
+  fi
+}
+
+# Print "ts<TAB>action<TAB>run-id<TAB>count" for each snapshot under <prefix>,
+# newest first. Run-id is the segment between prefix and leaf.
+list_snapshots() {
+  local prefix_path="${1%/}"
+  local strip="refs/stack-backup/${prefix_path}/"
+  git for-each-ref --format='%(refname)' "$strip" 2>/dev/null \
+    | awk -v strip="$strip" '
+        {
+          if (index($0, strip) == 1) {
+            rest = substr($0, length(strip) + 1)
+            n = split(rest, parts, "/")
+            run_id = parts[1]
+            count[run_id]++
+          }
+        }
+        END {
+          for (r in count) {
+            split(r, p, "-")
+            printf "%s\t%s\t%s\t%d\n", p[1], p[2], r, count[r]
+          }
+        }
+      ' \
+    | sort -rn
+}
+
+# Emit "leaf<TAB>sha" for each branch in <prefix>/<run-id> snapshot.
+snapshot_branches_for() {
+  local prefix_path="${1%/}"
+  local run_id="$2"
+  local strip="refs/stack-backup/${prefix_path}/${run_id}/"
+  git for-each-ref --format='%(refname) %(objectname)' "$strip" 2>/dev/null \
+    | awk -v strip="$strip" '
+        {
+          if (index($1, strip) == 1) {
+            leaf = substr($1, length(strip) + 1)
+            printf "%s\t%s\n", leaf, $2
+          }
+        }
+      '
+}
+
+# Resolve user-supplied id (full, action-tagged, bare ts, or @N) to canonical
+# run-id, or die if missing/ambiguous.
+parse_run_id() {
+  local prefix_path="${1%/}"
+  local input="$2"
+  local all=()
+  while IFS=$'\t' read -r ts action run_id count; do
+    [[ -n "$run_id" ]] && all+=("$run_id")
+  done < <(list_snapshots "$prefix_path")
+
+  if [[ "$input" =~ ^@([0-9]+)$ ]]; then
+    local n="${BASH_REMATCH[1]}"
+    (( n < ${#all[@]} )) || die "no snapshot @${n} (have ${#all[@]} snapshot(s))"
+    printf '%s\n' "${all[$n]}"
+    return 0
+  fi
+
+  local r matches=()
+  for r in "${all[@]}"; do
+    if [[ "$r" == "$input" ]] || [[ "$r" == "${input}-"* ]]; then
+      matches+=("$r")
+    fi
+  done
+  case "${#matches[@]}" in
+    0) die "no snapshot matching '${input}' (try 'git stack history')" ;;
+    1) printf '%s\n' "${matches[0]}" ;;
+    *) local m str="" ; for m in "${matches[@]}"; do str="${str:+${str}, }$m"; done
+       die "ambiguous '${input}' matches: $str" ;;
+  esac
+}
+
+# ---------- rename ----------
+
+# Build an atomic `git update-ref --stdin` script that renames every
+# refs/heads/<old>/<leaf> to refs/heads/<new>/<leaf>, optionally also moving
+# refs/stack-backup/<old>/... to refs/stack-backup/<new>/.... Does NOT touch
+# HEAD — caller updates HEAD's symref via `git symbolic-ref` before running
+# this batch (so the to-be-deleted old branch is no longer HEAD's target).
+emit_rename_batch() {
+  local old_pfx="${1%/}"
+  local new_pfx="${2%/}"
+  local move_history="${3:-1}"
+
+  local refname sha leaf
+  while IFS=' ' read -r refname sha; do
+    [[ -z "$refname" ]] && continue
+    leaf="${refname#refs/heads/${old_pfx}/}"
+    printf 'create refs/heads/%s/%s %s\n' "$new_pfx" "$leaf" "$sha"
+    printf 'delete %s %s\n' "$refname" "$sha"
+  done < <(git for-each-ref --format='%(refname) %(objectname)' "refs/heads/${old_pfx}/")
+
+  if (( move_history )); then
+    local rest
+    while IFS=' ' read -r refname sha; do
+      [[ -z "$refname" ]] && continue
+      rest="${refname#refs/stack-backup/${old_pfx}/}"
+      printf 'create refs/stack-backup/%s/%s %s\n' "$new_pfx" "$rest" "$sha"
+      printf 'delete %s %s\n' "$refname" "$sha"
+    done < <(git for-each-ref --format='%(refname) %(objectname)' "refs/stack-backup/${old_pfx}/")
+  fi
+}
+
+# ---------- core ----------
+
+# Reflow the branch at index $1.
+# Return 0 on success, 2 on cherry-pick conflict.
+do_one_step() {
+  local cursor=$1
+  local B="${STACK_BRANCHES[$cursor]}"
+  local prev_new prev_label prev_ref B_orig
+  if (( cursor == STACK_FROM_IDX )) && [[ -n "$STACK_ONTO" ]]; then
+    prev_new="$STACK_ONTO"
+    prev_label="${STACK_ONTO_REF:-$STACK_ONTO}"
+    prev_ref="$STACK_ONTO"
+  else
+    local P="${STACK_BRANCHES[$((cursor - 1))]}"
+    prev_new=$(git rev-parse "refs/heads/$P")
+    prev_label="$P"
+    prev_ref="refs/heads/$P"
+  fi
+  B_orig=$(orig_sha_for "$B") || die "no orig SHA recorded for $B"
+
+  # Multi-commit guard. The cherry-pick below replays only B_orig (the tip),
+  # so a branch with multiple commits relative to its predecessor would
+  # silently lose all but the tip. We compare reachable-commit counts (not
+  # `prev..B`) because plain two-dot ranges inflate when the predecessor
+  # has been amended — old commits still in B's history but no longer in
+  # the predecessor's would falsely register as "extra B commits". The
+  # count-diff is correct for the standard linear-stack shape; multi-DAG
+  # histories can yield surprising diffs but are out of scope for this
+  # tool's single-commit-per-branch model. Refuse unless --force.
+  local count_prev count_b n_commits
+  count_prev=$(git rev-list --count "$prev_ref" 2>/dev/null || echo 0)
+  count_b=$(git rev-list --count "$B_orig" 2>/dev/null || echo 0)
+  n_commits=$((count_b - count_prev))
+  if (( n_commits > 1 )) && (( ! STACK_FORCE )); then
+    die "branch '$B' has $n_commits commits beyond its predecessor; restack would drop all but the tip. Pass --force to proceed (cherry-picks tip only) or rebase the branch manually first."
+  fi
+
+  # Skip when B's tip already equals the new predecessor head — nothing to
+  # cherry-pick. Sound under the single-commit assumption enforced above
+  # (or knowingly waived via --force).
+  if [[ "$B_orig" == "$prev_new" ]]; then
+    log "${C_DIM}skip${C_RESET} ${C_CYAN}$B${C_RESET} (already equals ${C_CYAN}$prev_label${C_RESET})"
+    return 0
+  fi
+
+  log "${C_GREEN}restack${C_RESET} ${C_CYAN}$B${C_RESET} ${C_DIM}onto${C_RESET} ${C_CYAN}$prev_label${C_RESET}"
+  git checkout --quiet "$B"
+  git reset --hard --quiet "$prev_new"
+  if ! git cherry-pick "$B_orig"; then
+    return 2
+  fi
+  return 0
+}
+
+push_branch() {
+  local b="$1" sha short rt err
+  sha=$(git rev-parse --short "refs/heads/$b")
+  short="$sha"
+  log "${C_BLUE}push${C_RESET}    ${C_CYAN}$b${C_RESET} ${C_DIM}($short, --force-with-lease)${C_RESET}"
+  err=$(git push --force-with-lease -u origin "refs/heads/$b:refs/heads/$b" 2>&1) && {
+    log_v "$err"
+    return 0
+  }
+  printf '%s' "$err" >&2
+  warn "push failed for $b"
+  rt=$(git rev-parse --short --quiet "refs/remotes/origin/$b" 2>/dev/null || echo "<not tracked>")
+  printf '          %slocal:%s           %s\n'        "$C_DIM" "$C_RESET" "$short" >&2
+  printf '          %sremote-tracking:%s %s%s\n'      "$C_DIM" "$C_RESET" "$rt" \
+    "$([ "$rt" = "<not tracked>" ] && echo " (run 'git fetch origin $b')" || echo "")" >&2
+  printf '          %shint:%s            git fetch origin %s   # refresh, then retry\n' \
+    "$C_DIM" "$C_RESET" "$b" >&2
+  printf '          %s                 %s git push --force origin %s   # bypass lease\n' \
+    "$C_DIM" "$C_RESET" "$b" >&2
+  STACK_PUSH_FAILURES+=("$b")
+  return 1
+}
+
+# Driven by state-file globals. Saves state on every iteration boundary so
+# `continue` and `abort` can pick up.
+run_reflow_loop() {
+  local cursor=$STACK_CURSOR
+  local last=$((${#STACK_BRANCHES[@]} - 1))
+  while (( cursor <= last )); do
+    STACK_CURSOR=$cursor
+    save_state
+    local rc=0
+    do_one_step "$cursor" || rc=$?
+    if (( rc == 2 )); then
+      printf '\n%s%s: conflict%s on %s%s%s\n\n' \
+        "$C_RED" "$PROG" "$C_RESET" \
+        "$C_CYAN" "${STACK_BRANCHES[$cursor]}" "$C_RESET" >&2
+      printf '  resolve + resume: %sgit stack continue%s\n' "$C_BOLD" "$C_RESET" >&2
+      printf '  give up:          %sgit stack abort%s\n'    "$C_BOLD" "$C_RESET" >&2
+      exit 2
+    fi
+    if (( STACK_PUSH )); then
+      push_branch "${STACK_BRANCHES[$cursor]}" || true
+    fi
+    cursor=$((cursor + 1))
+  done
+
+  STACK_CURSOR=$cursor
+  save_state
+
+  if [[ -n "$STACK_STARTING_BRANCH" ]] && \
+     git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
+    git checkout --quiet "$STACK_STARTING_BRANCH"
+  fi
+
+  local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
+  if (( ${#STACK_PUSH_FAILURES[@]} > 0 )); then
+    local b_str=""
+    local b
+    for b in "${STACK_PUSH_FAILURES[@]}"; do b_str="${b_str:+$b_str }$b"; done
+    warn "force-with-lease push failed for: $b_str"
+    warn "rerun manually with: git push --force-with-lease origin <branch>"
+    clear_state
+    exit 3
+  fi
+  log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
+  clear_state
+}
+
+# ---------- subcommands ----------
+
+cmd_help() {
+  # Aliases for brevity in the heredoc.
+  local b="$C_BOLD" d="$C_DIM" cy="$C_CYAN" r="$C_RESET"
+  local sub="${b}${cy}"   # subcommand keyword: bold cyan
+  local fl="${cy}"        # flag name: cyan
+  cat <<EOF
+${b}usage:${r} git stack <subcommand> [options]
+
+${b}Subcommands:${r}
+  ${sub}list${r} [${fl}--no-fetch${r}]                  List branches in the current stack with tip
+                                    SHA, subject, upstream sync state
+                                    (\`[synced]\`, \`[+ahead/-behind]\`,
+                                    \`[gone]\`, or \`[unpushed]\`),
+                                    and a \`*\` on current branch.
+                                    Also prints a header with the parent
+                                    branch and how many commits the stack is
+                                    behind it. Runs \`git fetch --all --prune\`
+                                    by default so counts reflect the latest
+                                    remotes; pass ${fl}--no-fetch${r} to skip
+                                    (e.g. when offline).
+  ${sub}checkout${r} [<number>]               Check out the stack branch whose leaf starts
+                                    with that number (numeric match, so \`5\`
+                                    finds \`05-foo\`, \`6.5\` finds \`06.5-baz\`).
+                                    With no <number>, opens an interactive
+                                    picker (fzf if available, else numbered
+                                    prompt). If the current branch has no
+                                    stack prefix (e.g. on \`main\`), prompts
+                                    for the stack first when more than one
+                                    is present.
+  ${sub}status${r}                            Per-branch local vs origin SHAs with
+                                    sync/diverged status. If a restack is in
+                                    progress, dump the state file too. (Debug.)
+  ${sub}restack${r} [${fl}--from${r} <branch>] [${fl}--onto${r} <ref>] [${fl}--push${r}] [${fl}--force${r}]
+                                    Reset+cherry-pick each branch above ${fl}--from${r}
+                                    (default: current branch's child) onto its
+                                    predecessor's new HEAD. With ${fl}--onto${r} <ref>,
+                                    rebase ${fl}--from${r} (default: bottom of stack)
+                                    onto <ref> first, then propagate up. With
+                                    ${fl}--push${r}, force-with-lease push each branch
+                                    as it finishes. Refuses if any branch has
+                                    more than one commit since its predecessor;
+                                    pass ${fl}--force${r} to cherry-pick the tip
+                                    only (intermediate commits are dropped).
+  ${sub}amend${r} [${fl}-m${r} <msg>] [${fl}--push${r}] [${fl}--force${r}] [${d}--${r} <pathspec>...]
+                                    git add <pathspec>, git commit --amend
+                                    [--no-edit|-m <msg>], then \`restack\`.
+                                    ${fl}--force${r} is plumbed through to ${sub}restack${r}.
+  ${sub}continue${r}                          After resolving a cherry-pick conflict
+                                    (\`git add\` the fixed files), finish the
+                                    cherry-pick and resume the reflow loop.
+  ${sub}abort${r}                             Restore every branch in the run to its
+                                    saved original SHA. Warns about already-
+                                    pushed branches; does not undo remote.
+  ${sub}push${r} [${fl}--from${r} <branch>] [${fl}--all${r}]    Force-with-lease push from the current branch
+                                    upward (default). With ${fl}--all${r}, push the
+                                    entire stack from the bottom; with ${fl}--from${r}
+                                    <branch>, start at that branch.
+  ${sub}history${r}                           List snapshots taken before each restack/
+                                    amend. Subcommands: \`history show <id>\`,
+                                    \`history restore <id> [--yes]\`. Run-id may
+                                    be full, action-tagged, bare timestamp, or
+                                    \`@N\` (relative; @0 = newest).
+  ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}]
+                                    Atomically rename every branch in the stack
+                                    from <old>/<leaf> to <new>/<leaf>, carrying
+                                    backup refs along by default. Refuses if
+                                    state file exists, branch checked out
+                                    elsewhere, or any target name collides.
+  ${sub}close${r} [${fl}--dry-run${r}] [${fl}--keep-history${r}]
+                                    Delete every branch in the stack whose
+                                    upstream is \`[gone]\` (run ${fl}git fetch
+                                    --prune${r} first), plus their snapshot
+                                    leaves. ${fl}--keep-history${r} preserves
+                                    backup refs.
+  ${sub}prefix${r}                            Print auto-detected stack prefix (debug).
+  ${sub}default-branch${r}                    Print the resolved default branch name
+                                    (stack.base → init.defaultBranch → main →
+                                    master, falling back to literal \`main\`).
+                                    Used by shell aliases like \`gstkrom\`.
+  ${sub}init${r} <bash|zsh|fish>              Emit shell-integration snippet defining
+                                    \`gstk*\` aliases/abbreviations. Add to your
+                                    rc: \`eval "\$(git stack init bash)"\` (bash/
+                                    zsh) or \`git stack init fish | source\`
+                                    (fish).
+
+${b}Common flags:${r}
+  ${fl}--prefix${r} <p>                      Override the stack prefix (else
+                                    git config stack.prefix, else auto-detect).
+  ${fl}--color${r} | ${fl}--no-color${r}              Force color on/off (default: auto-detect
+                                    TTY; honors ${fl}NO_COLOR${r} env var).
+  ${fl}-v${r}, ${fl}--verbose${r}                     More output.
+  ${fl}-q${r}, ${fl}--quiet${r}                       Less output.
+
+${b}Stack ordering:${r}
+  Branches whose final path segment matches  ${d}^[0-9]+(\.[0-9]+)?-${r}  are sorted by
+  \`sort -V\` on that numeric portion. Examples (in order):
+    ${cy}<prefix>/05-foo${r}
+    ${cy}<prefix>/06-bar${r}
+    ${cy}<prefix>/06.5-baz${r}
+    ${cy}<prefix>/07-qux${r}
+
+${b}Single-commit assumption:${r}
+  Each branch is treated as one commit on top of its predecessor, mirroring the
+  manual \`git reset --hard <prev> && git cherry-pick <branch-tip>\` flow. For
+  multi-commit branches, prefer \`git stack amend\` so the tool can capture the
+  pre-amend SHA up front.
+
+${b}Configuration:${r}
+  git config stack.prefix <prefix>/
+  git config stack.base <branch>     ${d}# parent branch for \`list\` (default:
+                                       init.defaultBranch, then main, then master)${r}
+  git config stack.historyKeep 100   ${d}# auto-prune older snapshots; 0 disables${r}
+EOF
+}
+
+cmd_prefix() {
+  detect_prefix
+}
+
+# Resolve the parent (base) branch name. Order:
+#   1. git config stack.base (e.g. "main", "develop")
+#   2. git config init.defaultBranch  (if such a local branch exists)
+#   3. local "main", then local "master"
+# Prints the bare branch name (no "origin/" prefix), or returns 1.
+_resolve_parent_name() {
+  local cfg
+  cfg=$(git config --get stack.base 2>/dev/null || true)
+  if [[ -n "$cfg" ]]; then
+    printf '%s\n' "${cfg#origin/}"
+    return 0
+  fi
+  cfg=$(git config --get init.defaultBranch 2>/dev/null || true)
+  if [[ -n "$cfg" ]] && git show-ref -q --verify "refs/heads/$cfg"; then
+    printf '%s\n' "$cfg"
+    return 0
+  fi
+  local cand
+  for cand in main master; do
+    if git show-ref -q --verify "refs/heads/$cand"; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve the actual ref to compare against, preferring the remote tracking
+# branch (which `git fetch` updates) over the local branch.
+# $1 = parent branch name (e.g. "main"). Prints the resolved ref, returns 1.
+_resolve_parent_ref() {
+  local name="$1"
+  if git rev-parse --verify --quiet "refs/remotes/origin/$name" >/dev/null 2>&1; then
+    printf '%s\n' "origin/$name"
+    return 0
+  fi
+  if git rev-parse --verify --quiet "refs/heads/$name" >/dev/null 2>&1; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  return 1
+}
+
+# Print a compact "[N behind]" / "[up to date]" / "[no parent ref]" indicator
+# for the stack-vs-parent state. $1 = bottom branch, $2 = parent ref.
+_parent_state() {
+  local bottom="$1" parent="$2"
+  if ! git rev-parse --verify --quiet "$parent" >/dev/null 2>&1; then
+    printf '%s[no parent ref]%s' "$C_DIM" "$C_RESET"
+    return
+  fi
+  local behind
+  behind=$(git rev-list --count "${bottom}..${parent}" 2>/dev/null || echo "?")
+  if [[ "$behind" == "0" ]]; then
+    printf '%s[up to date]%s' "$C_DIM" "$C_RESET"
+  else
+    printf '%s[%s behind]%s' "$C_YELLOW" "$behind" "$C_RESET"
+  fi
+}
+
+# Print a compact upstream-sync indicator for <branch>:
+#   [synced]          local sha == upstream sha
+#   [+ahead/-behind]  diverged (yellow)
+#   [gone]            upstream configured but its tracking ref is missing
+#                     (e.g. remote branch deleted, then `fetch --prune`)
+#   [unpushed]        no upstream configured (never pushed)
+_upstream_status() {
+  local b="$1"
+  local local_full upstream upstream_full
+  local_full=$(git rev-parse --verify --quiet "refs/heads/$b" 2>/dev/null) || {
+    printf '%s[?]%s' "$C_DIM" "$C_RESET"
+    return
+  }
+  upstream=$(git for-each-ref --format='%(upstream:short)' "refs/heads/$b" 2>/dev/null)
+  if [[ -z "$upstream" ]]; then
+    printf '%s[unpushed]%s' "$C_DIM" "$C_RESET"
+    return
+  fi
+  if upstream_full=$(git rev-parse --verify --quiet "refs/remotes/$upstream" 2>/dev/null); then
+    if [[ "$upstream_full" == "$local_full" ]]; then
+      printf '%s[synced]%s' "$C_DIM" "$C_RESET"
+    else
+      local ahead behind
+      ahead=$(git rev-list --count "refs/remotes/$upstream..refs/heads/$b" 2>/dev/null || echo "?")
+      behind=$(git rev-list --count "refs/heads/$b..refs/remotes/$upstream" 2>/dev/null || echo "?")
+      printf '%s[+%s/-%s]%s' "$C_YELLOW" "$ahead" "$behind" "$C_RESET"
+    fi
+  else
+    printf '%s[gone]%s' "$C_YELLOW" "$C_RESET"
+  fi
+}
+
+cmd_list() {
+  OPT_PREFIX=""
+  local OPT_FETCH=1
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --no-fetch) OPT_FETCH=0; shift ;;
+      -*) die "unknown list flag: $1" ;;
+      *)  die "list: unexpected arg '$1'" ;;
+    esac
+  done
+  require_in_repo
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local current
+  current=$(require_branch)
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches found for prefix '$prefix'"
+
+  if (( OPT_FETCH )); then
+    log "${C_DIM}fetching all remotes...${C_RESET}"
+    local fetch_out fetch_rc=0
+    fetch_out=$(git fetch --all --prune 2>&1) || fetch_rc=$?
+    if (( fetch_rc != 0 )); then
+      printf '%s\n' "$fetch_out" >&2
+      warn "git fetch failed; counts may be stale"
+    elif (( ! QUIET )); then
+      # Bucket each ref-change line by its leading flag char:
+      #   "   " (3 spaces) = fast-forward update
+      #   " * " = new ref       " - " = pruned/deleted
+      #   " + " = forced update " t " = tag update  " ! " = rejected
+      local updated=0 new=0 deleted=0 rejected=0 line
+      while IFS= read -r line; do
+        case "$line" in
+          "   "*|" + "*|" t "*) updated=$((updated + 1)) ;;
+          " * "*)               new=$((new + 1)) ;;
+          " - "*)               deleted=$((deleted + 1)) ;;
+          " ! "*)               rejected=$((rejected + 1)) ;;
+        esac
+      done < <(printf '%s\n' "$fetch_out" | grep '^[[:space:]]' || true)
+      local total=$((updated + new + deleted + rejected))
+      if (( total == 0 )); then
+        printf '%s  (no remote changes)%s\n' "$C_DIM" "$C_RESET"
+      else
+        local parts="" sep=""
+        (( updated  > 0 )) && parts="${parts}${sep}${updated} updated"   && sep=", "
+        (( new      > 0 )) && parts="${parts}${sep}${new} new"           && sep=", "
+        (( deleted  > 0 )) && parts="${parts}${sep}${deleted} deleted"   && sep=", "
+        (( rejected > 0 )) && parts="${parts}${sep}${rejected} rejected" && sep=", "
+        printf '%s  fetched: %s%s\n' "$C_DIM" "$parts" "$C_RESET"
+      fi
+    fi
+  fi
+
+  local parent_name parent_ref parent_state
+  if parent_name=$(_resolve_parent_name); then
+    if parent_ref=$(_resolve_parent_ref "$parent_name"); then
+      parent_state=$(_parent_state "${branches[0]}" "$parent_ref")
+      printf '%sparent:%s %s%s%s  %s\n\n' \
+        "$C_BOLD" "$C_RESET" "$C_CYAN" "$parent_ref" "$C_RESET" "$parent_state"
+    fi
+  fi
+
+  local b sha subj branch_color marker status
+  for b in "${branches[@]}"; do
+    sha=$(git rev-parse --short "$b")
+    subj=$(git log -1 --format='%s' "$b")
+    status=$(_upstream_status "$b")
+    if [[ "$b" == "$current" ]]; then
+      marker="${C_GREEN}*${C_RESET}"
+      branch_color="${C_BOLD}${C_CYAN}"
+    else
+      marker=" "
+      branch_color="${C_CYAN}"
+    fi
+    printf '%s %s%s%s  %s\n'  "$marker"  "$branch_color" "$b"   "$C_RESET" "$status"
+    printf '    %s%s%s  %s\n' "$C_DIM"   "$sha"          "$C_RESET" "$subj"
+  done
+}
+
+cmd_status() {
+  parse_common_flags "$@"
+  require_in_repo
+  local prefix current
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  current=$(_current_or_detached)
+
+  printf '%sprefix:%s   %s\n'  "$C_DIM" "$C_RESET" "$prefix"
+  printf '%scurrent:%s  %s%s%s\n\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$current" "$C_RESET"
+
+  local branches=()
+  _load_stack_branches "$prefix" branches
+  if (( ${#branches[@]} == 0 )); then
+    printf '%sno stack branches found%s\n' "$C_YELLOW" "$C_RESET"
+  else
+    printf '%sstack (%d branches):%s\n' "$C_BOLD" "${#branches[@]}" "$C_RESET"
+    local b local_sha rt_sha rt_full status marker color ahead behind
+    for b in "${branches[@]}"; do
+      local_sha=$(git rev-parse --short "refs/heads/$b")
+      if rt_full=$(git rev-parse --verify --quiet "refs/remotes/origin/$b" 2>/dev/null); then
+        rt_sha=$(git rev-parse --short "$rt_full")
+        if [[ "$rt_full" == "$(git rev-parse "refs/heads/$b")" ]]; then
+          status="${C_GREEN}in sync${C_RESET}"
+        else
+          ahead=$(git rev-list --count "refs/remotes/origin/$b..refs/heads/$b" 2>/dev/null || echo "?")
+          behind=$(git rev-list --count "refs/heads/$b..refs/remotes/origin/$b" 2>/dev/null || echo "?")
+          status="${C_YELLOW}diverged: local +${ahead}, remote +${behind}${C_RESET}"
+        fi
+      else
+        rt_sha="<not pushed>"
+        status="${C_DIM}no remote-tracking ref${C_RESET}"
+      fi
+      if [[ "$b" == "$current" ]]; then marker="${C_GREEN}*${C_RESET}"; color="${C_BOLD}${C_CYAN}"
+      else                                 marker=" ";                  color="${C_CYAN}"
+      fi
+      printf '  %s %s%s%s\n'                "$marker" "$color"  "$b"        "$C_RESET"
+      printf '       %slocal:%s  %s    %sorigin:%s %s    %s\n' \
+        "$C_DIM" "$C_RESET" "$local_sha" "$C_DIM" "$C_RESET" "$rt_sha" "$status"
+    done
+  fi
+
+  local last_snap last_ts last_action last_run last_count last_age
+  last_snap=$(list_snapshots "${prefix%/}" | head -1)
+  if [[ -n "$last_snap" ]]; then
+    IFS=$'\t' read -r last_ts last_action last_run last_count <<< "$last_snap"
+    last_age=$(_human_age $(($(date +%s) - last_ts)))
+    printf '\n%slast snapshot:%s %s ago (%s, %s%s%s, %d branches)\n' \
+      "$C_BOLD" "$C_RESET" "$last_age" "$last_action" "$C_CYAN" "$last_run" "$C_RESET" "$last_count"
+  fi
+
+  local sf
+  sf=$(state_file)
+  printf '\n%sstate file:%s ' "$C_BOLD" "$C_RESET"
+  if [[ ! -f "$sf" ]] ; then
+    printf '%snone%s\n' "$C_DIM" "$C_RESET"
+    return 0
+  fi
+  printf '%s\n' "$sf"
+  load_state
+  local started_human=""
+  [[ -n "${STACK_STARTED_AT-}" ]] && started_human=$(date -r "$STACK_STARTED_AT" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$STACK_STARTED_AT")
+  printf '  %sstarted:%s   %s\n'  "$C_DIM" "$C_RESET" "${started_human:-?}"
+  printf '  %sprefix:%s    %s\n'  "$C_DIM" "$C_RESET" "$STACK_PREFIX"
+  printf '  %sstarting:%s  %s\n'  "$C_DIM" "$C_RESET" "$STACK_STARTING_BRANCH"
+  if [[ -n "${STACK_ONTO-}" ]]; then
+    printf '  %sonto:%s      %s%s\n' "$C_DIM" "$C_RESET" \
+      "${STACK_ONTO_REF:-$STACK_ONTO}" \
+      "$([ -n "${STACK_ONTO_REF-}" ] && [ "$STACK_ONTO_REF" != "$STACK_ONTO" ] && echo " (${STACK_ONTO:0:10})" || echo "")"
+  fi
+  printf '  %sfrom_idx:%s  %d\n'  "$C_DIM" "$C_RESET" "$STACK_FROM_IDX"
+  printf '  %scursor:%s    %d'    "$C_DIM" "$C_RESET" "$STACK_CURSOR"
+  if (( STACK_CURSOR < ${#STACK_BRANCHES[@]} )); then
+    printf ' (%s%s%s)\n' "$C_CYAN" "${STACK_BRANCHES[$STACK_CURSOR]}" "$C_RESET"
+  else
+    printf ' (past end)\n'
+  fi
+  printf '  %spush mode:%s %s\n'  "$C_DIM" "$C_RESET" "$([ "$STACK_PUSH" = "1" ] && echo yes || echo no)"
+  if (( ${#STACK_PUSH_FAILURES[@]} > 0 )); then
+    local f_str=""; local f
+    for f in "${STACK_PUSH_FAILURES[@]}"; do f_str="${f_str:+$f_str, }$f"; done
+    printf '  %sfailures:%s  %s%s%s\n' "$C_DIM" "$C_RESET" "$C_YELLOW" "$f_str" "$C_RESET"
+  fi
+  local gitdir marker
+  gitdir=$(git rev-parse --git-dir)
+  for marker in CHERRY_PICK_HEAD MERGE_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    if [[ -e "$gitdir/$marker" ]]; then
+      printf '  %sin-progress:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_RED" "$marker" "$C_RESET"
+    fi
+  done
+}
+
+# Render seconds as "Ns", "Nm", "Nh", "Nd". Approximate; for human display only.
+_human_age() {
+  local s=$1
+  if   (( s < 60 ));    then printf '%ds' "$s"
+  elif (( s < 3600 ));  then printf '%dm' "$((s / 60))"
+  elif (( s < 86400 )); then printf '%dh' "$((s / 3600))"
+  else                       printf '%dd' "$((s / 86400))"
+  fi
+}
+
+cmd_history() {
+  # Sub-dispatch: 'history', 'history show <id>', 'history restore <id>'.
+  OPT_PREFIX=""
+  local sub="" id="" yes=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --yes|-y)     yes=1; shift ;;
+      -*) die "unknown history flag: $1" ;;
+      *)
+        if [[ -z "$sub" ]]; then sub="$1"
+        elif [[ -z "$id" ]]; then id="$1"
+        else die "history: extra arg '$1'"
+        fi
+        shift
+        ;;
+    esac
+  done
+  require_in_repo
+  local prefix prefix_path
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  prefix_path="${prefix%/}"
+
+  case "${sub:-list}" in
+    list)    cmd_history_list "$prefix_path" ;;
+    show)    [[ -n "$id" ]] || die "history show: missing <run-id>"
+             cmd_history_show "$prefix_path" "$id" ;;
+    restore) [[ -n "$id" ]] || die "history restore: missing <run-id>"
+             cmd_history_restore "$prefix_path" "$id" "$yes" ;;
+    *) die "unknown history subcommand: $sub (try 'list', 'show', or 'restore')" ;;
+  esac
+}
+
+cmd_history_list() {
+  local prefix_path="$1"
+  local snaps now idx ts action run_id count age
+  snaps=$(list_snapshots "$prefix_path")
+  if [[ -z "$snaps" ]]; then
+    log "${C_DIM}(no snapshots for ${prefix_path}/)${C_RESET}"
+    return 0
+  fi
+  now=$(date +%s)
+  printf '%sprefix:%s %s/\n\n' "$C_DIM" "$C_RESET" "$prefix_path"
+  printf '  %s%-4s  %-7s  %-8s  %-32s  %s%s\n' \
+    "$C_BOLD" "ref" "age" "action" "run-id" "branches" "$C_RESET"
+  idx=0
+  while IFS=$'\t' read -r ts action run_id count; do
+    [[ -z "$run_id" ]] && continue
+    age=$(_human_age $((now - ts)))
+    printf '  %s@%-3d%s %-7s  %-8s  %s%-32s%s  %d\n' \
+      "$C_GREEN" "$idx" "$C_RESET" \
+      "$age" "$action" "$C_CYAN" "$run_id" "$C_RESET" "$count"
+    idx=$((idx + 1))
+  done <<< "$snaps"
+}
+
+cmd_history_show() {
+  local prefix_path="$1" input="$2"
+  local run_id leaf saved_sha cur_sha branch
+  run_id=$(parse_run_id "$prefix_path" "$input")
+  printf '%srun-id:%s %s\n%sprefix:%s %s/\n\n' \
+    "$C_DIM" "$C_RESET" "$run_id" "$C_DIM" "$C_RESET" "$prefix_path"
+  while IFS=$'\t' read -r leaf saved_sha; do
+    [[ -z "$leaf" ]] && continue
+    branch="${prefix_path}/${leaf}"
+    cur_sha=$(git rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null || echo "")
+    local subj
+    subj=$(git log -1 --format='%s' "$saved_sha" 2>/dev/null || echo "?")
+    printf '  %s%s%s\n' "$C_CYAN" "$branch" "$C_RESET"
+    printf '    %ssaved:%s    %s  %s\n' "$C_DIM" "$C_RESET" "${saved_sha:0:10}" "$subj"
+    if [[ -z "$cur_sha" ]]; then
+      printf '    %scurrent:%s  %s(branch deleted)%s\n' "$C_DIM" "$C_RESET" "$C_YELLOW" "$C_RESET"
+    elif [[ "$cur_sha" == "$saved_sha" ]]; then
+      printf '    %scurrent:%s  %s  %s= snapshot%s\n' "$C_DIM" "$C_RESET" "${cur_sha:0:10}" "$C_GREEN" "$C_RESET"
+    else
+      local ahead behind
+      ahead=$(git rev-list --count "$saved_sha..refs/heads/$branch" 2>/dev/null || echo "?")
+      behind=$(git rev-list --count "refs/heads/$branch..$saved_sha" 2>/dev/null || echo "?")
+      printf '    %scurrent:%s  %s  %sdiverged: local +%s, snapshot +%s%s\n' \
+        "$C_DIM" "$C_RESET" "${cur_sha:0:10}" "$C_YELLOW" "$ahead" "$behind" "$C_RESET"
+    fi
+  done < <(snapshot_branches_for "$prefix_path" "$run_id")
+}
+
+cmd_history_restore() {
+  local prefix_path="$1" input="$2" yes="$3"
+  require_no_state_file
+  require_clean_tree
+  local run_id
+  run_id=$(parse_run_id "$prefix_path" "$input")
+
+  local pairs=() leaf saved_sha branch
+  while IFS=$'\t' read -r leaf saved_sha; do
+    [[ -z "$leaf" ]] && continue
+    pairs+=("${leaf}"$'\t'"${saved_sha}")
+  done < <(snapshot_branches_for "$prefix_path" "$run_id")
+  (( ${#pairs[@]} > 0 )) || die "snapshot ${run_id} is empty"
+
+  local entry
+  for entry in "${pairs[@]}"; do
+    leaf="${entry%%$'\t'*}"
+    branch="${prefix_path}/${leaf}"
+    require_branch_not_in_worktree "$branch"
+  done
+
+  local current
+  current=$(current_branch || true)
+
+  if (( ! yes )); then
+    log "${C_BOLD}dry run${C_RESET} (pass --yes to apply):"
+  else
+    log "${C_GREEN}restore${C_RESET} run-id ${C_CYAN}${run_id}${C_RESET}"
+  fi
+
+  local stdin=""
+  for entry in "${pairs[@]}"; do
+    leaf="${entry%%$'\t'*}"
+    saved_sha="${entry##*$'\t'}"
+    branch="${prefix_path}/${leaf}"
+    local cur_sha
+    cur_sha=$(git rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null || echo "0000000000000000000000000000000000000000")
+    if [[ "$cur_sha" == "$saved_sha" ]]; then
+      log "  ${C_DIM}skip${C_RESET}    ${C_CYAN}$branch${C_RESET} (already at ${saved_sha:0:10})"
+      continue
+    fi
+    if [[ "$branch" == "$current" ]]; then
+      if (( yes )); then
+        die "current branch '$branch' would be reset; checkout away first"
+      fi
+      log "  ${C_YELLOW}refuse${C_RESET}  ${C_CYAN}$branch${C_RESET} (current branch — checkout away to apply)"
+      continue
+    fi
+    log "  ${C_GREEN}set${C_RESET}     ${C_CYAN}$branch${C_RESET} ${cur_sha:0:10} -> ${saved_sha:0:10}"
+    stdin+="update refs/heads/${branch} ${saved_sha}"$'\n'
+  done
+
+  if (( ! yes )); then
+    log ""
+    log "rerun with: ${C_BOLD}git stack history restore ${input} --yes${C_RESET}"
+    return 0
+  fi
+  if [[ -z "$stdin" ]]; then
+    log "${C_DIM}no changes${C_RESET}"
+    return 0
+  fi
+  printf '%s' "$stdin" | git update-ref --stdin -m "git-stack history restore ${run_id}" \
+    || die "git update-ref failed"
+  log "${C_GREEN}done${C_RESET}    restored from ${run_id}"
+}
+
+cmd_close() {
+  OPT_PREFIX=""
+  local opt_dry_run=0 opt_keep_history=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --dry-run)       opt_dry_run=1; shift ;;
+      --keep-history)  opt_keep_history=1; shift ;;
+      -*) die "unknown close flag: $1" ;;
+      *)  die "close: unexpected arg '$1'" ;;
+    esac
+  done
+
+  require_in_repo
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix prefix_path
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  prefix_path="${prefix%/}"
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+
+  local gone=() leaves=() b track
+  for b in "${branches[@]}"; do
+    track=$(git for-each-ref --format='%(upstream:track)' "refs/heads/$b")
+    if [[ "$track" == "[gone]" ]]; then
+      gone+=("$b")
+      leaves+=("${b##*/}")
+    fi
+  done
+  if (( ${#gone[@]} == 0 )); then
+    log "no branches in '${prefix}' have a gone upstream (run 'git fetch --prune' first?)"
+    return 0
+  fi
+
+  # Safety: refuse if any gone branch is currently checked out (here or elsewhere).
+  local current
+  current=$(current_branch || echo "")
+  for b in "${gone[@]}"; do
+    [[ "$b" == "$current" ]] && die "branch '$b' is current HEAD; checkout away first"
+    require_branch_not_in_worktree "$b"
+  done
+
+  local stdin="" sha
+  for b in "${gone[@]}"; do
+    sha=$(git rev-parse "refs/heads/$b")
+    stdin+="delete refs/heads/${b} ${sha}"$'\n'
+  done
+
+  local removed_history=0
+  if (( ! opt_keep_history )); then
+    local refname leaf gleaf
+    while IFS= read -r refname; do
+      [[ -z "$refname" ]] && continue
+      leaf="${refname##*/}"
+      for gleaf in "${leaves[@]}"; do
+        if [[ "$leaf" == "$gleaf" ]]; then
+          stdin+="delete ${refname}"$'\n'
+          removed_history=$((removed_history + 1))
+          break
+        fi
+      done
+    done < <(git for-each-ref --format='%(refname)' "refs/stack-backup/${prefix_path}/")
+  fi
+
+  log "${C_YELLOW}close${C_RESET}   ${#gone[@]} branch(es) with gone upstream:"
+  for b in "${gone[@]}"; do
+    sha=$(git rev-parse --short "refs/heads/$b")
+    log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}${b}${C_RESET} (${sha})"
+  done
+  if (( removed_history > 0 )); then
+    log "  ${C_DIM}+ ${removed_history} backup ref(s)${C_RESET}"
+  elif (( ! opt_keep_history )); then
+    log "  ${C_DIM}(no matching backup refs)${C_RESET}"
+  fi
+
+  if (( opt_dry_run )); then
+    log ""
+    log "${C_BOLD}dry run${C_RESET}: rerun without --dry-run to apply"
+    return 0
+  fi
+
+  if ! printf '%s' "$stdin" | git update-ref --stdin -m "git-stack close" 2>/dev/null; then
+    die "git update-ref batch failed; refs unchanged (atomic)"
+  fi
+  log "${C_GREEN}done${C_RESET}    closed ${#gone[@]} branch(es)"
+}
+
+cmd_rename() {
+  OPT_PREFIX=""
+  local opt_dry_run=0 opt_no_history=0 new_pfx=""
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --dry-run)    opt_dry_run=1; shift ;;
+      --no-history) opt_no_history=1; shift ;;
+      -*)           die "unknown rename flag: $1" ;;
+      *)            [[ -z "$new_pfx" ]] || die "rename: extra arg '$1'"; new_pfx="$1"; shift ;;
+    esac
+  done
+  [[ -n "$new_pfx" ]] || die "usage: git stack rename <new-prefix> [--dry-run] [--no-history]"
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  local old_pfx_full
+  old_pfx_full=$(detect_prefix "$OPT_PREFIX")
+  local old_pfx="${old_pfx_full%/}"
+  new_pfx="${new_pfx%/}"
+
+  [[ "$old_pfx" != "$new_pfx" ]] || die "rename: new prefix is the same as the old ('$old_pfx')"
+
+  local branches=()
+  _load_stack_branches "${old_pfx}/" branches "no stack branches found under '${old_pfx}/'"
+
+  # Collision check.
+  local b leaf collisions=()
+  for b in "${branches[@]}"; do
+    leaf="${b##*/}"
+    if git rev-parse --verify --quiet "refs/heads/${new_pfx}/${leaf}" >/dev/null; then
+      collisions+=("${new_pfx}/${leaf}")
+    fi
+  done
+  if (( ${#collisions[@]} > 0 )); then
+    warn "rename would collide with existing branches:"
+    local c
+    for c in "${collisions[@]}"; do warn "  $c"; done
+    die "delete colliding branches first (e.g., git branch -D <name>)"
+  fi
+
+  # Worktree check.
+  for b in "${branches[@]}"; do
+    require_branch_not_in_worktree "$b"
+  done
+
+  local batch
+  batch=$(emit_rename_batch "$old_pfx" "$new_pfx" $((1 - opt_no_history)))
+  if [[ -z "$batch" ]]; then
+    die "nothing to rename (empty batch)"
+  fi
+
+  if (( opt_dry_run )); then
+    log "${C_BOLD}dry run${C_RESET}: would run 'git update-ref --stdin' with:"
+    printf '%s\n' "$batch"
+    return 0
+  fi
+
+  log "${C_GREEN}rename${C_RESET}  ${C_CYAN}${old_pfx}/${C_RESET} -> ${C_CYAN}${new_pfx}/${C_RESET} (${#branches[@]} branches$([ "$opt_no_history" = 1 ] && echo "" || echo ", + history"))"
+
+  # Retarget HEAD's symref BEFORE the batch deletes the old branch, otherwise
+  # HEAD would dangle. Captured original target is restored if the batch fails.
+  local head_target_before="" head_new_target=""
+  if head_target_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
+    if [[ "$head_target_before" == "refs/heads/${old_pfx}/"* ]]; then
+      head_new_target="refs/heads/${new_pfx}/${head_target_before#refs/heads/${old_pfx}/}"
+      git symbolic-ref HEAD "$head_new_target"
+    fi
+  fi
+
+  if ! printf '%s\n' "$batch" | git update-ref --stdin -m "git-stack rename ${old_pfx} -> ${new_pfx}"; then
+    # Roll HEAD back to its original target.
+    if [[ -n "$head_new_target" ]]; then
+      git symbolic-ref HEAD "$head_target_before" 2>/dev/null || true
+    fi
+    die "git update-ref batch failed; refs unchanged (atomic)"
+  fi
+
+  # Update stack.prefix config if it pointed at the old prefix.
+  local cfg
+  cfg=$(git config --get stack.prefix 2>/dev/null || true)
+  if [[ -n "$cfg" ]]; then
+    local cfg_clean="${cfg%/}"
+    if [[ "$cfg_clean" == "$old_pfx" ]]; then
+      git config stack.prefix "${new_pfx}/"
+      log "  ${C_DIM}config:${C_RESET} stack.prefix -> ${new_pfx}/"
+    fi
+  fi
+
+  log "${C_GREEN}done${C_RESET}    rename complete"
+}
+
+cmd_restack() {
+  parse_common_flags "$@"
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local branches=()
+  _load_stack_branches "$prefix" branches
+  (( ${#branches[@]} >= 2 )) || die "stack '$prefix' has fewer than 2 branches"
+
+  local starting_branch
+  starting_branch=$(require_branch)
+
+  local onto_sha=""
+  if [[ -n "$OPT_ONTO" ]]; then
+    onto_sha=$(git rev-parse --verify --quiet "${OPT_ONTO}^{commit}") \
+      || die "--onto: cannot resolve '$OPT_ONTO' to a commit"
+  fi
+
+  local from_idx
+  if [[ -n "$OPT_FROM" ]]; then
+    from_idx=$(branch_index "$OPT_FROM" "${branches[@]}") \
+      || die "--from '$OPT_FROM' not in stack"
+  elif [[ -n "$onto_sha" ]]; then
+    from_idx=0
+  else
+    local cur_idx
+    cur_idx=$(branch_index "$starting_branch" "${branches[@]}") \
+      || die "current branch '$starting_branch' not in stack '$prefix'"
+    from_idx=$((cur_idx + 1))
+  fi
+  if [[ -z "$onto_sha" ]]; then
+    (( from_idx > 0 )) || die "--from must have a predecessor in the stack (or pass --onto)"
+  fi
+  if (( from_idx >= ${#branches[@]} )); then
+    log "nothing to do (no branches above $starting_branch)"
+    return 0
+  fi
+
+  STACK_BRANCHES=("${branches[@]}")
+  STACK_ORIG_SHAS=()
+  local first_capture
+  if [[ -n "$onto_sha" ]]; then
+    first_capture=$from_idx
+  else
+    first_capture=$((from_idx - 1))
+  fi
+  local i
+  for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
+    if (( i >= first_capture )); then
+      STACK_ORIG_SHAS+=("$(git rev-parse "refs/heads/${STACK_BRANCHES[$i]}")")
+    else
+      STACK_ORIG_SHAS+=("")
+    fi
+  done
+
+  STACK_STARTED_AT=$(date +%s)
+  STACK_STARTING_BRANCH="$starting_branch"
+  STACK_PREFIX="$prefix"
+  STACK_PUSH="$OPT_PUSH"
+  STACK_FORCE="$OPT_FORCE"
+  STACK_ONTO="$onto_sha"
+  STACK_ONTO_REF="$OPT_ONTO"
+  STACK_FROM_IDX="$from_idx"
+  STACK_CURSOR="$from_idx"
+  STACK_PUSH_FAILURES=()
+
+  snapshot_stack restack "$STACK_PREFIX" "${STACK_BRANCHES[@]}"
+  save_state
+  run_reflow_loop
+}
+
+cmd_continue() {
+  require_in_repo
+  load_state
+
+  local gitdir marker
+  gitdir=$(git rev-parse --git-dir)
+  for marker in MERGE_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    if [[ -e "$gitdir/$marker" ]]; then
+      die "another git operation is in progress ($marker); resolve it first"
+    fi
+  done
+
+  if [[ -e "$gitdir/CHERRY_PICK_HEAD" ]]; then
+    if [[ -n $(git ls-files --unmerged) ]]; then
+      die "cherry-pick has unresolved conflicts; fix them and 'git add' the files, then re-run"
+    fi
+    log "${C_DIM}continue${C_RESET} finishing in-progress cherry-pick"
+    GIT_EDITOR=true git cherry-pick --continue \
+      || die "git cherry-pick --continue failed; resolve manually and re-run"
+  fi
+
+  if (( STACK_PUSH )); then
+    push_branch "${STACK_BRANCHES[$STACK_CURSOR]}" || true
+  fi
+  STACK_CURSOR=$((STACK_CURSOR + 1))
+  save_state
+  run_reflow_loop
+}
+
+cmd_abort() {
+  require_in_repo
+  load_state
+  log "${C_YELLOW}abort${C_RESET}   restoring branches to original SHAs"
+  local i b sha short
+  for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
+    b="${STACK_BRANCHES[$i]}"
+    sha="${STACK_ORIG_SHAS[$i]}"
+    [[ -n "$sha" ]] || continue
+    short="${sha:0:10}"
+    log "  ${C_DIM}restore${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}-> $short${C_RESET}"
+    git update-ref "refs/heads/$b" "$sha"
+  done
+  if [[ -e "$(git rev-parse --git-dir)/CHERRY_PICK_HEAD" ]]; then
+    git cherry-pick --abort 2>/dev/null || true
+  fi
+  if (( STACK_PUSH )); then
+    local pushed=()
+    for ((i = STACK_FROM_IDX; i < STACK_CURSOR; i++)); do
+      pushed+=("${STACK_BRANCHES[$i]}")
+    done
+    if (( ${#pushed[@]} > 0 )); then
+      warn "the following branches were already force-pushed; remote not undone:"
+      for b in "${pushed[@]}"; do warn "  $b"; done
+    fi
+  fi
+  if [[ -n "${STACK_STARTING_BRANCH-}" ]] && \
+     git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
+    git checkout --quiet "$STACK_STARTING_BRANCH"
+  fi
+  clear_state
+}
+
+cmd_amend() {
+  OPT_PREFIX=""
+  local commit_args=()
+  local push=0
+  local force=0
+  local has_msg=0
+  local pathspec=()
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      -m)        shift; [[ $# -gt 0 ]] || die "-m needs an argument"
+                 commit_args+=("-m" "$1"); has_msg=1; shift ;;
+      --no-edit) commit_args+=("--no-edit"); has_msg=1; shift ;;
+      --push)    push=1; shift ;;
+      --force)   force=1; shift ;;
+      --) shift; pathspec=("$@"); break ;;
+      -*) die "unknown amend flag: $1 (use '--' before pathspecs)" ;;
+      *)  pathspec+=("$1"); shift ;;
+    esac
+  done
+  (( has_msg )) || commit_args+=("--no-edit")
+
+  require_in_repo
+
+  # Snapshot the stack BEFORE git commit --amend rewrites the current branch
+  # tip. cmd_restack will take a second 'restack' snapshot — intentional:
+  # the amend snapshot captures pre-amend SHAs, the restack snapshot
+  # captures post-amend SHAs of the upper branches.
+  local _amend_prefix=""
+  _amend_prefix=$(detect_prefix "" 2>/dev/null) || _amend_prefix=""
+  if [[ -n "$_amend_prefix" ]]; then
+    local _amend_branches=()
+    _load_stack_branches "$_amend_prefix" _amend_branches
+    if (( ${#_amend_branches[@]} > 0 )); then
+      snapshot_stack amend "$_amend_prefix" "${_amend_branches[@]}"
+    fi
+  fi
+
+  if (( ${#pathspec[@]} > 0 )); then
+    git add -- "${pathspec[@]}"
+  fi
+  git commit --amend "${commit_args[@]}"
+
+  local args=()
+  (( push )) && args+=("--push")
+  (( force )) && args+=("--force")
+  cmd_restack ${args[@]+"${args[@]}"}
+}
+
+cmd_push() {
+  OPT_FROM=""
+  OPT_PREFIX=""
+  local opt_all=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --from)       shift; [[ $# -gt 0 ]] || die "--from needs an argument"; OPT_FROM="$1"; shift ;;
+      --all)        opt_all=1; shift ;;
+      -*) die "unknown push flag: $1" ;;
+      *)  die "push: unexpected arg '$1'" ;;
+    esac
+  done
+
+  if (( opt_all )) && [[ -n "$OPT_FROM" ]]; then
+    die "--all and --from are mutually exclusive"
+  fi
+
+  require_in_repo
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches"
+
+  local from_idx
+  if (( opt_all )); then
+    from_idx=0
+  elif [[ -n "$OPT_FROM" ]]; then
+    from_idx=$(branch_index "$OPT_FROM" "${branches[@]}") \
+      || die "--from '$OPT_FROM' not in stack"
+  else
+    local cur
+    cur=$(require_branch)
+    from_idx=$(branch_index "$cur" "${branches[@]}") \
+      || die "current branch '$cur' not in stack '$prefix' (use --from or --all)"
+  fi
+  STACK_PUSH_FAILURES=()
+  local i
+  for ((i = from_idx; i < ${#branches[@]}; i++)); do
+    push_branch "${branches[$i]}" || true
+  done
+  if (( ${#STACK_PUSH_FAILURES[@]} > 0 )); then
+    local b_str="" b
+    for b in "${STACK_PUSH_FAILURES[@]}"; do b_str="${b_str:+$b_str }$b"; done
+    warn "failed: $b_str"
+    return 3
+  fi
+}
+
+# Interactive selector. $1 = prompt header, remaining args = options. Prefers
+# fzf; falls back to a numbered-list prompt read from /dev/tty. Prints the
+# chosen option to stdout, returns non-zero if the user aborts.
+_pick_one() {
+  local header="$1"; shift
+  (( $# > 0 )) || return 1
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "$@" \
+      | fzf --prompt="${header} > " --height=40% --reverse --no-multi
+    return
+  fi
+  [[ -e /dev/tty ]] || return 1
+  local i=1 opt
+  printf '%s\n' "$header" >&2
+  for opt in "$@"; do
+    printf '  %2d) %s\n' "$i" "$opt" >&2
+    i=$((i + 1))
+  done
+  printf 'pick [1-%d]: ' "$#" >&2
+  local n
+  read -r n < /dev/tty || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )) || return 1
+  printf '%s\n' "${!n}"
+}
+
+# Interactive branch picker. $1 = prefix label (for the prompt only), $2 =
+# current branch (empty if none/detached; used to position the initial cursor),
+# remaining args = candidate branch names. Shows "<branch> \t <sha>  <subject>"
+# so any field is filterable. Prints the chosen branch name; non-zero on abort.
+_pick_branch() {
+  local label="$1"; shift
+  local current="$1"; shift
+  (( $# > 0 )) || return 1
+  local lines=() b sha subj
+  local cur_idx=0 i=0
+  for b in "$@"; do
+    i=$((i + 1))
+    [[ -n "$current" && "$b" == "$current" ]] && cur_idx=$i
+    sha=$(git rev-parse --short "$b" 2>/dev/null || echo "???????")
+    subj=$(git log -1 --format='%s' "$b" 2>/dev/null || echo "")
+    lines+=("${b}"$'\t'"${sha}  ${subj}")
+  done
+  if command -v fzf >/dev/null 2>&1; then
+    local picked
+    local fzf_args=(
+      --prompt="${label} branch > " --height=60% --reverse --no-multi
+      --delimiter=$'\t' --with-nth=1,2 --nth=1,2
+      --preview='git log -1 --color=always --format="%C(auto)%h%d %s%n%n%b" {1}'
+      --preview-window=down:6:wrap
+    )
+    (( cur_idx > 0 )) && fzf_args+=(--bind="load:pos($cur_idx)")
+    picked=$(printf '%s\n' "${lines[@]}" | fzf "${fzf_args[@]}") || return 1
+    printf '%s\n' "${picked%%$'\t'*}"
+    return
+  fi
+  [[ -e /dev/tty ]] || return 1
+  i=1
+  printf 'select branch (%s):\n' "$label" >&2
+  for b in "$@"; do
+    if (( i == cur_idx )); then
+      printf '* %2d) %s\n' "$i" "$b" >&2
+    else
+      printf '  %2d) %s\n' "$i" "$b" >&2
+    fi
+    i=$((i + 1))
+  done
+  printf 'pick [1-%d]: ' "$#" >&2
+  local n
+  read -r n < /dev/tty || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )) || return 1
+  printf '%s\n' "${!n}"
+}
+
+cmd_checkout_interactive() {
+  require_in_repo
+
+  local prefix=""
+  prefix=$(_try_detect_prefix "$OPT_PREFIX") || prefix=""
+
+  if [[ -z "$prefix" ]]; then
+    local prefixes=()
+    while IFS= read -r p; do
+      prefixes+=("$p")
+    done < <(stack_prefixes)
+    (( ${#prefixes[@]} > 0 )) || die "no stack branches found in this repo"
+    if (( ${#prefixes[@]} == 1 )); then
+      prefix="${prefixes[0]}"
+    else
+      local labels=() p
+      for p in "${prefixes[@]}"; do
+        labels+=("${p:-<top-level>}")
+      done
+      local picked_label
+      picked_label=$(_pick_one "select stack" "${labels[@]}") \
+        || die "no stack selected"
+      local i
+      for ((i = 0; i < ${#labels[@]}; i++)); do
+        if [[ "${labels[$i]}" == "$picked_label" ]]; then
+          prefix="${prefixes[$i]}"
+          break
+        fi
+      done
+    fi
+  fi
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '${prefix:-<top-level>}'"
+
+  local current=""
+  current=$(current_branch 2>/dev/null) || current=""
+
+  local picked
+  picked=$(_pick_branch "${prefix:-<top-level>}" "$current" "${branches[@]}") \
+    || die "no branch selected"
+  git checkout "$picked"
+}
+
+cmd_checkout() {
+  OPT_PREFIX=""
+  local input=""
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      -*) die "unknown checkout flag: $1" ;;
+      *)  [[ -z "$input" ]] || die "checkout: extra arg '$1'"; input="$1"; shift ;;
+    esac
+  done
+
+  if [[ -z "$input" ]]; then
+    cmd_checkout_interactive
+    return
+  fi
+
+  [[ "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "checkout: '$input' is not a number (e.g., 5, 06, 6.5)"
+
+  require_in_repo
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+
+  local matches=() b leaf num
+  for b in "${branches[@]}"; do
+    leaf="${b##*/}"
+    [[ "$leaf" =~ ^([0-9]+(\.[0-9]+)?)- ]] || continue
+    num="${BASH_REMATCH[1]}"
+    if awk -v a="$input" -v c="$num" 'BEGIN { exit !(a+0 == c+0) }'; then
+      matches+=("$b")
+    fi
+  done
+
+  case "${#matches[@]}" in
+    0) die "no stack branch with number '${input}' under '${prefix}' (try 'git stack list')" ;;
+    1) git checkout "${matches[0]}" ;;
+    *) local m s=""; for m in "${matches[@]}"; do s="${s:+$s, }$m"; done
+       die "ambiguous '${input}' matches: $s" ;;
+  esac
+}
+
+# ---------- default-branch & shell init ----------
+
+# Print the bare default branch name (no `origin/` prefix). Uses the same
+# resolution order as the rest of the script (stack.base → init.defaultBranch →
+# main → master), falling back to a bare "main" if nothing is found so that
+# shell aliases like `gstkrom` always have something to feed `git fetch`.
+cmd_default_branch() {
+  require_in_repo
+  local b
+  if b=$(_resolve_parent_name); then
+    printf '%s\n' "$b"
+  else
+    printf 'main\n'
+  fi
+}
+
+# Emit shell-specific alias/function/abbr definitions for the given shell.
+# Designed to be `eval`d (bash/zsh) or sourced (fish) at shell startup.
+cmd_init() {
+  local shell="${1-}"
+  [[ -n "$shell" ]] || die "usage: git stack init <bash|zsh|fish>"
+  case "$shell" in
+    bash|zsh) _emit_init_posix ;;
+    fish)     _emit_init_fish ;;
+    *) die "unsupported shell: $shell (supported: bash, zsh, fish)" ;;
+  esac
+}
+
+_emit_init_posix() {
+  cat <<'POSIX_EOF'
+# git stack shell integration — add to your rc:
+#   eval "$(git stack init bash)"   # or  init zsh
+alias gstk='git stack'
+alias gstkl='git stack list'
+alias gstkco='git stack checkout'
+alias gstks='git stack status'
+alias gstkr='git stack restack'
+alias gstkrp='git stack restack --push'
+alias gstkro='git stack restack --onto'
+alias gstkc='git stack continue'
+alias gstka='git stack abort'
+alias gstkam='git stack amend'
+alias gstkp='git stack push'
+alias gstkpa='git stack push --all'
+alias gstkh='git stack history'
+alias gstkhs='git stack history show'
+alias gstkhr='git stack history restore'
+alias gstkmv='git stack rename'
+
+gstkrom() {
+  local _b
+  _b=$(git stack default-branch) || return
+  git fetch origin "$_b" && git stack restack --onto "origin/$_b" "$@"
+}
+gstkromp() {
+  local _b
+  _b=$(git stack default-branch) || return
+  git fetch origin "$_b" && git stack restack --onto "origin/$_b" --push "$@"
+}
+gstkcl() {
+  git fetch --all --prune && git stack close "$@"
+}
+POSIX_EOF
+}
+
+_emit_init_fish() {
+  cat <<'FISH_EOF'
+# git stack shell integration — add to your config.fish:
+#   git stack init fish | source
+abbr -a -g gstk git stack
+abbr -a -g gstkl git stack list
+abbr -a -g gstkco git stack checkout
+abbr -a -g gstks git stack status
+abbr -a -g gstkr git stack restack
+abbr -a -g gstkrp git stack restack --push
+abbr -a -g gstkro git stack restack --onto
+abbr -a -g gstkrom "git fetch origin (git stack default-branch); and git stack restack --onto origin/(git stack default-branch)"
+abbr -a -g gstkromp "git fetch origin (git stack default-branch); and git stack restack --onto origin/(git stack default-branch) --push"
+abbr -a -g gstkc git stack continue
+abbr -a -g gstka git stack abort
+abbr -a -g gstkam git stack amend
+abbr -a -g gstkp git stack push
+abbr -a -g gstkpa git stack push --all
+abbr -a -g gstkh git stack history
+abbr -a -g gstkhs git stack history show
+abbr -a -g gstkhr git stack history restore
+abbr -a -g gstkmv git stack rename
+abbr -a -g gstkcl "git fetch --all --prune; and git stack close"
+FISH_EOF
+}
+
+# ---------- dispatch ----------
+
+# Subcommand exit codes:
+#   0  success
+#   1  generic error (die)
+#   2  cherry-pick conflict — state file preserved; resume with `continue`
+#   3  push failures during the run — state cleared; rerun pushes manually
+main() {
+  # Pre-scan args for color preference so help output respects it too.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --color)    USE_COLOR_PREF="always" ;;
+      --no-color) USE_COLOR_PREF="never" ;;
+    esac
+  done
+  color_init
+  local sub="${1-help}"
+  case "$sub" in
+    help|--help|-h|"") cmd_help ;;
+    list)              shift; cmd_list "$@" ;;
+    checkout|co)       shift; cmd_checkout "$@" ;;
+    status)            shift; cmd_status "$@" ;;
+    prefix)            shift; cmd_prefix "$@" ;;
+    restack)           shift; cmd_restack "$@" ;;
+    amend)             shift; cmd_amend "$@" ;;
+    continue)          shift; cmd_continue "$@" ;;
+    abort)             shift; cmd_abort "$@" ;;
+    push)              shift; cmd_push "$@" ;;
+    history)           shift; cmd_history "$@" ;;
+    rename)            shift; cmd_rename "$@" ;;
+    close)             shift; cmd_close "$@" ;;
+    init)              shift; cmd_init "$@" ;;
+    default-branch)    shift; cmd_default_branch "$@" ;;
+    *) die "unknown subcommand: $sub (try 'git stack help')" ;;
+  esac
+}
+
+main "$@"
