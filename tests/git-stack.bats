@@ -211,6 +211,249 @@ teardown() { teardown_repo; }
   git rev-parse --verify --quiet refs/heads/feat/01-a
 }
 
+# ---------- pr sync ----------
+
+@test "pr sync: fresh 3-branch stack creates draft PRs with correct bases" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"create  #101 feat/01-foo -> main"* ]]
+  [[ "$output" == *"create  #102 feat/02-bar -> feat/01-foo"* ]]
+  [[ "$output" == *"create  #103 feat/03-baz -> feat/02-bar"* ]]
+  # Each branch: one pr create, one pr edit
+  [ "$(gh_log_count 'pr create')" -eq 3 ]
+  [ "$(gh_log_count 'pr edit')" -eq 3 ]
+  # Verify --draft is on each create
+  local creates
+  creates=$(grep -c '^gh pr create.* --draft' "$GH_STUB_LOG")
+  [ "$creates" -eq 3 ]
+}
+
+@test "pr sync: idempotent re-run makes no remote changes" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"exists  #101"* ]]
+  [[ "$output" == *"exists  #102"* ]]
+  [[ "$output" == *"exists  #103"* ]]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+}
+
+@test "pr sync: stack growing from 2 to 3 rebrackets existing titles" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  # Sanity: PRs exist with [1/2] and [2/2] titles. Content title comes from
+  # the last commit subject on each branch — make_stack_branches commits with
+  # subjects matching the leaf names ("01-foo", "02-bar").
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/2] 01-foo" ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/102.json")" = "[2/2] 02-bar" ]
+  # Add a third branch (no need to push manually — pr sync will push it).
+  git checkout -q -b feat/03-baz
+  echo c >> file
+  git add file
+  git commit -q -m "third commit"
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/3] 01-foo" ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/102.json")" = "[2/3] 02-bar" ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/103.json")" = "[3/3] third commit" ]
+}
+
+@test "pr sync: preserves non-position bracket prefix like [WIP]" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  # User manually edits #101's title.
+  jq '.title = "[WIP] Foo overhaul"' "$GH_STUB_DIR/by-num/101.json" > "$GH_STUB_DIR/x"
+  mv "$GH_STUB_DIR/x" "$GH_STUB_DIR/by-num/101.json"
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/3] [WIP] Foo overhaul" ]
+}
+
+@test "pr sync --no-push: errors when a branch isn't on origin" {
+  make_stack_branches feat 01-foo 02-bar
+  # No make_remote_origin — branches don't exist on origin
+  git init -q --bare "${TEST_REPO}.origin"
+  git remote add origin "${TEST_REPO}.origin"
+  run git stack pr sync --no-push --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not synced on origin"* ]]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+}
+
+@test "pr sync --dry-run: makes no create/edit calls" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  run git stack pr sync --dry-run --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"create  feat/01-foo"* ]]
+  [[ "$output" == *"update  #DRY"* ]]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  # pr list still called (read-only query is fine)
+  [ "$(gh_log_count 'pr list')" -gt 0 ]
+}
+
+@test "pr sync: picks up .github/pull_request_template.md and prepends it" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  mkdir -p .github
+  printf '## Why\n\nDescribe the change.\n' > .github/pull_request_template.md
+  git add .github && git commit -q -m "add template"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  # The body sent to pr create should contain the template content.
+  local body
+  body=$(gh_log_stdin 'pr create')
+  [[ "$body" == *"## Why"* ]]
+  [[ "$body" == *"Describe the change."* ]]
+  # And after pass 2, the stored body has template + nav footer.
+  local stored
+  stored=$(jq -r .body "$GH_STUB_DIR/by-num/101.json")
+  [[ "$stored" == *"## Why"* ]]
+  [[ "$stored" == *"git-stack:nav-start"* ]]
+  [[ "$stored" == *"git-stack:nav-end"* ]]
+}
+
+@test "pr sync: prefers .github/PULL_REQUEST_TEMPLATE/default.md over single-file" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  mkdir -p .github/PULL_REQUEST_TEMPLATE
+  printf 'SINGLE FILE TEMPLATE\n' > .github/PULL_REQUEST_TEMPLATE.md
+  printf 'DIRECTORY DEFAULT TEMPLATE\n' > .github/PULL_REQUEST_TEMPLATE/default.md
+  git add .github && git commit -q -m "add templates"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  local body
+  body=$(gh_log_stdin 'pr create')
+  [[ "$body" == *"DIRECTORY DEFAULT TEMPLATE"* ]]
+  [[ "$body" != *"SINGLE FILE TEMPLATE"* ]]
+}
+
+@test "pr sync: warns on multi-template directory without default" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  mkdir -p .github/PULL_REQUEST_TEMPLATE
+  printf 'feature\n' > .github/PULL_REQUEST_TEMPLATE/feature.md
+  printf 'bug\n' > .github/PULL_REQUEST_TEMPLATE/bug.md
+  git add .github && git commit -q -m "add multi templates"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no default.md"* ]] || [[ "$output" == *"multi-template"* ]]
+  # Body should NOT contain template content (just nav footer)
+  local stored
+  stored=$(jq -r .body "$GH_STUB_DIR/by-num/101.json")
+  [[ "$stored" != *"feature"* ]]
+  [[ "$stored" != *"bug"* ]]
+  [[ "$stored" == *"git-stack:nav-start"* ]]
+}
+
+@test "pr sync: --ready creates non-draft PRs" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  run git stack pr sync --ready --no-color
+  [ "$status" -eq 0 ]
+  # No --draft flag in any pr create invocation
+  local drafts
+  drafts=$(grep -c '^gh pr create.* --draft' "$GH_STUB_LOG" || true)
+  [ "$drafts" -eq 0 ]
+  [ "$(gh_log_count 'pr create')" -eq 2 ]
+}
+
+@test "pr sync: partial pr create failure returns exit 3 but processes others" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_STUB_FAIL_CREATE="feat/02-bar"
+  run git stack pr sync --no-color
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"PR sync failed for"* ]]
+  # First and third should have created PRs (stub sanitizes / and - to _)
+  [ "$(gh_log_count 'pr create')" -eq 3 ]   # all three attempted
+  [ -f "$GH_STUB_DIR/by-branch/feat_01_foo.num" ]
+  [ -f "$GH_STUB_DIR/by-branch/feat_03_baz.num" ]
+  # Middle branch should NOT have a state file (create failed)
+  [ ! -f "$GH_STUB_DIR/by-branch/feat_02_bar.num" ]
+}
+
+@test "pr sync: single-branch stack still gets nav footer" {
+  make_stack_branches feat 01-solo
+  make_remote_origin
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  local body
+  body=$(jq -r .body "$GH_STUB_DIR/by-num/101.json")
+  [[ "$body" == *"git-stack:nav-start"* ]]
+  [[ "$body" == *"#101 01-solo ← this PR"* ]]
+  [[ "$body" == *"git-stack:nav-end"* ]]
+}
+
+@test "pr sync: empty-diff branch in middle is skipped and chain bridges over it" {
+  make_stack_branches feat 01-foo
+  # Create 02-mid pointing at feat/01-foo's tip — no new commits
+  git branch feat/02-mid feat/01-foo
+  git checkout -q feat/02-mid
+  git checkout -q -b feat/03-baz
+  echo c >> file
+  git add file
+  git commit -q -m third
+  make_remote_origin
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skip    feat/02-mid"* ]]
+  [[ "$output" == *"no commits ahead of feat/01-foo"* ]]
+  # Only 2 PRs created (not 3)
+  [ "$(gh_log_count 'pr create')" -eq 2 ]
+  # 03-baz's --base should be feat/01-foo (bridging over the empty middle)
+  grep -q '^gh pr create .*--head feat/03-baz .*--base feat/01-foo' "$GH_STUB_LOG"
+  # Titles use [N/2] not [N/3]. Content comes from each branch's last commit
+  # subject: 01-foo from make_stack_branches, "third" from the inline commit.
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/2] 01-foo" ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/102.json")" = "[2/2] third" ]
+}
+
+@test "pr sync: resumability — already-existing PR is found via re-query" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  # Seed an existing PR for feat/01-foo with a stale position prefix
+  # (simulates a stack that's been reshuffled since the prior run).
+  export GH_PR_feat_01_foo__NUM=999
+  export GH_PR_feat_01_foo__TITLE="[5/9] Old name"
+  export GH_PR_feat_01_foo__BODY=""
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  # No new PR created for 01-foo (we re-discovered #999); one for 02-bar
+  [[ "$output" == *"exists  #999 feat/01-foo"* ]]
+  [[ "$output" == *"create  #101 feat/02-bar"* ]]
+  # And the title's position prefix should have been rebracketed to [1/2],
+  # preserving the rest of the title ("Old name").
+  # NOTE: env-seeded PRs don't get persisted edits in the stub (it can't write
+  # to env vars), so we verify the edit via the stub log instead. The stub
+  # logs argv shell-quoted via %q, so reconstruct it with `eval set --`.
+  local edit_line cmd_part title_arg=""
+  edit_line=$(grep '^gh pr edit 999 ' "$GH_STUB_LOG" | head -1)
+  [ -n "$edit_line" ]
+  cmd_part="${edit_line%%	*}"
+  eval "set -- $cmd_part"
+  while (( $# > 0 )); do
+    if [ "$1" = "--title" ]; then
+      title_arg="${2-}"
+      break
+    fi
+    shift
+  done
+  [ "$title_arg" = "[1/2] Old name" ]
+}
+
 # ---------- default-branch ----------
 
 @test "default-branch: returns main when on main" {
@@ -287,11 +530,11 @@ teardown() { teardown_repo; }
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches simple-abbreviation count (16)" {
-  # 16 simple aliases (gstk + 15 others), 3 compound functions.
+@test "init bash: alias count matches simple-abbreviation count (17)" {
+  # 17 simple aliases (gstk + 16 others), 3 compound functions.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk')
-  [ "$alias_count" -eq 16 ]
+  [ "$alias_count" -eq 17 ]
 }

@@ -10,7 +10,7 @@ feat/02-login
 feat/03-profile
 ```
 
-`git stack` reflows the stack after you amend the bottom, renames the whole prefix atomically, pushes with `--force-with-lease`, prunes branches whose remote has been deleted, and keeps snapshots so you can roll back.
+`git stack` reflows the stack after you amend the bottom, renames the whole prefix atomically, pushes with `--force-with-lease`, opens and updates the GitHub PR chain (via `gh`), prunes branches whose remote has been deleted, and keeps snapshots so you can roll back.
 
 ## Install
 
@@ -76,6 +76,7 @@ Then reload your shell.
 | `gstkam`    | `git stack amend`                                                                                |
 | `gstkp`     | `git stack push`                                                                                 |
 | `gstkpa`    | `git stack push --all`                                                                           |
+| `gstkprs`   | `git stack pr sync`                                                                              |
 | `gstkh`     | `git stack history`                                                                              |
 | `gstkhs`    | `git stack history show`                                                                         |
 | `gstkhr`    | `git stack history restore`                                                                      |
@@ -102,7 +103,22 @@ git stack list                    # see the stack and sync state
 git stack amend -m "fix typo"     # amend current branch, reflow the rest
 git stack push --all              # push every branch with --force-with-lease
 git stack restack --onto origin/main   # rebase the whole stack onto a new base
+git stack pr sync                 # open draft PRs for the chain (or update them)
 ```
+
+## Syncing PRs to GitHub
+
+`git stack pr sync` opens and updates the GitHub PR chain to match the local stack. It pushes any unpushed branches, creates a draft PR per branch (each one's base pointing at the previous branch in the stack, or `stack.base` for the bottom), uses the repo's PR template if present (`.github/PULL_REQUEST_TEMPLATE.md` or its variants), and keeps each PR's title prefix (`[N/M]`) and a stack-navigation footer in sync. Re-run it whenever the stack changes — new branch, removed branch, reordered — to bring the PRs back into alignment. Idempotent: PRs whose title and body already match aren't touched.
+
+```sh
+git stack pr sync                 # default: drafts, auto-push missing branches
+git stack pr sync --ready         # open as ready-for-review instead of drafts
+git stack pr sync --no-push       # error if any branch isn't on origin
+git stack pr sync --dry-run       # show planned actions, make no remote calls
+git stack pr sync --no-template   # ignore .github/PULL_REQUEST_TEMPLATE.md
+```
+
+Requires [`gh`](https://cli.github.com/) authenticated for github.com (`gh auth login`).
 
 ## Configuration
 
@@ -114,11 +130,11 @@ git config stack.historyKeep 100     # auto-prune older snapshots (0 disables)
 
 ## Tests
 
-Requires `bats-core`:
+Requires `bats-core` and `jq` (the `pr sync` tests use a stubbed `gh` that pipes JSON through `jq`):
 
 ```sh
-brew install bats-core          # macOS
-sudo apt-get install -y bats    # Debian/Ubuntu
+brew install bats-core jq       # macOS
+sudo apt-get install -y bats jq # Debian/Ubuntu
 
 make test                       # JOBS=4 by default
 make test JOBS=1                # sequential

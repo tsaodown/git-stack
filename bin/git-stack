@@ -682,6 +682,204 @@ run_reflow_loop() {
   clear_state
 }
 
+# ---------- PR sync helpers ----------
+
+# Verify gh CLI is installed, authenticated for github.com, and a GitHub
+# remote exists. On success, GH_REPO is set to "<owner>/<repo>" for use by
+# all subsequent gh invocations as --repo "$GH_REPO".
+GH_REPO=""
+_gh_preflight() {
+  command -v gh >/dev/null 2>&1 \
+    || die "gh not found; install from https://cli.github.com/"
+  gh auth status -h github.com >/dev/null 2>&1 \
+    || die "gh not authenticated for github.com (run: gh auth login)"
+  GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+    || die "no GitHub remote detected (run from a repo with a github.com remote)"
+  [[ -n "$GH_REPO" ]] || die "gh repo view returned empty nameWithOwner"
+}
+
+# The branch's last commit subject — used as the content portion of a fresh
+# PR title (before the [N/M] position prefix is applied).
+_pr_branch_title() {
+  local branch="$1"
+  git log -1 --format='%s' "refs/heads/$branch" 2>/dev/null
+}
+
+# Compose a PR title with a [N/M] position prefix.
+# Args: <pos> <total> <existing_title> [<leaf_fallback>]
+#   - If existing matches "^\[\d+/\d+\] ", replace just that prefix.
+#   - Else if existing is non-empty, prepend "[N/M] " to it.
+#   - Else compose "[N/M] <leaf_fallback>".
+_pr_title_with_pos() {
+  local pos="$1" total="$2" existing="${3-}" leaf_fallback="${4-}"
+  if [[ "$existing" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
+    printf '[%d/%d] %s' "$pos" "$total" "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ -n "$existing" ]]; then
+    printf '[%d/%d] %s' "$pos" "$total" "$existing"
+    return 0
+  fi
+  printf '[%d/%d] %s' "$pos" "$total" "$leaf_fallback"
+}
+
+# Print the repo's PR template body to stdout (empty if none found).
+# Lookup order:
+#   1. .github/PULL_REQUEST_TEMPLATE/default.md (multi-template repo default)
+#   2. case-insensitive search for pull_request_template.md in .github/, docs/, repo root
+#   3. if multi-template dir exists with no default and no single-file match:
+#      warn (caller falls back to empty body)
+_pr_template_body() {
+  local toplevel
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  local dir_path="${toplevel}/.github/PULL_REQUEST_TEMPLATE"
+  if [[ -d "$dir_path" && -f "$dir_path/default.md" ]]; then
+    cat "$dir_path/default.md"
+    return 0
+  fi
+  local dir cand
+  for dir in ".github" "docs" "."; do
+    [[ -d "$toplevel/$dir" ]] || continue
+    cand=$(find "$toplevel/$dir" -maxdepth 1 -iname "pull_request_template.md" -type f 2>/dev/null | head -1)
+    if [[ -n "$cand" ]]; then
+      cat "$cand"
+      return 0
+    fi
+  done
+  if [[ -d "$dir_path" ]]; then
+    warn "multi-template dir $dir_path/ has no default.md; using empty body"
+  fi
+  return 0
+}
+
+# Filter stdin -> stdout, removing the fenced nav-footer block (inclusive of
+# both fence comments) plus any trailing blank lines. Idempotent.
+_pr_strip_nav_footer() {
+  awk '
+    /<!-- git-stack:nav-start -->/ { skip=1 }
+    !skip { print }
+    /<!-- git-stack:nav-end -->/ { skip=0; next }
+  ' | awk '
+    { lines[NR]=$0; last=NR }
+    END {
+      end=last
+      while (end > 0 && lines[end] ~ /^[[:space:]]*$/) end--
+      for (i=1; i<=end; i++) print lines[i]
+    }
+  '
+}
+
+# Emit the fenced stack-nav footer to stdout.
+# Args: <self_branch> then repeating triples of (branch, pr_num, title).
+# Titles with a leading "[N/M] " prefix have that prefix stripped before
+# display (the bracket info is redundant inside the chain listing).
+_pr_render_nav_footer() {
+  local self="$1"; shift
+  printf '<!-- git-stack:nav-start -->\n'
+  printf '## Stack\n\n'
+  local b n t
+  while (( $# >= 3 )); do
+    b="$1"; n="$2"; t="$3"
+    if [[ "$t" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
+      t="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$b" == "$self" ]]; then
+      printf -- '- #%s %s ← this PR\n' "$n" "$t"
+    else
+      printf -- '- #%s %s\n' "$n" "$t"
+    fi
+    shift 3
+  done
+  printf '\n<!-- git-stack:nav-end -->\n'
+}
+
+# Return 0 if <branch> needs to be (re-)pushed to origin: either the
+# remote-tracking ref is missing, or local and remote tips differ.
+_pr_needs_push() {
+  local b="$1"
+  local local_sha remote_sha
+  local_sha=$(git rev-parse --verify --quiet "refs/heads/$b" 2>/dev/null) || return 0
+  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/origin/$b" 2>/dev/null) || return 0
+  [[ "$local_sha" != "$remote_sha" ]]
+}
+
+# Look up an open PR for <branch>. On success, print
+#   "<num><US><title><US><body>"
+# where <US> is ASCII unit separator (\x1f) and <body> may contain newlines.
+# Empty stdout if no PR found.
+_gh_pr_find() {
+  local b="$1"
+  gh pr list --repo "$GH_REPO" --head "$b" --state open --limit 1 \
+    --json number,title,body \
+    --jq '.[] | "\(.number)\(.title // "")\(.body // "")"' \
+    2>/dev/null
+}
+
+# Create a draft PR (or non-draft if draft=0) for <branch>.
+# Args: <branch> <parent> <title> <draft:0|1> <body>
+# Prints the new PR number on stdout. On "already exists" error, re-queries
+# and returns the existing PR's number (handles interrupted prior runs).
+# Returns 1 on hard failure (caller adds to PR_FAILURES).
+_gh_pr_create() {
+  local b="$1" parent="$2" title="$3" draft="$4" body="$5"
+  local args=( --repo "$GH_REPO" --head "$b" --base "$parent" --title "$title" --body-file - )
+  if (( draft )); then
+    args+=( --draft )
+  fi
+  local out url num
+  if out=$(printf '%s' "$body" | gh pr create "${args[@]}" 2>&1); then
+    url=$(printf '%s' "$out" | tail -1)
+    num="${url##*/}"
+    if [[ "$num" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$num"
+      return 0
+    fi
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  if [[ "$out" == *"already exists"* ]]; then
+    log_v "gh pr create: $out"
+    local lookup
+    lookup=$(_gh_pr_find "$b")
+    if [[ -n "$lookup" ]]; then
+      printf '%s' "${lookup%%$'\x1f'*}"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$out" >&2
+  return 1
+}
+
+# Update an existing PR's title and/or body. Pass empty string for either to
+# skip that field. Returns 1 on failure (output captured + printed to stderr).
+_gh_pr_edit() {
+  local num="$1" new_title="$2" new_body="$3"
+  local args=( "$num" --repo "$GH_REPO" )
+  if [[ -n "$new_title" ]]; then
+    args+=( --title "$new_title" )
+  fi
+  local stdin_needed=0
+  if [[ -n "$new_body" ]]; then
+    args+=( --body-file - )
+    stdin_needed=1
+  fi
+  # Nothing to update (just <num> --repo <repo>). Caller should guard; this
+  # is defensive.
+  (( ${#args[@]} > 3 )) || return 0
+  local out
+  if (( stdin_needed )); then
+    out=$(printf '%s' "$new_body" | gh pr edit "${args[@]}" 2>&1) || {
+      printf '%s\n' "$out" >&2
+      return 1
+    }
+  else
+    out=$(gh pr edit "${args[@]}" 2>&1) || {
+      printf '%s\n' "$out" >&2
+      return 1
+    }
+  fi
+}
+
 # ---------- subcommands ----------
 
 cmd_help() {
@@ -741,6 +939,17 @@ ${b}Subcommands:${r}
                                     upward (default). With ${fl}--all${r}, push the
                                     entire stack from the bottom; with ${fl}--from${r}
                                     <branch>, start at that branch.
+  ${sub}pr sync${r} [${fl}--no-push${r}] [${fl}--ready${r}] [${fl}--dry-run${r}] [${fl}--no-template${r}]
+                                    Sync the GitHub PR chain to the local
+                                    stack. Pushes any unpushed branches,
+                                    opens a draft PR for each (base = previous
+                                    branch, or ${fl}stack.base${r} for the bottom),
+                                    titled \`[N/M] <last commit subject>\`, with
+                                    the repo's PR template as the body. On
+                                    existing PRs, keeps the [N/M] prefix and
+                                    a fenced stack-nav footer up to date.
+                                    Re-run after any stack change. Requires
+                                    \`gh\` authenticated for github.com.
   ${sub}history${r}                           List snapshots taken before each restack/
                                     amend. Subcommands: \`history show <id>\`,
                                     \`history restore <id> [--yes]\`. Run-id may
@@ -1664,6 +1873,226 @@ cmd_push() {
   fi
 }
 
+# Sub-dispatcher for `git stack pr <verb>`. Only `sync` is implemented; the
+# structure leaves room for future verbs (pr list, pr close, etc.).
+cmd_pr() {
+  local sub="${1-}"
+  if [[ -z "$sub" || "$sub" == -* ]]; then
+    # No subverb given (or only flags) — default to sync.
+    cmd_pr_sync "$@"
+    return
+  fi
+  shift
+  case "$sub" in
+    sync) cmd_pr_sync "$@" ;;
+    *) die "unknown pr subcommand: $sub (try 'sync')" ;;
+  esac
+}
+
+# Open/update the stack's GitHub PR chain. Three passes:
+#   0. push any branches whose remote-tracking ref is missing or stale
+#   0.5 filter out branches with no commits ahead of their in-stack parent
+#   1. for each remaining (ACTIVE) branch, find existing open PR or create
+#      a new draft PR with title "[N/M] <leaf>"
+#   2. rewrite each PR's title prefix and stack-nav footer so the chain
+#      reflects the current local stack
+cmd_pr_sync() {
+  OPT_PREFIX=""
+  local opt_no_push=0 opt_ready=0 opt_dry_run=0 opt_no_template=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --no-push)     opt_no_push=1; shift ;;
+      --ready)       opt_ready=1; shift ;;
+      --dry-run)     opt_dry_run=1; shift ;;
+      --no-template) opt_no_template=1; shift ;;
+      -*) die "unknown pr sync flag: $1" ;;
+      *)  die "pr sync: unexpected arg '$1'" ;;
+    esac
+  done
+
+  require_in_repo
+  _gh_preflight
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under $prefix"
+  local M=${#branches[@]}
+
+  local base0
+  base0=$(_resolve_parent_name) \
+    || die "could not resolve stack base branch (set git config stack.base)"
+
+  # --- pass 0: push ---
+  local b
+  local fatal_unpushed=()
+  STACK_PUSH_FAILURES=()
+  for b in "${branches[@]}"; do
+    if _pr_needs_push "$b"; then
+      if (( opt_no_push )); then
+        fatal_unpushed+=("$b")
+      elif (( opt_dry_run )); then
+        log "${C_BLUE}push${C_RESET}    ${C_CYAN}$b${C_RESET} ${C_DIM}(dry-run)${C_RESET}"
+      else
+        push_branch "$b" || true
+      fi
+    fi
+  done
+  if (( ${#fatal_unpushed[@]} > 0 )); then
+    local s=""
+    for b in "${fatal_unpushed[@]}"; do s="${s:+$s }$b"; done
+    die "--no-push set, but these branches are not synced on origin: $s"
+  fi
+  if (( ${#STACK_PUSH_FAILURES[@]} > 0 )); then
+    local s=""
+    for b in "${STACK_PUSH_FAILURES[@]}"; do s="${s:+$s }$b"; done
+    warn "push failed for: $s"
+    return 3
+  fi
+
+  # --- pass 0.5: filter empty-diff branches ---
+  local ACTIVE=()
+  local i parent_in_stack p_sha b_sha
+  for ((i = 0; i < M; i++)); do
+    if (( i == 0 )); then
+      parent_in_stack="$base0"
+    else
+      parent_in_stack="${branches[i-1]}"
+    fi
+    p_sha=$(git rev-parse --verify --quiet "refs/heads/$parent_in_stack" 2>/dev/null || true)
+    b_sha=$(git rev-parse --verify --quiet "refs/heads/${branches[i]}" 2>/dev/null || true)
+    if [[ -n "$p_sha" && "$p_sha" == "$b_sha" ]]; then
+      log "${C_DIM}skip${C_RESET}    ${C_CYAN}${branches[i]}${C_RESET} ${C_DIM}(no commits ahead of $parent_in_stack)${C_RESET}"
+      continue
+    fi
+    ACTIVE+=("${branches[i]}")
+  done
+  local N=${#ACTIVE[@]}
+  (( N > 0 )) || die "nothing to do — every stack branch is empty"
+
+  # --- pass 1: query existing or create new (bottom-up) ---
+  # Parallel arrays indexed 0..N-1
+  local PR_NUMS=() PR_TITLES=() PR_BODIES=()
+  local template_body=""
+  if (( ! opt_no_template )); then
+    template_body=$(_pr_template_body)
+  fi
+  local PR_FAILURES=()
+  local j parent leaf found
+  for ((j = 0; j < N; j++)); do
+    b="${ACTIVE[j]}"
+    if (( j == 0 )); then
+      parent="$base0"
+    else
+      parent="${ACTIVE[j-1]}"
+    fi
+    found=$(_gh_pr_find "$b")
+    if [[ -n "$found" ]]; then
+      local cur_num cur_title cur_body rest
+      cur_num="${found%%$'\x1f'*}"
+      rest="${found#*$'\x1f'}"
+      cur_title="${rest%%$'\x1f'*}"
+      cur_body="${rest#*$'\x1f'}"
+      PR_NUMS+=("$cur_num")
+      PR_TITLES+=("$cur_title")
+      PR_BODIES+=("$cur_body")
+      log "${C_DIM}exists${C_RESET}  ${C_GREEN}#${cur_num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+    else
+      leaf=$(_pr_branch_title "$b")
+      local fresh_title
+      fresh_title=$(_pr_title_with_pos "$((j+1))" "$N" "" "$leaf")
+      if (( opt_dry_run )); then
+        log "${C_GREEN}create${C_RESET}  ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}  title='${fresh_title}'  body=${#template_body}B${C_RESET}"
+        PR_NUMS+=("DRY")
+        PR_TITLES+=("$fresh_title")
+        PR_BODIES+=("$template_body")
+        continue
+      fi
+      local draft=1
+      (( opt_ready )) && draft=0
+      local new_num
+      if new_num=$(_gh_pr_create "$b" "$parent" "$fresh_title" "$draft" "$template_body"); then
+        PR_NUMS+=("$new_num")
+        PR_TITLES+=("$fresh_title")
+        PR_BODIES+=("$template_body")
+        log "${C_GREEN}create${C_RESET}  ${C_GREEN}#${new_num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}${C_RESET}"
+      else
+        warn "pr create failed for $b"
+        PR_FAILURES+=("$b")
+        PR_NUMS+=("?")
+        PR_TITLES+=("$fresh_title")
+        PR_BODIES+=("$template_body")
+      fi
+    fi
+  done
+
+  # --- pass 2: rewrite title + body with full chain context ---
+  for ((j = 0; j < N; j++)); do
+    b="${ACTIVE[j]}"
+    local num="${PR_NUMS[j]}"
+    [[ "$num" == "?" ]] && continue   # creation failed; skip update
+    local cur_title="${PR_TITLES[j]}"
+    local cur_body="${PR_BODIES[j]}"
+    leaf=$(_pr_branch_title "$b")
+    local desired_title
+    desired_title=$(_pr_title_with_pos "$((j+1))" "$N" "$cur_title" "$leaf")
+    local stripped
+    stripped=$(printf '%s' "$cur_body" | _pr_strip_nav_footer)
+    local footer_args=("$b") k
+    for ((k = 0; k < N; k++)); do
+      footer_args+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${PR_TITLES[k]}")
+    done
+    local footer
+    footer=$(_pr_render_nav_footer "${footer_args[@]}")
+    local desired_body
+    if [[ -n "$stripped" ]]; then
+      desired_body=$(printf '%s\n\n%s' "$stripped" "$footer")
+    else
+      desired_body="$footer"
+    fi
+    # Real GitHub may normalize bodies on the round-trip (trailing newline,
+    # CRLF -> LF). On a first re-sync after a fresh create, this can cause a
+    # spurious body_changed=1 even when nothing meaningful changed — at worst
+    # one redundant `gh pr edit` per PR, after which state stabilizes.
+    local title_changed=0 body_changed=0
+    [[ "$desired_title" != "$cur_title" ]] && title_changed=1
+    [[ "$desired_body" != "$cur_body" ]] && body_changed=1
+    if (( ! title_changed && ! body_changed )); then
+      log_v "${C_DIM}ok${C_RESET}      ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+      continue
+    fi
+    if (( opt_dry_run )); then
+      local tc bc
+      (( title_changed )) && tc=yes || tc=no
+      (( body_changed )) && bc=yes || bc=no
+      log "${C_BLUE}update${C_RESET}  ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}(title=$tc body=$bc)${C_RESET}"
+      continue
+    fi
+    local pass_title="" pass_body=""
+    (( title_changed )) && pass_title="$desired_title"
+    (( body_changed ))  && pass_body="$desired_body"
+    if _gh_pr_edit "$num" "$pass_title" "$pass_body"; then
+      log "${C_BLUE}update${C_RESET}  ${C_GREEN}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+    else
+      warn "pr edit failed for $b (#${num})"
+      PR_FAILURES+=("$b")
+    fi
+  done
+
+  if (( ${#PR_FAILURES[@]} > 0 )); then
+    local s=""
+    for b in "${PR_FAILURES[@]}"; do s="${s:+$s }$b"; done
+    warn "PR sync failed for: $s"
+    return 3
+  fi
+  log "${C_GREEN}done${C_RESET}    pr sync complete (${C_BOLD}${N}${C_RESET} branches)"
+}
+
 # Interactive selector. $1 = prompt header, remaining args = options. Prefers
 # fzf; falls back to a numbered-list prompt read from /dev/tty. Prints the
 # chosen option to stdout, returns non-zero if the user aborts.
@@ -1871,6 +2300,7 @@ alias gstka='git stack abort'
 alias gstkam='git stack amend'
 alias gstkp='git stack push'
 alias gstkpa='git stack push --all'
+alias gstkprs='git stack pr sync'
 alias gstkh='git stack history'
 alias gstkhs='git stack history show'
 alias gstkhr='git stack history restore'
@@ -1910,6 +2340,7 @@ abbr -a -g gstka git stack abort
 abbr -a -g gstkam git stack amend
 abbr -a -g gstkp git stack push
 abbr -a -g gstkpa git stack push --all
+abbr -a -g gstkprs git stack pr sync
 abbr -a -g gstkh git stack history
 abbr -a -g gstkhs git stack history show
 abbr -a -g gstkhr git stack history restore
@@ -1947,6 +2378,7 @@ main() {
     continue)          shift; cmd_continue "$@" ;;
     abort)             shift; cmd_abort "$@" ;;
     push)              shift; cmd_push "$@" ;;
+    pr)                shift; cmd_pr "$@" ;;
     history)           shift; cmd_history "$@" ;;
     rename)            shift; cmd_rename "$@" ;;
     close)             shift; cmd_close "$@" ;;
