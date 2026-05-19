@@ -803,6 +803,42 @@ _pr_needs_push() {
   [[ "$local_sha" != "$remote_sha" ]]
 }
 
+# Return 0 (true) if <branch>'s tip SHA equals <parent>'s tip SHA — i.e. the
+# branch has no commits ahead of its in-stack parent. gh pr create would
+# fail with "No commits between base and head" for these, so we filter them
+# out of the active set.
+_pr_is_empty_diff() {
+  local b="$1" parent="$2"
+  local p_sha b_sha
+  p_sha=$(git rev-parse --verify --quiet "refs/heads/$parent" 2>/dev/null || true)
+  b_sha=$(git rev-parse --verify --quiet "refs/heads/$b" 2>/dev/null || true)
+  [[ -n "$p_sha" && "$p_sha" == "$b_sha" ]]
+}
+
+# Populate the named array with branches that have at least one commit ahead
+# of their in-stack predecessor. Empty-diff branches are silently filtered.
+# The caller can re-iterate the input and call _pr_is_empty_diff to log a
+# message for each skipped branch.
+# Usage: _pr_active_branches <base0> <out_array_name> <branches...>
+_pr_active_branches() {
+  local base0="$1" out_name="$2"
+  shift 2
+  local in=("$@")
+  eval "$out_name=()"
+  local i parent
+  for ((i = 0; i < ${#in[@]}; i++)); do
+    if (( i == 0 )); then
+      parent="$base0"
+    else
+      parent="${in[i-1]}"
+    fi
+    if _pr_is_empty_diff "${in[i]}" "$parent"; then
+      continue
+    fi
+    eval "$out_name+=( $(printf '%q' "${in[i]}") )"
+  done
+}
+
 # Look up an open PR for <branch>. On success, print
 #   "<num><US><title><US><body>"
 # where <US> is ASCII unit separator (\x1f) and <body> may contain newlines.
@@ -880,6 +916,31 @@ _gh_pr_edit() {
   fi
 }
 
+# Emit an OSC 8 hyperlink escape sequence wrapping <text> with <url>, when
+# colors are on. Falls back to plain <text> when --no-color / non-TTY (i.e.
+# whenever color_init left $C_RESET empty). Same gate as ANSI colors.
+_osc8_link() {
+  local url="$1" text="$2"
+  if [[ -n "$C_RESET" ]]; then
+    printf '\033]8;;%s\007%s\033]8;;\007' "$url" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+# Inspect a PR for <branch> across all states (open/closed/merged). Emits one
+# line (\x1f-separated) on success:
+#   num<US>title<US>state<US>isDraft<US>baseRefName<US>reviewDecision<US>commentsCount
+# Empty stdout if no PR exists for the branch. Unlike _gh_pr_find, no
+# `--state open` filter — `pr list` should surface closed/merged PRs too.
+_gh_pr_inspect() {
+  local b="$1"
+  gh pr list --repo "$GH_REPO" --head "$b" --limit 1 \
+    --json number,title,state,isDraft,baseRefName,reviewDecision,comments \
+    --jq '.[] | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)"' \
+    2>/dev/null
+}
+
 # ---------- subcommands ----------
 
 cmd_help() {
@@ -950,6 +1011,14 @@ ${b}Subcommands:${r}
                                     a fenced stack-nav footer up to date.
                                     Re-run after any stack change. Requires
                                     \`gh\` authenticated for github.com.
+  ${sub}pr list${r} [${fl}--no-fetch${r}]              List the stack's PRs one per line: branch,
+                                    PR number (clickable link in modern
+                                    terminals), status badges (\`[synced]\`,
+                                    \`[draft]\`, \`[base: X]\`, \`[approved]\`,
+                                    \`[closed]\`/\`[merged]\`), title, and
+                                    comment count. Runs \`git fetch --all
+                                    --prune\` by default; pass ${fl}--no-fetch${r}
+                                    to skip. Requires \`gh\`.
   ${sub}history${r}                           List snapshots taken before each restack/
                                     amend. Subcommands: \`history show <id>\`,
                                     \`history restore <id> [--yes]\`. Run-id may
@@ -1885,7 +1954,8 @@ cmd_pr() {
   shift
   case "$sub" in
     sync) cmd_pr_sync "$@" ;;
-    *) die "unknown pr subcommand: $sub (try 'sync')" ;;
+    list) cmd_pr_list "$@" ;;
+    *) die "unknown pr subcommand: $sub (try 'sync' or 'list')" ;;
   esac
 }
 
@@ -1957,20 +2027,19 @@ cmd_pr_sync() {
 
   # --- pass 0.5: filter empty-diff branches ---
   local ACTIVE=()
-  local i parent_in_stack p_sha b_sha
+  _pr_active_branches "$base0" ACTIVE "${branches[@]}"
+  # Log a skip line for each empty-diff branch (re-checking the condition is
+  # cheap and keeps the active-branch filter pure / log-free for `pr list`).
+  local i parent_in_stack
   for ((i = 0; i < M; i++)); do
     if (( i == 0 )); then
       parent_in_stack="$base0"
     else
       parent_in_stack="${branches[i-1]}"
     fi
-    p_sha=$(git rev-parse --verify --quiet "refs/heads/$parent_in_stack" 2>/dev/null || true)
-    b_sha=$(git rev-parse --verify --quiet "refs/heads/${branches[i]}" 2>/dev/null || true)
-    if [[ -n "$p_sha" && "$p_sha" == "$b_sha" ]]; then
+    if _pr_is_empty_diff "${branches[i]}" "$parent_in_stack"; then
       log "${C_DIM}skip${C_RESET}    ${C_CYAN}${branches[i]}${C_RESET} ${C_DIM}(no commits ahead of $parent_in_stack)${C_RESET}"
-      continue
     fi
-    ACTIVE+=("${branches[i]}")
   done
   local N=${#ACTIVE[@]}
   (( N > 0 )) || die "nothing to do — every stack branch is empty"
@@ -2091,6 +2160,149 @@ cmd_pr_sync() {
     return 3
   fi
   log "${C_GREEN}done${C_RESET}    pr sync complete (${C_BOLD}${N}${C_RESET} branches)"
+}
+
+# List the stack's PRs one per line. Mirrors `git stack list`'s look: parent
+# header, per-branch row, fetches by default. Adds PR-specific badges:
+# state, draft, base-mismatch, review decision, plus a comment count.
+cmd_pr_list() {
+  OPT_PREFIX=""
+  local opt_fetch=1
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --no-fetch) opt_fetch=0; shift ;;
+      -*) die "unknown pr list flag: $1" ;;
+      *)  die "pr list: unexpected arg '$1'" ;;
+    esac
+  done
+
+  require_in_repo
+  _gh_preflight
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local current
+  current=$(current_branch || echo "")
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches found for prefix '$prefix'"
+
+  local base0
+  base0=$(_resolve_parent_name) \
+    || die "could not resolve stack base branch (set git config stack.base)"
+
+  if (( opt_fetch )); then
+    log "${C_DIM}fetching all remotes...${C_RESET}"
+    git fetch --all --prune >/dev/null 2>&1 || warn "git fetch failed; counts may be stale"
+  fi
+
+  # Parent header (matches cmd_list).
+  local parent_ref parent_state
+  if parent_ref=$(_resolve_parent_ref "$base0"); then
+    parent_state=$(_parent_state "${branches[0]}" "$parent_ref")
+    printf '%sparent:%s %s%s%s  %s\n\n' \
+      "$C_BOLD" "$C_RESET" "$C_CYAN" "$parent_ref" "$C_RESET" "$parent_state"
+  fi
+
+  # Compute active branches for base-mismatch checks.
+  local ACTIVE=()
+  _pr_active_branches "$base0" ACTIVE "${branches[@]}"
+
+  # Branch column width for alignment.
+  local b max_w=0
+  for b in "${branches[@]}"; do
+    (( ${#b} > max_w )) && max_w=${#b}
+  done
+
+  local data num title state is_draft base_ref review_dec comments
+  local marker branch_color flags expected_base pr_cell pr_url
+  for b in "${branches[@]}"; do
+    if [[ "$b" == "$current" ]]; then
+      marker="${C_GREEN}${C_BOLD}*${C_RESET}"
+      branch_color="${C_BOLD}${C_CYAN}"
+    else
+      marker=" "
+      branch_color="${C_CYAN}"
+    fi
+
+    data=$(_gh_pr_inspect "$b")
+    if [[ -z "$data" ]]; then
+      printf '%s %s%-*s%s  %s(no PR)%s\n' \
+        "$marker" "$branch_color" "$max_w" "$b" "$C_RESET" \
+        "$C_DIM" "$C_RESET"
+      continue
+    fi
+
+    num="${data%%$'\x1f'*}";        data="${data#*$'\x1f'}"
+    title="${data%%$'\x1f'*}";      data="${data#*$'\x1f'}"
+    state="${data%%$'\x1f'*}";      data="${data#*$'\x1f'}"
+    is_draft="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    base_ref="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    review_dec="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
+    comments="$data"
+
+    # Strip the [N/M] prefix from the displayed title — the row order already
+    # conveys position, so showing the prefix here is just visual noise.
+    if [[ "$title" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
+      title="${BASH_REMATCH[1]}"
+    fi
+
+    pr_url="https://github.com/${GH_REPO}/pull/${num}"
+    pr_cell=$(_osc8_link "$pr_url" "#${num}")
+
+    # Build flag list.
+    flags=""
+    case "$state" in
+      CLOSED) flags+="${C_RED}${C_DIM}[closed]${C_RESET} " ;;
+      MERGED) flags+="${C_MAGENTA}${C_DIM}[merged]${C_RESET} " ;;
+    esac
+    flags+="$(_upstream_status "$b") "
+    if [[ "$is_draft" == "1" ]]; then
+      flags+="${C_YELLOW}[draft]${C_RESET} "
+    fi
+
+    # Base-mismatch check: only for active branches (skipped branches have
+    # no PR anyway, but be defensive).
+    local in_active=0 a
+    for a in "${ACTIVE[@]}"; do
+      [[ "$a" == "$b" ]] && { in_active=1; break; }
+    done
+    if (( in_active )); then
+      # Find expected base: previous *active* branch, or base0 for the bottom.
+      local idx_in_active=-1 k
+      for ((k = 0; k < ${#ACTIVE[@]}; k++)); do
+        [[ "${ACTIVE[k]}" == "$b" ]] && { idx_in_active=$k; break; }
+      done
+      if (( idx_in_active == 0 )); then
+        expected_base="$base0"
+      else
+        expected_base="${ACTIVE[idx_in_active-1]}"
+      fi
+      if [[ "$base_ref" != "$expected_base" ]]; then
+        flags+="${C_YELLOW}[base: ${base_ref}]${C_RESET} "
+      fi
+    fi
+
+    case "$review_dec" in
+      APPROVED)          flags+="${C_GREEN}[approved]${C_RESET} " ;;
+      CHANGES_REQUESTED) flags+="${C_RED}[changes]${C_RESET} " ;;
+    esac
+
+    # Trim trailing space on flags.
+    flags="${flags% }"
+
+    local cnt_suffix=""
+    if [[ "$comments" =~ ^[0-9]+$ ]] && (( comments > 0 )); then
+      cnt_suffix="  ${C_DIM}(${comments}c)${C_RESET}"
+    fi
+
+    printf '%s %s%-*s%s  %s  %s  %s%s\n' \
+      "$marker" "$branch_color" "$max_w" "$b" "$C_RESET" \
+      "$pr_cell" "$flags" "$title" "$cnt_suffix"
+  done
 }
 
 # Interactive selector. $1 = prompt header, remaining args = options. Prefers
@@ -2301,6 +2513,7 @@ alias gstkam='git stack amend'
 alias gstkp='git stack push'
 alias gstkpa='git stack push --all'
 alias gstkprs='git stack pr sync'
+alias gstkprl='git stack pr list'
 alias gstkh='git stack history'
 alias gstkhs='git stack history show'
 alias gstkhr='git stack history restore'
@@ -2341,6 +2554,7 @@ abbr -a -g gstkam git stack amend
 abbr -a -g gstkp git stack push
 abbr -a -g gstkpa git stack push --all
 abbr -a -g gstkprs git stack pr sync
+abbr -a -g gstkprl git stack pr list
 abbr -a -g gstkh git stack history
 abbr -a -g gstkhs git stack history show
 abbr -a -g gstkhr git stack history restore

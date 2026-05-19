@@ -70,23 +70,65 @@ _envget() {
   eval "printf '%s' \"\${$1-}\""
 }
 
-# Build a single-PR JSON object from inputs (uses jq for safe quoting).
+# Build a single-PR JSON object with all fields needed by both `pr sync`
+# and `pr list`. Uses jq for safe quoting. The extra args (state, draft,
+# base, review, comments-count) are optional and have sensible defaults.
+# Usage: _emit_pr_json <num> <title> <body> [<state>] [<draft:0|1>] [<base>] [<review>] [<comments_n>]
 _emit_pr_json() {
   local num="$1" title="$2" body="$3"
-  jq -n --argjson n "$num" --arg t "$title" --arg b "$body" \
-    '{number: $n, title: $t, body: $b}'
+  local state="${4:-OPEN}"
+  local draft="${5:-1}"     # default to draft — that's what `pr create --draft` sets
+  local base="${6:-main}"
+  local review="${7-}"      # empty by default (REVIEW_REQUIRED / null)
+  local n_comments="${8:-0}"
+  local is_draft_json
+  if [ "$draft" = "1" ] || [ "$draft" = "true" ]; then
+    is_draft_json="true"
+  else
+    is_draft_json="false"
+  fi
+  jq -n \
+    --argjson n "$num" \
+    --arg t "$title" \
+    --arg b "$body" \
+    --arg state "$state" \
+    --argjson is_draft "$is_draft_json" \
+    --arg base "$base" \
+    --arg review "$review" \
+    --argjson nc "$n_comments" \
+    '{
+       number: $n,
+       title: $t,
+       body: $b,
+       state: $state,
+       isDraft: $is_draft,
+       baseRefName: $base,
+       reviewDecision: $review,
+       comments: (if $nc > 0 then [range(0; $nc) | {id: ., body: "stub"}] else [] end)
+     }'
 }
 
-# Look up a PR's JSON (single object, not array) for <branch>. Empty if none.
+# Look up a PR's JSON (single object) for <branch>. Empty if none.
 # Order: env-var seeds first, then persisted state from `pr create`.
+# Persisted state is filled in with default field values for new fields
+# (state, isDraft, baseRefName, reviewDecision, comments) so callers see a
+# consistent schema regardless of how the PR was created in the stub.
 _lookup_pr() {
   local head="$1"
   local safe; safe=$(_safe "$head")
   local seed_num; seed_num=$(_envget "GH_PR_${safe}__NUM")
   if [ -n "$seed_num" ]; then
-    local seed_title; seed_title=$(_envget "GH_PR_${safe}__TITLE")
-    local seed_body; seed_body=$(_envget "GH_PR_${safe}__BODY")
-    _emit_pr_json "$seed_num" "$seed_title" "$seed_body"
+    local seed_title=$(_envget "GH_PR_${safe}__TITLE")
+    local seed_body=$(_envget "GH_PR_${safe}__BODY")
+    local seed_state=$(_envget "GH_PR_${safe}__STATE")
+    local seed_draft=$(_envget "GH_PR_${safe}__DRAFT")
+    local seed_base=$(_envget "GH_PR_${safe}__BASE")
+    local seed_review=$(_envget "GH_PR_${safe}__REVIEW")
+    local seed_comments=$(_envget "GH_PR_${safe}__COMMENTS")
+    _emit_pr_json \
+      "$seed_num" "$seed_title" "$seed_body" \
+      "${seed_state:-OPEN}" "${seed_draft:-1}" "${seed_base:-main}" \
+      "$seed_review" "${seed_comments:-0}"
     return 0
   fi
   local nf="$_stub_dir/by-branch/$safe.num"
@@ -94,7 +136,11 @@ _lookup_pr() {
     local n; n=$(cat "$nf")
     local jf="$_stub_dir/by-num/$n.json"
     if [ -f "$jf" ]; then
-      cat "$jf"
+      # Fill in defaults for any fields not present in the stored JSON.
+      jq '
+        {state: "OPEN", isDraft: true, baseRefName: "main",
+         reviewDecision: "", comments: []} * .
+      ' "$jf"
       return 0
     fi
   fi
@@ -130,6 +176,12 @@ case "$_sub1 $_sub2" in
   "pr create")
     _head=$(_flagval --head "$@" || true)
     _title=$(_flagval --title "$@" || true)
+    _base=$(_flagval --base "$@" || true)
+    # Detect --draft (flag, no value).
+    _draft=0
+    for _a in "$@"; do
+      if [ "$_a" = "--draft" ]; then _draft=1; break; fi
+    done
     if [ -n "${GH_STUB_FAIL_CREATE:-}" ] && [ "$GH_STUB_FAIL_CREATE" = "$_head" ]; then
       printf 'gh-stub: simulated create failure for %s\n' "$_head" >&2
       exit 1
@@ -145,7 +197,8 @@ case "$_sub1 $_sub2" in
     _n=$((_n + 1))
     printf '%d' "$_n" > "$_counter"
     _safe_h=$(_safe "$_head")
-    _emit_pr_json "$_n" "$_title" "$_stdin" > "$_stub_dir/by-num/$_n.json"
+    _emit_pr_json "$_n" "$_title" "$_stdin" "OPEN" "$_draft" "${_base:-main}" "" 0 \
+      > "$_stub_dir/by-num/$_n.json"
     printf '%d' "$_n" > "$_stub_dir/by-branch/$_safe_h.num"
     printf 'https://github.com/%s/pull/%d\n' "${GH_STUB_REPO:-test/repo}" "$_n"
     exit 0

@@ -454,6 +454,218 @@ teardown() { teardown_repo; }
   [ "$title_arg" = "[1/2] Old name" ]
 }
 
+# ---------- pr list ----------
+
+@test "pr list: lists synced branches with PR numbers and titles" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"feat/01-foo"* ]]
+  [[ "$output" == *"#101"* ]]
+  [[ "$output" == *"feat/02-bar"* ]]
+  [[ "$output" == *"#102"* ]]
+  [[ "$output" == *"feat/03-baz"* ]]
+  [[ "$output" == *"#103"* ]]
+  # Parent header
+  [[ "$output" == *"parent:"* ]]
+  [[ "$output" == *"main"* ]]
+}
+
+@test "pr list: marks current branch with *" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  git checkout -q feat/02-bar
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  # Exactly one line should start with "*"
+  local star_lines
+  star_lines=$(printf '%s\n' "$output" | grep -c '^\*' || true)
+  [ "$star_lines" -eq 1 ]
+  # And it should be the feat/02-bar line
+  printf '%s\n' "$output" | grep -q '^\* feat/02-bar'
+}
+
+@test "pr list: shows (no PR) for branches without an open PR" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  # Add a new branch but don't sync.
+  git checkout -q -b feat/02-bar
+  echo b >> file
+  git add file
+  git commit -q -m "second"
+  git push -q -u origin feat/02-bar
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"feat/01-foo"* ]]
+  [[ "$output" == *"#101"* ]]
+  [[ "$output" == *"feat/02-bar"* ]]
+  [[ "$output" == *"(no PR)"* ]]
+}
+
+@test "pr list: [draft] flag appears when PR is a draft" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  # Seed a draft PR (default for stub) and a non-draft (DRAFT=0).
+  make_stack_branches feat 02-bar
+  export GH_PR_feat_01_foo__NUM=201
+  export GH_PR_feat_01_foo__TITLE="Draft PR"
+  export GH_PR_feat_01_foo__BODY=""
+  export GH_PR_feat_01_foo__DRAFT=1
+  export GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=202
+  export GH_PR_feat_02_bar__TITLE="Ready PR"
+  export GH_PR_feat_02_bar__BODY=""
+  export GH_PR_feat_02_bar__DRAFT=0
+  export GH_PR_feat_02_bar__BASE=feat/01-foo
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  # The draft branch's line has [draft]; the non-draft does not.
+  local draft_line ready_line
+  draft_line=$(printf '%s\n' "$output" | grep 'feat/01-foo')
+  ready_line=$(printf '%s\n' "$output" | grep 'feat/02-bar')
+  [[ "$draft_line" == *"[draft]"* ]]
+  [[ "$ready_line" != *"[draft]"* ]]
+}
+
+@test "pr list: [closed] and [merged] flags for non-open PRs" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=301
+  export GH_PR_feat_01_foo__TITLE="Was closed"
+  export GH_PR_feat_01_foo__BODY=""
+  export GH_PR_feat_01_foo__STATE=CLOSED
+  export GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=302
+  export GH_PR_feat_02_bar__TITLE="Was merged"
+  export GH_PR_feat_02_bar__BODY=""
+  export GH_PR_feat_02_bar__STATE=MERGED
+  export GH_PR_feat_02_bar__BASE=feat/01-foo
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[closed]"* ]]
+  [[ "$output" == *"[merged]"* ]]
+}
+
+@test "pr list: [approved] and [changes] reflect reviewDecision" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=401
+  export GH_PR_feat_01_foo__TITLE="Approved"
+  export GH_PR_feat_01_foo__BODY=""
+  export GH_PR_feat_01_foo__REVIEW=APPROVED
+  export GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=402
+  export GH_PR_feat_02_bar__TITLE="Changes requested"
+  export GH_PR_feat_02_bar__BODY=""
+  export GH_PR_feat_02_bar__REVIEW=CHANGES_REQUESTED
+  export GH_PR_feat_02_bar__BASE=feat/01-foo
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[approved]"* ]]
+  [[ "$output" == *"[changes]"* ]]
+}
+
+@test "pr list: [base: X] flag when PR's base drifts from expected" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  # Expected base for feat/02-bar is feat/01-foo, but PR is against main.
+  export GH_PR_feat_01_foo__NUM=501
+  export GH_PR_feat_01_foo__TITLE="Bottom"
+  export GH_PR_feat_01_foo__BODY=""
+  export GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=502
+  export GH_PR_feat_02_bar__TITLE="Drifted base"
+  export GH_PR_feat_02_bar__BODY=""
+  export GH_PR_feat_02_bar__BASE=main
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  # First branch's expected base IS main, so no [base: X] flag on it.
+  local foo_line bar_line
+  foo_line=$(printf '%s\n' "$output" | grep 'feat/01-foo')
+  bar_line=$(printf '%s\n' "$output" | grep 'feat/02-bar')
+  [[ "$foo_line" != *"[base:"* ]]
+  [[ "$bar_line" == *"[base: main]"* ]]
+}
+
+@test "pr list: appends (Nc) comment-count suffix when comments > 0" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=601
+  export GH_PR_feat_01_foo__TITLE="With comments"
+  export GH_PR_feat_01_foo__BODY=""
+  export GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_01_foo__COMMENTS=3
+  export GH_PR_feat_02_bar__NUM=602
+  export GH_PR_feat_02_bar__TITLE="No comments"
+  export GH_PR_feat_02_bar__BODY=""
+  export GH_PR_feat_02_bar__BASE=feat/01-foo
+  export GH_PR_feat_02_bar__COMMENTS=0
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  local foo_line bar_line
+  foo_line=$(printf '%s\n' "$output" | grep 'feat/01-foo')
+  bar_line=$(printf '%s\n' "$output" | grep 'feat/02-bar')
+  [[ "$foo_line" == *"(3c)"* ]]
+  [[ "$bar_line" != *"(0c)"* ]]
+  [[ "$bar_line" != *"c)"* ]]
+}
+
+@test "pr list --no-fetch: skips the 'fetching all remotes...' banner" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"fetching"* ]]
+}
+
+@test "pr list --color: PR number is wrapped in an OSC 8 hyperlink" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr list --no-fetch --color
+  [ "$status" -eq 0 ]
+  # OSC 8 sequence: ESC ] 8 ; ; <url> BEL <text> ESC ] 8 ; ; BEL
+  # Use ANSI-C $'...' quoting so $'\e' becomes the literal ESC byte.
+  [[ "$output" == *$'\e]8;;https://github.com/test/repo/pull/101\a#101\e]8;;\a'* ]]
+}
+
+@test "pr list --no-color: PR number is plain (no OSC 8 escape bytes)" {
+  make_stack_branches feat 01-foo
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" != *$'\e]8;;'* ]]
+  [[ "$output" == *"#101"* ]]
+}
+
+@test "pr list: empty-diff middle branch shows (no PR), surrounding ones list normally" {
+  make_stack_branches feat 01-foo
+  # Branch sharing the same tip as feat/01-foo — no commits ahead.
+  git branch feat/02-mid feat/01-foo
+  git checkout -q feat/02-mid
+  git checkout -q -b feat/03-baz
+  echo c >> file
+  git add file
+  git commit -q -m "third"
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  local foo_line mid_line baz_line
+  foo_line=$(printf '%s\n' "$output" | grep 'feat/01-foo')
+  mid_line=$(printf '%s\n' "$output" | grep 'feat/02-mid')
+  baz_line=$(printf '%s\n' "$output" | grep 'feat/03-baz')
+  [[ "$foo_line" == *"#101"* ]]
+  [[ "$mid_line" == *"(no PR)"* ]]
+  [[ "$baz_line" == *"#102"* ]]
+}
+
 # ---------- default-branch ----------
 
 @test "default-branch: returns main when on main" {
@@ -530,11 +742,11 @@ teardown() { teardown_repo; }
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches simple-abbreviation count (17)" {
-  # 17 simple aliases (gstk + 16 others), 3 compound functions.
+@test "init bash: alias count matches simple-abbreviation count (18)" {
+  # 18 simple aliases (gstk + 17 others), 3 compound functions.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk')
-  [ "$alias_count" -eq 17 ]
+  [ "$alias_count" -eq 18 ]
 }

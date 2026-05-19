@@ -77,6 +77,7 @@ Then reload your shell.
 | `gstkp`     | `git stack push`                                                                                 |
 | `gstkpa`    | `git stack push --all`                                                                           |
 | `gstkprs`   | `git stack pr sync`                                                                              |
+| `gstkprl`   | `git stack pr list`                                                                              |
 | `gstkh`     | `git stack history`                                                                              |
 | `gstkhs`    | `git stack history show`                                                                         |
 | `gstkhr`    | `git stack history restore`                                                                      |
@@ -117,6 +118,15 @@ git stack pr sync --no-push       # error if any branch isn't on origin
 git stack pr sync --dry-run       # show planned actions, make no remote calls
 git stack pr sync --no-template   # ignore .github/PULL_REQUEST_TEMPLATE.md
 ```
+
+To inspect the chain after syncing:
+
+```sh
+git stack pr list                 # one line per PR with status badges + clickable links
+git stack pr list --no-fetch      # skip the upfront git fetch
+```
+
+Each row shows: current-branch marker (`*`), branch name, PR number (clickable hyperlink in modern terminals), and status badges — `[synced]`/`[+N/-M]`/`[unpushed]`, `[draft]`, `[base: X]` (when the PR's base has drifted from the stack), `[approved]`/`[changes]`, `[closed]`/`[merged]` — followed by the title and a `(Nc)` suffix for comment count. Branches without an open PR show `(no PR)`.
 
 Requires [`gh`](https://cli.github.com/) authenticated for github.com (`gh auth login`).
 
