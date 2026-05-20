@@ -277,7 +277,7 @@ case "$_sub1 $_sub2" in
     if [ "$_method" = "POST" ] && [[ "$_path" == */branches/*/rename ]]; then
       _old="${_path#*/branches/}"
       _old="${_old%/rename}"
-      _old="${_old//%2F/\/}"
+      _old="${_old//%2F//}"
       if [ -n "${GH_STUB_FAIL_RENAME:-}" ] && [ "$_old" = "$GH_STUB_FAIL_RENAME" ]; then
         echo "stub: simulated rename failure for $_old" >&2
         exit 1

@@ -770,7 +770,7 @@ _remote_rename_one() {
   # URL-encode the branch name's slashes (the only special character in our
   # naming convention).
   local old_enc="${old//\//%2F}"
-  local out err rc
+  local out rc
   out=$(gh api -X POST "/repos/${GH_REPO}/branches/${old_enc}/rename" \
           -f "new_name=${new}" 2>&1) || rc=$?
   if (( ${rc:-0} != 0 )); then
