@@ -73,6 +73,10 @@ color_init() {
 #   STACK_ORIG_SHAS        original tip SHAs at run start
 #   STACK_PUSH_FAILURES    branches whose push failed during this run
 #                          (transient — not historical)
+#   STACK_POST_ACTION      "move-rename" or empty; post-reflow hook
+#   STACK_POST_BRANCHES    post-move ordering for rename batch
+#   STACK_OPT_NO_PUSH      persisted OPT_NO_PUSH from move invocation
+#   STACK_OPT_NO_SYNC      persisted OPT_NO_SYNC from move invocation
 STACK_VERSION=1
 STACK_STARTED_AT=""
 STACK_STARTING_BRANCH=""
@@ -86,6 +90,10 @@ STACK_ONTO_REF=""
 STACK_BRANCHES=()
 STACK_ORIG_SHAS=()
 STACK_PUSH_FAILURES=()
+STACK_POST_ACTION=""        # "move-rename" or empty
+STACK_POST_BRANCHES=()      # post-move ordering used to compute rename batch
+STACK_OPT_NO_PUSH=0         # persisted across continue/abort
+STACK_OPT_NO_SYNC=0
 
 # ---------- helpers ----------
 
@@ -413,6 +421,10 @@ save_state() {
     _emit_array STACK_BRANCHES STACK_BRANCHES
     _emit_array STACK_ORIG_SHAS STACK_ORIG_SHAS
     _emit_array STACK_PUSH_FAILURES STACK_PUSH_FAILURES
+    printf 'STACK_POST_ACTION=%q\n' "$STACK_POST_ACTION"
+    printf 'STACK_OPT_NO_PUSH=%d\n' "$STACK_OPT_NO_PUSH"
+    printf 'STACK_OPT_NO_SYNC=%d\n' "$STACK_OPT_NO_SYNC"
+    _emit_array STACK_POST_BRANCHES STACK_POST_BRANCHES
   } > "$out"
 }
 
@@ -425,6 +437,8 @@ load_state() {
   STACK_BRANCHES=()
   STACK_ORIG_SHAS=()
   STACK_PUSH_FAILURES=()
+  STACK_POST_ACTION=""
+  STACK_POST_BRANCHES=()
   # shellcheck disable=SC1090
   source "$f"
   [[ "${STACK_VERSION-}" == "1" ]] || die "incompatible state file version: ${STACK_VERSION-?}"
@@ -749,7 +763,77 @@ run_reflow_loop() {
     exit 3
   fi
   log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
+  local post_action="$STACK_POST_ACTION"
   clear_state
+  if [[ "$post_action" == "move-rename" ]]; then
+    _finish_move_rename
+  fi
+}
+
+# Called by run_reflow_loop after Stage A finishes when STACK_POST_ACTION == "move-rename".
+# Reads STACK_POST_BRANCHES + STACK_PREFIX, computes consecutive-leaf cascade,
+# applies an atomic batch, then does remote rename + pr sync (unless --no-push).
+# Honors STACK_OPT_NO_PUSH / STACK_OPT_NO_SYNC from the state file (which mirror
+# OPT_NO_PUSH/OPT_NO_SYNC at the time of the original cmd_move invocation).
+_finish_move_rename() {
+  local prefix="$STACK_PREFIX"
+  local post=("${STACK_POST_BRANCHES[@]+"${STACK_POST_BRANCHES[@]}"}")
+
+  # Restore OPT_NO_PUSH/OPT_NO_SYNC from state for downstream helpers.
+  OPT_NO_PUSH="$STACK_OPT_NO_PUSH"
+  OPT_NO_SYNC="$STACK_OPT_NO_SYNC"
+
+  local width
+  width=$(_leaf_width_for "${post[@]+"${post[@]}"}")
+  local rename_pairs=()
+  local i
+  for ((i = 0; i < ${#post[@]}; i++)); do
+    local old="${post[$i]}"
+    local old_leaf="${old##*/}"
+    local old_rest="${old_leaf#*-}"
+    local new_num=$((i + 1))
+    local new_leaf
+    new_leaf=$(_format_leaf "$new_num" "$width")
+    local new_full="${prefix}${new_leaf}-${old_rest}"
+    if [[ "$old" != "$new_full" ]]; then
+      rename_pairs+=("$old" "$new_full")
+    fi
+  done
+
+  if (( ${#rename_pairs[@]} > 0 )); then
+    local batch=""
+    local j
+    for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
+      local rp_old="${rename_pairs[$j]}"
+      local rp_new="${rename_pairs[$((j + 1))]}"
+      local sha
+      sha=$(git rev-parse "refs/heads/$rp_old")
+      batch+="create refs/heads/${rp_new} ${sha}"$'\n'
+      batch+="delete refs/heads/${rp_old} ${sha}"$'\n'
+    done
+    local head_before="" head_new=""
+    if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
+      for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
+        if [[ "$head_before" == "refs/heads/${rename_pairs[$j]}" ]]; then
+          head_new="refs/heads/${rename_pairs[$((j + 1))]}"
+          git symbolic-ref HEAD "$head_new"
+          break
+        fi
+      done
+    fi
+    if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack move (post-rename)"; then
+      [[ -n "$head_new" ]] && git symbolic-ref HEAD "$head_before" 2>/dev/null || true
+      die "git update-ref batch failed; refs unchanged (atomic)"
+    fi
+    log "${C_GREEN}done${C_RESET}    move complete (+$((${#rename_pairs[@]} / 2)) renames)"
+  fi
+
+  if (( ! OPT_NO_PUSH )) && (( ${#rename_pairs[@]} > 0 )); then
+    _remote_rename_batch_or_skip "${rename_pairs[@]}"
+  fi
+  if (( ! OPT_NO_PUSH )); then
+    _post_rename_sync
+  fi
 }
 
 # ---------- PR sync helpers ----------
@@ -2319,6 +2403,10 @@ cmd_move() {
   STACK_FROM_IDX="$first_affected"
   STACK_CURSOR="$first_affected"
   STACK_PUSH_FAILURES=()
+  STACK_POST_ACTION="move-rename"
+  STACK_POST_BRANCHES=("${post[@]}")
+  STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
+  STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
   if (( first_affected == 0 )); then
     local parent_name parent_ref
     parent_name=$(_resolve_parent_name) \
@@ -2331,62 +2419,6 @@ cmd_move() {
 
   save_state
   run_reflow_loop
-
-  # ----- Stage B: cascade rename to consecutive leaves -----
-  local width
-  width=$(_leaf_width_for "${branches[@]}")
-  local rename_pairs=()
-  for ((i = 0; i < ${#post[@]}; i++)); do
-    local old="${post[$i]}"
-    local old_leaf="${old##*/}"
-    local old_rest="${old_leaf#*-}"
-    local new_num=$((i + 1))
-    local new_leaf
-    new_leaf=$(_format_leaf "$new_num" "$width")
-    local new_full="${prefix}${new_leaf}-${old_rest}"
-    if [[ "$old" != "$new_full" ]]; then
-      rename_pairs+=("$old" "$new_full")
-    fi
-  done
-
-  if (( ${#rename_pairs[@]} > 0 )); then
-    local batch=""
-    local j
-    for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
-      local rp_old="${rename_pairs[$j]}"
-      local rp_new="${rename_pairs[$((j + 1))]}"
-      local sha
-      sha=$(git rev-parse "refs/heads/$rp_old")
-      batch+="create refs/heads/${rp_new} ${sha}"$'\n'
-      batch+="delete refs/heads/${rp_old} ${sha}"$'\n'
-    done
-
-    local head_before="" head_new=""
-    if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
-      for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
-        if [[ "$head_before" == "refs/heads/${rename_pairs[$j]}" ]]; then
-          head_new="refs/heads/${rename_pairs[$((j + 1))]}"
-          git symbolic-ref HEAD "$head_new"
-          break
-        fi
-      done
-    fi
-
-    if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack move ${src_branch}"; then
-      [[ -n "$head_new" ]] && git symbolic-ref HEAD "$head_before" 2>/dev/null || true
-      die "git update-ref batch failed; refs unchanged (atomic)"
-    fi
-  fi
-
-  log "${C_GREEN}move${C_RESET}    ${C_CYAN}${src_branch}${C_RESET} ${C_DIM}-> position $((dst_idx + 1)) (+$((${#rename_pairs[@]} / 2)) renames)${C_RESET}"
-
-  # ----- Stage C: remote rename + pr sync -----
-  if (( ! OPT_NO_PUSH )) && (( ${#rename_pairs[@]} > 0 )); then
-    _remote_rename_batch_or_skip "${rename_pairs[@]}"
-  fi
-  if (( ! OPT_NO_PUSH )); then
-    _post_rename_sync
-  fi
 }
 
 cmd_restack() {

@@ -1002,3 +1002,34 @@ teardown() { teardown_repo; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"outside"* ]]
 }
+
+@test "move: cherry-pick conflict halts; continue completes move + rename" {
+  # Use a 3-branch stack (01-a, 02-b, 03-c) where each branch appends to
+  # `file`. Move feat/01-a to --top so the post-move ordering is
+  # [02-b, 03-c, 01-a] and all three are rebased (first_affected=0).
+  # The rebase-reorder causes two cherry-pick conflicts (on feat/02-b, then
+  # on feat/01-a). After both are resolved, the post-action (rename) fires.
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack move feat/01-a --top --no-color
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"conflict"* ]]
+
+  # First conflict: cherry-pick 02-b onto main. 3-way base=01-a(01-a\n),
+  # ours=main(empty), theirs=02-b(01-a\n02-b\n). Resolve to just "02-b".
+  printf '02-b\n' > file
+  git add file
+  run git stack continue --no-color
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"conflict"* ]]
+
+  # Second conflict: cherry-pick 01-a onto new 03-c. 3-way base=main(empty),
+  # ours=03-c(02-b\n03-c\n), theirs=01-a(01-a\n). Resolve to append 01-a.
+  printf '02-b\n03-c\n01-a\n' > file
+  git add file
+  run git stack continue --no-color
+  [ "$status" -eq 0 ]
+  # post=[02-b, 03-c, 01-a] → renumbered: 01-b, 02-c, 03-a
+  git rev-parse --verify --quiet refs/heads/feat/01-b
+  git rev-parse --verify --quiet refs/heads/feat/02-c
+  git rev-parse --verify --quiet refs/heads/feat/03-a
+}
