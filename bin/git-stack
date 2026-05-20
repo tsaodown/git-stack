@@ -1943,6 +1943,8 @@ cmd_new() {
   elif (( opt_bottom )); then
     insert_idx=0
   elif [[ -n "$opt_after" ]]; then
+    # Until Task 11 removes the top-level empty-stack guard, this check is
+    # unreachable. Keep it for when bootstrap is wired in.
     if (( ${#branches[@]} == 0 )); then
       die "new --after: no branches in stack '$prefix'"
     fi
@@ -1952,6 +1954,8 @@ cmd_new() {
     insert_idx=$(branch_index "$after_branch" "${branches[@]}")
     insert_idx=$((insert_idx + 1))
   elif [[ -n "$opt_at" ]]; then
+    # Until Task 11 removes the top-level empty-stack guard, this check is
+    # unreachable. Keep it for when bootstrap is wired in.
     if (( ${#branches[@]} == 0 )); then
       die "new --at: no branches in stack '$prefix'"
     fi
@@ -1968,8 +1972,10 @@ cmd_new() {
   local predecessor_ref predecessor_label
   if (( insert_idx == 0 )); then
     local parent_name
-    parent_name=$(_resolve_parent_name)
-    predecessor_ref=$(_resolve_parent_ref "$parent_name")
+    parent_name=$(_resolve_parent_name) \
+      || die "new: cannot determine parent branch (set stack.base or create main/master)"
+    predecessor_ref=$(_resolve_parent_ref "$parent_name") \
+      || die "new: cannot resolve parent ref for '$parent_name'"
     predecessor_label="$parent_name"
   else
     local prev="${branches[$((insert_idx - 1))]}"
@@ -2063,7 +2069,7 @@ cmd_new() {
   # Switch HEAD to the new branch.
   git checkout --quiet "$new_branch"
 
-  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label}, +${#rename_pairs[@]} renames)${C_RESET}"
+  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label}, +$((${#rename_pairs[@]} / 2)) renames)${C_RESET}"
 }
 
 cmd_restack() {

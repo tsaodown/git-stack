@@ -884,3 +884,14 @@ teardown() { teardown_repo; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"99"* ]]
 }
+
+@test "new --after: HEAD follows if currently on a cascade-renamed branch" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  run git stack new mid --after 1 --no-color
+  [ "$status" -eq 0 ]
+  # The final `git checkout` always lands on the new branch:
+  [ "$(git symbolic-ref --short HEAD)" = "feat/02-mid" ]
+  git rev-parse --verify --quiet refs/heads/feat/03-b
+  ! git rev-parse --verify --quiet refs/heads/feat/02-b
+}
