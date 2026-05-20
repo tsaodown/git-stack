@@ -1033,3 +1033,29 @@ teardown() { teardown_repo; }
   git rev-parse --verify --quiet refs/heads/feat/02-c
   git rev-parse --verify --quiet refs/heads/feat/03-a
 }
+
+@test "move: abort mid-conflict restores original branches, no rename" {
+  make_stack_branches feat 01-a 02-b 03-c
+  local sha_01 sha_02 sha_03
+  sha_01=$(git rev-parse refs/heads/feat/01-a)
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  sha_03=$(git rev-parse refs/heads/feat/03-c)
+
+  run git stack move feat/01-a --top --no-color
+  [ "$status" -eq 2 ]
+
+  run git stack abort --no-color
+  [ "$status" -eq 0 ]
+
+  # All original branches still present with their original names.
+  [ "$(git rev-parse refs/heads/feat/01-a)" = "$sha_01" ]
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+  [ "$(git rev-parse refs/heads/feat/03-c)" = "$sha_03" ]
+  # Renamed branches must not exist.
+  ! git rev-parse --verify --quiet refs/heads/feat/01-b
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  ! git rev-parse --verify --quiet refs/heads/feat/03-a
+  # State file gone — continue should fail.
+  run git stack continue --no-color
+  [ "$status" -ne 0 ]
+}
