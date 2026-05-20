@@ -3301,7 +3301,9 @@ alias gstkprl='git stack pr list'
 alias gstkh='git stack history'
 alias gstkhs='git stack history show'
 alias gstkhr='git stack history restore'
-alias gstkmv='git stack rename'
+alias gstkn='git stack new'
+alias gstkmv='git stack move'
+alias gstkrn='git stack rename'
 
 gstkrom() {
   local _b
@@ -3342,7 +3344,9 @@ abbr -a -g gstkprl git stack pr list
 abbr -a -g gstkh git stack history
 abbr -a -g gstkhs git stack history show
 abbr -a -g gstkhr git stack history restore
-abbr -a -g gstkmv git stack rename
+abbr -a -g gstkn git stack new
+abbr -a -g gstkmv git stack move
+abbr -a -g gstkrn git stack rename
 abbr -a -g gstkcl "git fetch --all --prune; and git stack close"
 FISH_EOF
 }

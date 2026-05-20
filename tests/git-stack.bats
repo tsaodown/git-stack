@@ -787,13 +787,29 @@ teardown() { teardown_repo; }
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches simple-abbreviation count (18)" {
-  # 18 simple aliases (gstk + 17 others), 3 compound functions.
+@test "init bash: alias count matches simple-abbreviation count (20)" {
+  # 20 simple aliases (gstk + 19 others), 3 compound functions.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk')
-  [ "$alias_count" -eq 18 ]
+  [ "$alias_count" -eq 20 ]
+}
+
+@test "init bash: emits gstkn, gstkmv (move), gstkrn" {
+  run git stack init bash
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"alias gstkn="* ]]
+  [[ "$output" == *"alias gstkmv='git stack move'"* ]]
+  [[ "$output" == *"alias gstkrn='git stack rename'"* ]]
+}
+
+@test "init fish: emits gstkn, gstkmv (move), gstkrn" {
+  run git stack init fish
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"gstkn git stack new"* ]]
+  [[ "$output" == *"gstkmv git stack move"* ]]
+  [[ "$output" == *"gstkrn git stack rename"* ]]
 }
 
 # ---------- decimal leaves (rejected) ----------

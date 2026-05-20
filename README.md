@@ -81,7 +81,9 @@ Then reload your shell.
 | `gstkh`     | `git stack history`                                                                              |
 | `gstkhs`    | `git stack history show`                                                                         |
 | `gstkhr`    | `git stack history restore`                                                                      |
-| `gstkmv`    | `git stack rename`                                                                               |
+| `gstkn`     | `git stack new`                                                                                  |
+| `gstkmv`    | `git stack move` (was `rename` in prior versions; breaking change)                                |
+| `gstkrn`    | `git stack rename`                                                                                |
 | `gstkcl`    | `git fetch --all --prune` then `git stack close`                                                 |
 
 `<default>` is resolved by `git stack default-branch` (honors `stack.base` config, then `init.defaultBranch`, then falls back to `main`/`master`).
@@ -106,6 +108,19 @@ git stack push --all              # push every branch with --force-with-lease
 git stack restack --onto origin/main   # rebase the whole stack onto a new base
 git stack pr sync                 # open draft PRs for the chain (or update them)
 ```
+
+### Creating and moving branches
+
+```sh
+git stack new auth                       # new branch at top (default)
+git stack new cache --after 01-auth      # insert between two branches
+git stack new prep --bottom              # new bottom branch (under main)
+git stack new                            # interactive picker
+git stack move feat/05-cache --top       # relocate to top
+git stack move feat/05-cache --at 02     # move into another slot
+```
+
+Auto-reflow keeps leaves consecutive: insert/move rewrites affected leaves locally, renames remote branches via GitHub's branch-rename API (so PRs follow), and re-runs `pr sync` to update `[N/M]` prefixes. Use `--no-push` for local-only operations or `--no-sync` to skip just the PR title refresh.
 
 ## Syncing PRs to GitHub
 
