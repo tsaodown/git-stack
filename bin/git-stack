@@ -11,6 +11,8 @@ USE_COLOR_PREF="auto"   # auto | always | never; resolved by color_init.
 
 OPT_PUSH=0
 OPT_FORCE=0
+OPT_NO_SYNC=0
+OPT_NO_PUSH=0
 OPT_FROM=""
 OPT_ONTO=""
 OPT_PREFIX=""
@@ -328,6 +330,8 @@ orig_sha_for() {
 parse_common_flags() {
   OPT_PUSH=0
   OPT_FORCE=0
+  OPT_NO_SYNC=0
+  OPT_NO_PUSH=0
   OPT_FROM=""
   OPT_ONTO=""
   OPT_PREFIX=""
@@ -336,6 +340,8 @@ parse_common_flags() {
     case "$1" in
       --push)       OPT_PUSH=1; shift ;;
       --force)      OPT_FORCE=1; shift ;;
+      --no-sync)    OPT_NO_SYNC=1; shift ;;
+      --no-push)    OPT_NO_PUSH=1; shift ;;
       --from)       shift; [[ $# -gt 0 ]] || die "--from needs an argument"; OPT_FROM="$1"; shift ;;
       --onto)       shift; [[ $# -gt 0 ]] || die "--onto needs an argument"; OPT_ONTO="$1"; shift ;;
       --prefix)     shift; [[ $# -gt 0 ]] || die "--prefix needs an argument"; OPT_PREFIX="$1"; shift ;;
@@ -364,6 +370,8 @@ _consume_common_flag() {
     --no-color)   USE_COLOR_PREF="never";  color_init; _FLAG_SHIFT=1 ;;
     -v|--verbose) VERBOSE=1; _FLAG_SHIFT=1 ;;
     -q|--quiet)   QUIET=1; _FLAG_SHIFT=1 ;;
+    --no-sync)    OPT_NO_SYNC=1; _FLAG_SHIFT=1 ;;
+    --no-push)    OPT_NO_PUSH=1; _FLAG_SHIFT=1 ;;
     *) return 1 ;;
   esac
   return 0
@@ -812,6 +820,21 @@ _remote_rename_batch_or_skip() {
       die "gh api branches/${old}/rename failed; local renames already applied. Resolve on GitHub (UI or 'gh api ... /rename') then 'git fetch --prune' and re-run 'git stack pr sync'."
     fi
   done
+}
+
+# Invoke pr sync unless --no-sync was given. Idempotent; safe to call after
+# any local+remote rename. Silently no-op if gh isn't available (cmd_pr_sync
+# handles its own preflight).
+_post_rename_sync() {
+  (( OPT_NO_SYNC )) && return 0
+  if ! command -v gh >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! gh auth status -h github.com >/dev/null 2>&1; then
+    return 0
+  fi
+  log "${C_DIM}post-rename:${C_RESET} pr sync"
+  cmd_pr_sync || warn "pr sync returned non-zero; re-run 'gstkprs' manually"
 }
 
 # The branch's last commit subject — used as the content portion of a fresh
@@ -2087,14 +2110,13 @@ cmd_pr() {
 #      reflects the current local stack
 cmd_pr_sync() {
   OPT_PREFIX=""
-  local opt_no_push=0 opt_ready=0 opt_dry_run=0 opt_no_template=0
+  local opt_ready=0 opt_dry_run=0 opt_no_template=0
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
       continue
     fi
     case "$1" in
-      --no-push)     opt_no_push=1; shift ;;
       --ready)       opt_ready=1; shift ;;
       --dry-run)     opt_dry_run=1; shift ;;
       --no-template) opt_no_template=1; shift ;;
@@ -2123,7 +2145,7 @@ cmd_pr_sync() {
   STACK_PUSH_FAILURES=()
   for b in "${branches[@]}"; do
     if _pr_needs_push "$b"; then
-      if (( opt_no_push )); then
+      if (( OPT_NO_PUSH )); then
         fatal_unpushed+=("$b")
       elif (( opt_dry_run )); then
         log "${C_BLUE}push${C_RESET}    ${C_CYAN}$b${C_RESET} ${C_DIM}(dry-run)${C_RESET}"
