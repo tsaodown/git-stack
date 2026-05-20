@@ -1918,15 +1918,51 @@ cmd_new() {
   require_no_op_in_progress
   require_no_state_file
 
-  local prefix
-  prefix=$(detect_prefix "$OPT_PREFIX")
+  local prefix=""
+  if [[ -n "$OPT_PREFIX" ]]; then
+    prefix="${OPT_PREFIX%/}/"
+  elif prefix=$(_try_detect_prefix "" 2>/dev/null); then
+    :  # ok
+  else
+    # Bootstrap path: no current stack.
+    if ! [[ -e /dev/tty ]] || ! [[ -t 0 || -t 2 ]]; then
+      die "no prefix detected; pass --prefix or set git config stack.prefix"
+    fi
+    # Offer existing prefixes (if any) + [new prefix...].
+    local existing_prefixes=()
+    while IFS= read -r p; do
+      [[ -n "$p" ]] && existing_prefixes+=("$p")
+    done < <(stack_prefixes)
+    if (( ${#existing_prefixes[@]} > 0 )); then
+      local picker_items=("${existing_prefixes[@]}" "[new prefix...]")
+      local picked
+      picked=$(_pick_one "select stack prefix:" "${picker_items[@]}") \
+        || die "new: no prefix selected"
+      if [[ "$picked" == "[new prefix...]" ]]; then
+        printf 'prefix (without trailing /): ' >&2
+        local typed
+        read -r typed < /dev/tty || die "new: aborted"
+        prefix="${typed%/}/"
+      else
+        prefix="$picked"
+      fi
+    else
+      printf 'prefix (without trailing /): ' >&2
+      local typed
+      read -r typed < /dev/tty || die "new: aborted"
+      prefix="${typed%/}/"
+    fi
+    # Validate the typed/picked prefix.
+    [[ -n "$prefix" && "$prefix" != "/" ]] || die "new: prefix is empty"
+    [[ "$prefix" != /* ]] || die "new: prefix must not start with /"
+    [[ "$prefix" != *' '* ]] || die "new: prefix must not contain spaces"
+    local first_leaf="${prefix%/}"
+    first_leaf="${first_leaf##*/}"
+    [[ ! "$first_leaf" =~ ^[0-9]+- ]] || die "new: prefix '$prefix' would clash with leaf-numbering pattern"
+  fi
 
   local branches=()
   _load_stack_branches "$prefix" branches
-
-  # Bootstrap path (empty stack) is handled in Task 11.
-  # Until then, die cleanly rather than crashing with set -u.
-  (( ${#branches[@]} > 0 )) || die "new: no stack branches under '$prefix' (bootstrap path not yet implemented)"
 
   # Slug collision check (against existing stack only).
   if (( ${#branches[@]} > 0 )) && _check_slug_collision "$slug" "${branches[@]}"; then
@@ -1949,7 +1985,7 @@ cmd_new() {
   fi
 
   local width
-  width=$(_leaf_width_for "${branches[@]}")
+  width=$(_leaf_width_for "${branches[@]+"${branches[@]}"}")
 
   # Compute the 0-based insertion index in the post-mutation array.
   local insert_idx
@@ -1958,8 +1994,6 @@ cmd_new() {
   elif (( opt_bottom )); then
     insert_idx=0
   elif [[ -n "$opt_after" ]]; then
-    # Until Task 11 removes the top-level empty-stack guard, this check is
-    # unreachable. Keep it for when bootstrap is wired in.
     if (( ${#branches[@]} == 0 )); then
       die "new --after: no branches in stack '$prefix'"
     fi
@@ -1969,8 +2003,6 @@ cmd_new() {
     insert_idx=$(branch_index "$after_branch" "${branches[@]}")
     insert_idx=$((insert_idx + 1))
   elif [[ -n "$opt_at" ]]; then
-    # Until Task 11 removes the top-level empty-stack guard, this check is
-    # unreachable. Keep it for when bootstrap is wired in.
     if (( ${#branches[@]} == 0 )); then
       die "new --at: no branches in stack '$prefix'"
     fi
@@ -2047,7 +2079,11 @@ cmd_new() {
   fi
 
   # Snapshot before mutation.
-  snapshot_stack new "$prefix" "${branches[@]}"
+  if (( ${#branches[@]} > 0 )); then
+    snapshot_stack new "$prefix" "${branches[@]}"
+  else
+    snapshot_stack new "$prefix"
+  fi
 
   # Build the atomic update-ref batch.
   local batch=""

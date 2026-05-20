@@ -944,3 +944,24 @@ teardown() { teardown_repo; }
   [ "$(gh_log_count 'api -X POST')" -ge 1 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
 }
+
+@test "new (bootstrap, --prefix): creates first branch of a new stack from main" {
+  # Already on main from setup. No stack exists.
+  run git stack new auth --prefix feat --no-color </dev/null
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/01-auth
+  [ "$(git symbolic-ref --short HEAD)" = "feat/01-auth" ]
+  [ "$(git rev-parse feat/01-auth)" = "$(git rev-parse main)" ]
+}
+
+@test "new (bootstrap, non-TTY, no --prefix): errors with hint" {
+  run git stack new auth --no-color </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"prefix"* ]]
+}
+
+@test "new (bootstrap, --prefix, --at): errors — empty stack" {
+  run git stack new auth --prefix feat --at 1 --no-color </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no branches"* ]]
+}
