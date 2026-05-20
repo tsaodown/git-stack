@@ -760,6 +760,60 @@ _gh_preflight() {
   [[ -n "$GH_REPO" ]] || die "gh repo view returned empty nameWithOwner"
 }
 
+# Rename a single remote branch via gh's branches/rename endpoint. PRs that
+# point at <old> are automatically retargeted by GitHub to <new>.
+# Args: <old-branch-name> <new-branch-name>
+# Caller must have already invoked _gh_preflight (so GH_REPO is set).
+# Returns 0 on success; non-zero on API failure (caller dies).
+_remote_rename_one() {
+  local old="$1" new="$2"
+  # URL-encode the branch name's slashes (the only special character in our
+  # naming convention).
+  local old_enc="${old//\//%2F}"
+  local out err rc
+  out=$(gh api -X POST "/repos/${GH_REPO}/branches/${old_enc}/rename" \
+          -f "new_name=${new}" 2>&1) || rc=$?
+  if (( ${rc:-0} != 0 )); then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+  log_v "remote rename: $old -> $new"
+}
+
+# Rename remote refs for each (old, new) pair where origin/<old> exists.
+# If gh isn't available or the remote isn't GitHub, silently skip the whole
+# batch with a single warning. On per-call failure, hard-errors (caller's
+# trap restores nothing — the local rename has already happened).
+# Args: <old1> <new1> <old2> <new2> ...
+_remote_rename_batch_or_skip() {
+  (( $# % 2 == 0 )) || die "internal: _remote_rename_batch_or_skip got odd argc"
+  (( $# == 0 )) && return 0
+  if ! command -v gh >/dev/null 2>&1; then
+    warn "gh not installed; skipping remote rename. PRs may orphan if branches were pushed."
+    return 0
+  fi
+  if ! gh auth status -h github.com >/dev/null 2>&1; then
+    warn "gh not authenticated for github.com; skipping remote rename."
+    return 0
+  fi
+  if ! GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null); then
+    warn "no GitHub remote detected; skipping remote rename."
+    return 0
+  fi
+  local old new
+  while (( $# >= 2 )); do
+    old="$1"; new="$2"; shift 2
+    # Skip branches that aren't pushed.
+    if ! git rev-parse --verify --quiet "refs/remotes/origin/$old" >/dev/null; then
+      log_v "skip remote rename (not pushed): $old"
+      continue
+    fi
+    if ! _remote_rename_one "$old" "$new"; then
+      die "gh api branches/${old}/rename failed; local renames already applied. Resolve on GitHub (UI or 'gh api ... /rename') then 'git fetch --prune' and re-run 'git stack pr sync'."
+    fi
+  done
+}
+
 # The branch's last commit subject — used as the content portion of a fresh
 # PR title (before the [N/M] position prefix is applied).
 _pr_branch_title() {

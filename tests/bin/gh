@@ -252,6 +252,42 @@ case "$_sub1 $_sub2" in
     fi
     exit 0
     ;;
+  "api -X")
+    # Handle: gh api -X POST /repos/OWNER/REPO/branches/OLD/rename -f new_name=NEW
+    _method="${3-}"
+    _path=""
+    _new_name=""
+    if (( $# >= 3 )); then shift 3; else shift "$#"; fi  # consume 'api -X POST' (or as much as exists)
+    while (( $# > 0 )); do
+      case "$1" in
+        -f)
+          case "${2-}" in
+            new_name=*) _new_name="${2#new_name=}" ;;
+          esac
+          shift 2
+          ;;
+        /*)
+          _path="$1"; shift
+          ;;
+        *)
+          shift
+          ;;
+      esac
+    done
+    if [ "$_method" = "POST" ] && [[ "$_path" == */branches/*/rename ]]; then
+      _old="${_path#*/branches/}"
+      _old="${_old%/rename}"
+      _old="${_old//%2F/\/}"
+      if [ -n "${GH_STUB_FAIL_RENAME:-}" ] && [ "$_old" = "$GH_STUB_FAIL_RENAME" ]; then
+        echo "stub: simulated rename failure for $_old" >&2
+        exit 1
+      fi
+      printf '{"name":"%s","protected":false}\n' "$_new_name"
+      exit 0
+    fi
+    # Unrecognized api call — silently succeed (don't break tests using it).
+    exit 0
+    ;;
   *)
     printf 'gh-stub: unrecognized command: %s %s\n' "$_sub1" "$_sub2" >&2
     exit 2
