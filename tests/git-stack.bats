@@ -965,3 +965,40 @@ teardown() { teardown_repo; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"no branches"* ]]
 }
+
+# ---------- move ----------
+
+@test "move: relocates a single-commit branch to top" {
+  # Each branch touches a different file to avoid cherry-pick conflicts when
+  # the move reorders branches onto new parents.
+  git checkout -q -b feat/01-a; printf 'a\n' > file-a; git add file-a; git commit -q -m "01-a"
+  git checkout -q -b feat/02-b; printf 'b\n' > file-b; git add file-b; git commit -q -m "02-b"
+  git checkout -q -b feat/03-c; printf 'c\n' > file-c; git add file-c; git commit -q -m "03-c"
+  run git stack move feat/01-a --top --no-color
+  [ "$status" -eq 0 ]
+  # 01-a content should now be at the top, renumbered.
+  # Stack order becomes: was-02-b, was-03-c, was-01-a.
+  # With auto-reflow: 01-b, 02-c, 03-a.
+  git rev-parse --verify --quiet refs/heads/feat/01-b
+  git rev-parse --verify --quiet refs/heads/feat/02-c
+  git rev-parse --verify --quiet refs/heads/feat/03-a
+  ! git rev-parse --verify --quiet refs/heads/feat/01-a
+  ! git rev-parse --verify --quiet refs/heads/feat/02-b
+  ! git rev-parse --verify --quiet refs/heads/feat/03-c
+}
+
+@test "move: refuses if target == source position" {
+  make_stack_branches feat 01-a 02-b
+  run git stack move feat/01-a --bottom --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already"* ]]
+}
+
+@test "move: refuses if source not in stack" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q main
+  git branch outside
+  run git stack move outside --prefix feat --top --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"outside"* ]]
+}

@@ -2133,6 +2133,260 @@ cmd_new() {
   fi
 }
 
+cmd_move() {
+  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
+  local src="" opt_top=0 opt_bottom=0 opt_after="" opt_at=""
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --top)     opt_top=1; shift ;;
+      --bottom)  opt_bottom=1; shift ;;
+      --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
+      --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
+      --force)   OPT_FORCE=1; shift ;;
+      -*)        die "unknown move flag: $1" ;;
+      *)         [[ -z "$src" ]] || die "move: extra arg '$1'"; src="$1"; shift ;;
+    esac
+  done
+
+  [[ -n "$src" ]] || die "usage: git stack move <branch> [--top|--bottom|--after <ref>|--at <ref>]"
+
+  local n_pos=0
+  (( opt_top )) && (( n_pos++ )) || true
+  (( opt_bottom )) && (( n_pos++ )) || true
+  [[ -n "$opt_after" ]] && (( n_pos++ )) || true
+  [[ -n "$opt_at" ]] && (( n_pos++ )) || true
+  (( n_pos <= 1 )) || die "move: --top, --bottom, --after, --at are mutually exclusive"
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+  (( ${#branches[@]} >= 2 )) || die "move: stack has fewer than 2 branches"
+
+  # Resolve source.
+  local src_branch rc=0
+  src_branch=$(_resolve_branch_ref "$src" "${branches[@]}") || rc=$?
+  (( rc == 0 )) || die "move: '$src' not in stack '$prefix'"
+  local src_idx
+  src_idx=$(branch_index "$src_branch" "${branches[@]}")
+
+  # TTY picker if no position flag.
+  if (( n_pos == 0 )) && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
+    local picker_items=("[top]")
+    local b
+    for b in "${branches[@]}"; do
+      [[ "$b" == "$src_branch" ]] && continue
+      picker_items+=("$b")
+    done
+    picker_items+=("[bottom]")
+    local picked
+    picked=$(_pick_one "move ${src_branch} to position of:" "${picker_items[@]}") \
+      || die "move: no position selected"
+    case "$picked" in
+      "[top]")    opt_top=1 ;;
+      "[bottom]") opt_bottom=1 ;;
+      *)          opt_at="$picked" ;;
+    esac
+    n_pos=1
+  fi
+  (( n_pos == 1 )) || die "move: no position specified (and no TTY for picker); pass --top/--bottom/--after/--at"
+
+  # Resolve destination index in the *post-removal* array (i.e., the array with src_branch removed).
+  # This is the index *where src will sit* after the move.
+  local dst_idx
+  if (( opt_top )); then
+    dst_idx=$((${#branches[@]} - 1))
+  elif (( opt_bottom )); then
+    dst_idx=0
+  elif [[ -n "$opt_after" ]]; then
+    local after_branch
+    after_branch=$(_resolve_branch_ref "$opt_after" "${branches[@]}") \
+      || die "move --after: '$opt_after' not in stack '$prefix'"
+    [[ "$after_branch" != "$src_branch" ]] || die "move: cannot reference itself"
+    local after_idx
+    after_idx=$(branch_index "$after_branch" "${branches[@]}")
+    if (( after_idx > src_idx )); then
+      dst_idx=$after_idx
+    else
+      dst_idx=$((after_idx + 1))
+    fi
+  elif [[ -n "$opt_at" ]]; then
+    local at_branch
+    at_branch=$(_resolve_branch_ref "$opt_at" "${branches[@]}") \
+      || die "move --at: '$opt_at' not in stack '$prefix'"
+    [[ "$at_branch" != "$src_branch" ]] || die "move: cannot reference itself"
+    local at_idx
+    at_idx=$(branch_index "$at_branch" "${branches[@]}")
+    if (( at_idx > src_idx )); then
+      dst_idx=$((at_idx - 1))
+    else
+      dst_idx=$at_idx
+    fi
+  fi
+
+  # Refuse if destination == source position.
+  if (( dst_idx == src_idx )); then
+    die "move: '$src_branch' is already at position $((src_idx + 1))"
+  fi
+
+  # Build the post-move ordering: branches minus src, with src spliced at dst_idx.
+  local post=() i
+  for ((i = 0; i < ${#branches[@]}; i++)); do
+    (( i == src_idx )) && continue
+    post+=("${branches[$i]}")
+  done
+  local spliced=()
+  for ((i = 0; i < dst_idx; i++)); do spliced+=("${post[$i]}"); done
+  spliced+=("$src_branch")
+  for ((i = dst_idx; i < ${#post[@]}; i++)); do spliced+=("${post[$i]}"); done
+  post=("${spliced[@]}")
+
+  # First affected branch index in the post-move ordering.
+  local first_affected
+  if (( dst_idx < src_idx )); then
+    first_affected=$dst_idx
+  else
+    first_affected=$src_idx
+  fi
+
+  # Multi-commit guard for affected branches.
+  if (( ! OPT_FORCE )); then
+    for ((i = first_affected; i < ${#post[@]}; i++)); do
+      local pb="${post[$i]}"
+      # Check against the CURRENT predecessor (from the original branches[] ordering),
+      # not the future predecessor. This matches do_one_step's cherry-pick semantics.
+      local cur_idx
+      cur_idx=$(branch_index "$pb" "${branches[@]}")
+      local prev_ref
+      if (( cur_idx == 0 )); then
+        local parent_name
+        parent_name=$(_resolve_parent_name) \
+          || die "move: cannot determine parent branch (set stack.base or create main/master)"
+        prev_ref=$(_resolve_parent_ref "$parent_name")
+      else
+        prev_ref="refs/heads/${branches[$((cur_idx - 1))]}"
+      fi
+      local cnt_b cnt_prev n_commits
+      cnt_b=$(git rev-list --count "refs/heads/$pb" 2>/dev/null || echo 0)
+      cnt_prev=$(git rev-list --count "$prev_ref" 2>/dev/null || echo 0)
+      n_commits=$((cnt_b - cnt_prev))
+      if (( n_commits > 1 )); then
+        die "branch '$pb' has $n_commits commits beyond its current predecessor; move would drop all but the tip. Pass --force to proceed."
+      fi
+    done
+  fi
+
+  # Worktree safety: every affected branch must not be checked out elsewhere.
+  for ((i = first_affected; i < ${#post[@]}; i++)); do
+    require_branch_not_in_worktree "${post[$i]}"
+  done
+
+  # Snapshot before mutation.
+  snapshot_stack move "$prefix" "${branches[@]}"
+
+  # ----- Stage A: rebase affected branches in the new order onto their new predecessors -----
+  STACK_BRANCHES=("${post[@]}")
+  STACK_ORIG_SHAS=()
+  for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
+    if (( i >= first_affected )); then
+      STACK_ORIG_SHAS+=("$(git rev-parse "refs/heads/${STACK_BRANCHES[$i]}")")
+    else
+      STACK_ORIG_SHAS+=("")
+    fi
+  done
+  STACK_STARTED_AT=$(date +%s)
+  STACK_STARTING_BRANCH=$(current_branch || echo "")
+  STACK_PREFIX="$prefix"
+  STACK_PUSH=0
+  # cmd_move's pre-check (above) already verified each affected branch has
+  # ≤1 commit beyond its current predecessor.  do_one_step's guard compares
+  # against the *new* predecessor, which yields a false positive when a branch
+  # inherits ancestors from an earlier stack position.  Set STACK_FORCE=1 so
+  # the do_one_step guard is suppressed; the cherry-pick is safe.
+  STACK_FORCE=1
+  STACK_ONTO=""
+  STACK_ONTO_REF=""
+  STACK_FROM_IDX="$first_affected"
+  STACK_CURSOR="$first_affected"
+  STACK_PUSH_FAILURES=()
+  if (( first_affected == 0 )); then
+    local parent_name parent_ref
+    parent_name=$(_resolve_parent_name)
+    parent_ref=$(_resolve_parent_ref "$parent_name")
+    STACK_ONTO=$(git rev-parse "$parent_ref")
+    STACK_ONTO_REF="$parent_name"
+  fi
+
+  save_state
+  run_reflow_loop
+
+  # ----- Stage B: cascade rename to consecutive leaves -----
+  local width
+  width=$(_leaf_width_for "${branches[@]}")
+  local rename_pairs=()
+  for ((i = 0; i < ${#post[@]}; i++)); do
+    local old="${post[$i]}"
+    local old_leaf="${old##*/}"
+    local old_rest="${old_leaf#*-}"
+    local new_num=$((i + 1))
+    local new_leaf
+    new_leaf=$(_format_leaf "$new_num" "$width")
+    local new_full="${prefix}${new_leaf}-${old_rest}"
+    if [[ "$old" != "$new_full" ]]; then
+      rename_pairs+=("$old" "$new_full")
+    fi
+  done
+
+  if (( ${#rename_pairs[@]} > 0 )); then
+    local batch=""
+    local j
+    for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
+      local rp_old="${rename_pairs[$j]}"
+      local rp_new="${rename_pairs[$((j + 1))]}"
+      local sha
+      sha=$(git rev-parse "refs/heads/$rp_old")
+      batch+="create refs/heads/${rp_new} ${sha}"$'\n'
+      batch+="delete refs/heads/${rp_old} ${sha}"$'\n'
+    done
+
+    local head_before="" head_new=""
+    if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
+      for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
+        if [[ "$head_before" == "refs/heads/${rename_pairs[$j]}" ]]; then
+          head_new="refs/heads/${rename_pairs[$((j + 1))]}"
+          git symbolic-ref HEAD "$head_new"
+          break
+        fi
+      done
+    fi
+
+    if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack move ${src_branch}"; then
+      [[ -n "$head_new" ]] && git symbolic-ref HEAD "$head_before" 2>/dev/null || true
+      die "git update-ref batch failed; refs unchanged (atomic)"
+    fi
+  fi
+
+  log "${C_GREEN}move${C_RESET}    ${C_CYAN}${src_branch}${C_RESET} ${C_DIM}-> position $((dst_idx + 1)) (+$((${#rename_pairs[@]} / 2)) renames)${C_RESET}"
+
+  # ----- Stage C: remote rename + pr sync -----
+  if (( ! OPT_NO_PUSH )) && (( ${#rename_pairs[@]} > 0 )); then
+    _remote_rename_batch_or_skip "${rename_pairs[@]}"
+  fi
+  if (( ! OPT_NO_PUSH )); then
+    _post_rename_sync
+  fi
+}
+
 cmd_restack() {
   parse_common_flags "$@"
   require_in_repo
@@ -3048,6 +3302,7 @@ main() {
     history)           shift; cmd_history "$@" ;;
     rename)            shift; cmd_rename "$@" ;;
     new)               shift; cmd_new "$@" ;;
+    move|mv)           shift; cmd_move "$@" ;;
     close)             shift; cmd_close "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;
