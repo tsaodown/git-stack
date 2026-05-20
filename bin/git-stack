@@ -2321,8 +2321,10 @@ cmd_move() {
   STACK_PUSH_FAILURES=()
   if (( first_affected == 0 )); then
     local parent_name parent_ref
-    parent_name=$(_resolve_parent_name)
-    parent_ref=$(_resolve_parent_ref "$parent_name")
+    parent_name=$(_resolve_parent_name) \
+      || die "move: cannot determine parent branch (set stack.base or create main/master)"
+    parent_ref=$(_resolve_parent_ref "$parent_name") \
+      || die "move: cannot resolve parent ref for '$parent_name'"
     STACK_ONTO=$(git rev-parse "$parent_ref")
     STACK_ONTO_REF="$parent_name"
   fi
