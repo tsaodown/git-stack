@@ -795,3 +795,23 @@ teardown() { teardown_repo; }
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk')
   [ "$alias_count" -eq 18 ]
 }
+
+# ---------- decimal leaves (rejected) ----------
+
+@test "decimals: branches with decimal leaves are ignored by list" {
+  make_stack_branches feat 01-a 02-b
+  git branch feat/02.5-skip feat/02-b
+  run git stack list --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  echo "$output" | grep -q "feat/01-a"
+  echo "$output" | grep -q "feat/02-b"
+  ! echo "$output" | grep -q "feat/02.5-skip"
+}
+
+@test "decimals: checkout 2.5 errors out" {
+  make_stack_branches feat 01-a 02-b
+  git branch feat/02.5-skip feat/02-b
+  run git stack checkout 2.5 --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a number"* ]] || [[ "$output" == *"no stack branch"* ]]
+}

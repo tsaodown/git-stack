@@ -155,7 +155,7 @@ _try_detect_prefix() {
   local b leaf prefix
   b=$(current_branch) || return 1
   leaf="${b##*/}"
-  [[ "$leaf" =~ ^[0-9]+(\.[0-9]+)?- ]] || return 2
+  [[ "$leaf" =~ ^[0-9]+- ]] || return 2
   if [[ "$b" == */* ]]; then
     prefix="${b%/*}/"
   else
@@ -177,7 +177,7 @@ detect_prefix() {
   esac
 }
 
-# Print branches under the prefix whose leaf matches ^[0-9]+(\.[0-9]+)?-,
+# Print branches under the prefix whose leaf matches ^[0-9]+-,
 # sorted by sort -V on the numeric portion. One branch per line.
 stack_branches() {
   local prefix="$1"
@@ -186,7 +186,7 @@ stack_branches() {
     | awk -F/ '
         {
           leaf = $NF
-          if (match(leaf, /^[0-9]+(\.[0-9]+)?-/)) {
+          if (match(leaf, /^[0-9]+-/)) {
             key = substr(leaf, 1, RLENGTH - 1)
             print key "\t" $0
           }
@@ -219,14 +219,14 @@ _load_stack_branches() {
 }
 
 # Print distinct prefixes (each ending in "/", or "" for top-level) of every
-# local branch whose leaf matches ^[0-9]+(\.[0-9]+)?-. Used by interactive
+# local branch whose leaf matches ^[0-9]+-. Used by interactive
 # checkout to let the user pick a stack when current branch has no prefix.
 stack_prefixes() {
   git for-each-ref --format='%(refname:short)' refs/heads/ \
     | awk -F/ '
         {
           leaf = $NF
-          if (match(leaf, /^[0-9]+(\.[0-9]+)?-/)) {
+          if (match(leaf, /^[0-9]+-/)) {
             n = length($0) - length(leaf)
             print substr($0, 1, n)
           }
@@ -969,7 +969,7 @@ ${b}Subcommands:${r}
                                     (e.g. when offline).
   ${sub}checkout${r} [<number>]               Check out the stack branch whose leaf starts
                                     with that number (numeric match, so \`5\`
-                                    finds \`05-foo\`, \`6.5\` finds \`06.5-baz\`).
+                                    finds \`05-foo\`).
                                     With no <number>, opens an interactive
                                     picker (fzf if available, else numbered
                                     prompt). If the current branch has no
@@ -1060,11 +1060,10 @@ ${b}Common flags:${r}
   ${fl}-q${r}, ${fl}--quiet${r}                       Less output.
 
 ${b}Stack ordering:${r}
-  Branches whose final path segment matches  ${d}^[0-9]+(\.[0-9]+)?-${r}  are sorted by
+  Branches whose final path segment matches  ${d}^[0-9]+-${r}  are sorted by
   \`sort -V\` on that numeric portion. Examples (in order):
     ${cy}<prefix>/05-foo${r}
     ${cy}<prefix>/06-bar${r}
-    ${cy}<prefix>/06.5-baz${r}
     ${cy}<prefix>/07-qux${r}
 
 ${b}Single-commit assumption:${r}
@@ -2467,7 +2466,7 @@ cmd_checkout() {
     return
   fi
 
-  [[ "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "checkout: '$input' is not a number (e.g., 5, 06, 6.5)"
+  [[ "$input" =~ ^[0-9]+$ ]] || die "checkout: '$input' is not a number (e.g., 5, 06)"
 
   require_in_repo
 
@@ -2479,7 +2478,7 @@ cmd_checkout() {
   local matches=() b leaf num
   for b in "${branches[@]}"; do
     leaf="${b##*/}"
-    [[ "$leaf" =~ ^([0-9]+(\.[0-9]+)?)- ]] || continue
+    [[ "$leaf" =~ ^([0-9]+)- ]] || continue
     num="${BASH_REMATCH[1]}"
     if awk -v a="$input" -v c="$num" 'BEGIN { exit !(a+0 == c+0) }'; then
       matches+=("$b")
