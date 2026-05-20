@@ -895,3 +895,13 @@ teardown() { teardown_repo; }
   git rev-parse --verify --quiet refs/heads/feat/03-b
   ! git rev-parse --verify --quiet refs/heads/feat/02-b
 }
+
+@test "new --bottom: inserts as leaf 01 and shifts all branches up" {
+  make_stack_branches feat 01-a 02-b
+  run git stack new prep --bottom --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/01-prep
+  git rev-parse --verify --quiet refs/heads/feat/02-a
+  git rev-parse --verify --quiet refs/heads/feat/03-b
+  [ "$(git rev-parse feat/01-prep)" = "$(git rev-parse main)" ]
+}
