@@ -1098,6 +1098,26 @@ teardown() { teardown_repo; }
   [ "$(gh_log_count 'pr')" -eq 0 ]
 }
 
+# ---------- new/move history interop ----------
+
+@test "history: 'new' produces a restorable snapshot" {
+  make_stack_branches feat 01-a 02-b
+  git stack new mid --after 1 --no-color </dev/null
+  run git stack history --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"new"* ]]
+}
+
+@test "history: 'move' produces a restorable snapshot" {
+  # snapshot_stack is called before the rebase, so even if cherry-pick
+  # conflicts the snapshot is already recorded.
+  make_stack_branches feat 01-a 02-b
+  git stack move feat/01-a --top --no-push --no-color </dev/null 2>&1 || true
+  run git stack history --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"move"* ]]
+}
+
 # ---------- help ----------
 
 @test "help: documents 'new' and 'move'" {
