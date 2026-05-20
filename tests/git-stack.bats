@@ -815,3 +815,30 @@ teardown() { teardown_repo; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"not a number"* ]] || [[ "$output" == *"no stack branch"* ]]
 }
+
+# ---------- new ----------
+
+@test "new: creates branch at top of stack with next leaf number" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  run git stack new auth --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/03-auth
+  [ "$(git symbolic-ref --short HEAD)" = "feat/03-auth" ]
+  [ "$(git rev-parse feat/03-auth)" = "$(git rev-parse feat/02-b)" ]
+}
+
+@test "new: refuses invalid slug" {
+  make_stack_branches feat 01-a
+  run git stack new 'has space' --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"slug"* ]]
+}
+
+@test "new: refuses slug collision in same stack" {
+  make_stack_branches feat 01-auth 02-other
+  git checkout -q feat/02-other
+  run git stack new auth --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"auth"* ]]
+}

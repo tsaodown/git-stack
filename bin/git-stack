@@ -1844,6 +1844,142 @@ cmd_rename() {
   log "${C_GREEN}done${C_RESET}    rename complete"
 }
 
+# ---------------------------------------------------------------------------
+# cmd_new helpers
+# ---------------------------------------------------------------------------
+
+# Slug validation: permissive — allows letters, digits, underscores, hyphens.
+# Must start with a letter or underscore. Slashes forbidden (they're the
+# branch suffix separator).
+_validate_slug() {
+  local s="$1"
+  [[ -n "$s" ]] || die "new: slug is required"
+  [[ "$s" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || die "new: slug '$s' invalid (must match ^[A-Za-z_][A-Za-z0-9_-]*\$)"
+}
+
+# Check the stack for an existing branch with the given slug suffix.
+# Returns 0 if collision found (and sets _SLUG_COLLISION_BRANCH); 1 if clear.
+_SLUG_COLLISION_BRANCH=""
+_check_slug_collision() {
+  local slug="$1"; shift
+  local b leaf rest
+  for b in "$@"; do
+    leaf="${b##*/}"
+    rest="${leaf#*-}"
+    if [[ "$rest" == "$slug" ]]; then
+      _SLUG_COLLISION_BRANCH="$b"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Pick the next integer leaf number above the highest existing one.
+# Args: <branch1> <branch2> ...  (sorted in stack order)
+# Echoes the integer.
+_next_leaf_num() {
+  if (( $# == 0 )); then
+    printf '1\n'
+    return 0
+  fi
+  local last="${!#}"
+  local leaf="${last##*/}"
+  [[ "$leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$leaf' has no numeric prefix"
+  printf '%d\n' $((10#${BASH_REMATCH[1]} + 1))
+}
+
+cmd_new() {
+  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
+  local slug="" opt_top=0 opt_bottom=0 opt_after="" opt_at=""
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --top)     opt_top=1; shift ;;
+      --bottom)  opt_bottom=1; shift ;;
+      --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
+      --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
+      --force)   OPT_FORCE=1; shift ;;
+      -*)        die "unknown new flag: $1" ;;
+      *)         [[ -z "$slug" ]] || die "new: extra arg '$1'"; slug="$1"; shift ;;
+    esac
+  done
+
+  _validate_slug "$slug"
+
+  # Mutual exclusion among position flags.
+  local n_pos=$(( opt_top + opt_bottom ))
+  [[ -n "$opt_after" ]] && (( n_pos++ )) || true
+  [[ -n "$opt_at"    ]] && (( n_pos++ )) || true
+  (( n_pos <= 1 )) || die "new: --top, --bottom, --after, --at are mutually exclusive"
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches
+
+  # Slug collision check (against existing stack only).
+  if (( ${#branches[@]} > 0 )) && _check_slug_collision "$slug" "${branches[@]}"; then
+    die "new: slug '$slug' collides with existing branch '$_SLUG_COLLISION_BRANCH'"
+  fi
+
+  local width
+  width=$(_leaf_width_for "${branches[@]}")
+
+  # MINIMAL VERSION: top-of-stack only. Tasks 7-8 add --after, --at, --bottom.
+  local insert_idx
+  if (( ${#branches[@]} == 0 )); then
+    insert_idx=0
+  else
+    insert_idx=${#branches[@]}
+  fi
+
+  # Predecessor: where the new branch starts from.
+  local predecessor_ref
+  if (( insert_idx == 0 )); then
+    # Empty stack — start from the parent branch (main/master).
+    local parent_name
+    parent_name=$(_resolve_parent_name) \
+      || die "new: cannot determine parent branch (set stack.base or create main/master)"
+    predecessor_ref=$(_resolve_parent_ref "$parent_name") \
+      || die "new: cannot resolve parent ref for '$parent_name'"
+  else
+    predecessor_ref="${branches[$((insert_idx - 1))]}"
+  fi
+  local predecessor_sha
+  predecessor_sha=$(git rev-parse "$predecessor_ref") \
+    || die "new: cannot resolve predecessor '$predecessor_ref'"
+
+  # Compute the new branch's leaf number and full name.
+  local next_num leaf new_branch
+  next_num=$(_next_leaf_num "${branches[@]}")
+  leaf=$(_format_leaf "$next_num" "$width")
+  new_branch="${prefix}${leaf}-${slug}"
+
+  # Refuse if the target ref already exists (paranoia).
+  if git rev-parse --verify --quiet "refs/heads/$new_branch" >/dev/null; then
+    die "new: ref 'refs/heads/$new_branch' already exists"
+  fi
+
+  # Snapshot before mutation.
+  snapshot_stack new "$prefix" "${branches[@]}"
+
+  # Create the new branch ref and switch HEAD.
+  git update-ref "refs/heads/$new_branch" "$predecessor_sha" \
+    || die "new: failed to create ref"
+  git checkout --quiet "$new_branch"
+
+  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_ref#refs/heads/})${C_RESET}"
+}
+
 cmd_restack() {
   parse_common_flags "$@"
   require_in_repo
@@ -2758,6 +2894,7 @@ main() {
     pr)                shift; cmd_pr "$@" ;;
     history)           shift; cmd_history "$@" ;;
     rename)            shift; cmd_rename "$@" ;;
+    new)               shift; cmd_new "$@" ;;
     close)             shift; cmd_close "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;
