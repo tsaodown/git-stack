@@ -249,6 +249,44 @@ branch_index() {
   return 1
 }
 
+# _resolve_branch_ref <ref> <branch1> <branch2> ...
+# Resolve a position-ref argument to a full branch name.
+# Accepts:
+#   - a numeric leaf (matches by integer-equal on the leading [0-9]+ of the
+#     stack branch's leaf; e.g., "2" finds "02-foo")
+#   - a full branch name (must equal exactly one stack branch)
+# Prints the matched branch name to stdout, exits 0.
+# On no match or multiple matches, exits non-zero (caller dies with context).
+_resolve_branch_ref() {
+  local ref="$1"; shift
+  (( $# > 0 )) || return 1
+  local b leaf num matches=()
+  # Full-name match takes precedence.
+  for b in "$@"; do
+    if [[ "$b" == "$ref" ]]; then
+      printf '%s\n' "$b"
+      return 0
+    fi
+  done
+  # Numeric-leaf match.
+  if [[ "$ref" =~ ^[0-9]+$ ]]; then
+    for b in "$@"; do
+      leaf="${b##*/}"
+      [[ "$leaf" =~ ^([0-9]+)- ]] || continue
+      num="${BASH_REMATCH[1]}"
+      if awk -v a="$ref" -v c="$num" 'BEGIN { exit !(a+0 == c+0) }'; then
+        matches+=("$b")
+      fi
+    done
+    case "${#matches[@]}" in
+      1) printf '%s\n' "${matches[0]}"; return 0 ;;
+      0) return 1 ;;
+      *) return 2 ;;
+    esac
+  fi
+  return 1
+}
+
 # orig_sha_for <branch> — print the saved original SHA for the branch.
 orig_sha_for() {
   local target="$1"
