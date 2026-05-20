@@ -910,6 +910,10 @@ _remote_rename_batch_or_skip() {
 # any local+remote rename. Silently no-op if gh isn't available (cmd_pr_sync
 # handles its own preflight).
 _post_rename_sync() {
+  # Optional first arg: explicit prefix to pass to cmd_pr_sync (needed when
+  # HEAD is not on a stack branch after the rename, e.g. cmd_rename with HEAD
+  # on main).
+  local _pfx="${1-}"
   (( OPT_NO_SYNC )) && return 0
   if ! command -v gh >/dev/null 2>&1; then
     return 0
@@ -918,7 +922,11 @@ _post_rename_sync() {
     return 0
   fi
   log "${C_DIM}post-rename:${C_RESET} pr sync"
-  cmd_pr_sync || warn "pr sync returned non-zero; re-run 'gstkprs' manually"
+  if [[ -n "$_pfx" ]]; then
+    cmd_pr_sync --prefix "$_pfx" || warn "pr sync returned non-zero; re-run 'gstkprs' manually"
+  else
+    cmd_pr_sync || warn "pr sync returned non-zero; re-run 'gstkprs' manually"
+  fi
 }
 
 # The branch's last commit subject — used as the content portion of a fresh
@@ -1926,6 +1934,19 @@ cmd_rename() {
   fi
 
   log "${C_GREEN}done${C_RESET}    rename complete"
+
+  # Stage 2 + 3: remote rename + pr sync. Build pairs from old branches → new prefix names.
+  if (( ! OPT_NO_PUSH )); then
+    local rename_pairs=() b leaf
+    for b in "${branches[@]}"; do
+      leaf="${b##*/}"
+      rename_pairs+=("$b" "${new_pfx}/${leaf}")
+    done
+    if (( ${#rename_pairs[@]} > 0 )); then
+      _remote_rename_batch_or_skip "${rename_pairs[@]}"
+    fi
+    _post_rename_sync "$new_pfx"
+  fi
 }
 
 # ---------- cmd_new helpers ----------

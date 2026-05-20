@@ -1059,3 +1059,25 @@ teardown() { teardown_repo; }
   run git stack continue --no-color
   [ "$status" -ne 0 ]
 }
+
+# ---------- rename (remote stages) ----------
+
+@test "rename: triggers remote rename for pushed branches" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack rename newfeat --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -ge 2 ]
+  [ "$(gh_log_count 'pr')" -ge 1 ]
+}
+
+@test "rename --no-push: keeps local-only behavior" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack rename newfeat --no-push --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr')" -eq 0 ]
+}
