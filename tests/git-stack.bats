@@ -279,6 +279,51 @@ teardown() { teardown_repo; }
   [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/3] [WIP] Foo overhaul" ]
 }
 
+@test "pr sync: re-aligns base when an existing PR points at the wrong branch" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  # Simulate #102's base getting reset to main (e.g. parent merged, base
+  # auto-retargeted by GitHub, or someone edited it by hand).
+  jq '.baseRefName = "main"' "$GH_STUB_DIR/by-num/102.json" > "$GH_STUB_DIR/x"
+  mv "$GH_STUB_DIR/x" "$GH_STUB_DIR/by-num/102.json"
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  # The base on #102 should have been re-pointed at its real parent.
+  [ "$(jq -r .baseRefName "$GH_STUB_DIR/by-num/102.json")" = "feat/01-foo" ]
+  # And the edit call should have explicitly passed --base.
+  grep -q "^gh pr edit 102 .* --base feat/01-foo" "$GH_STUB_LOG"
+  # PRs whose bases were already correct shouldn't get a base flip.
+  ! grep -q "^gh pr edit 101 .* --base " "$GH_STUB_LOG"
+  ! grep -q "^gh pr edit 103 .* --base " "$GH_STUB_LOG"
+}
+
+@test "pr sync --dry-run: reports base mismatch without calling pr edit" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  jq '.baseRefName = "main"' "$GH_STUB_DIR/by-num/102.json" > "$GH_STUB_DIR/x"
+  mv "$GH_STUB_DIR/x" "$GH_STUB_DIR/by-num/102.json"
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --dry-run --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"base=yes"* ]]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(jq -r .baseRefName "$GH_STUB_DIR/by-num/102.json")" = "main" ]
+}
+
+@test "pr sync: idempotent when base already matches expected parent" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  # No edits at all when title, body, AND base are all stable.
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+}
+
 @test "pr sync --no-push: errors when a branch isn't on origin" {
   make_stack_branches feat 01-foo 02-bar
   # No make_remote_origin — branches don't exist on origin

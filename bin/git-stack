@@ -840,14 +840,14 @@ _pr_active_branches() {
 }
 
 # Look up an open PR for <branch>. On success, print
-#   "<num><US><title><US><body>"
+#   "<num><US><title><US><baseRef><US><body>"
 # where <US> is ASCII unit separator (\x1f) and <body> may contain newlines.
 # Empty stdout if no PR found.
 _gh_pr_find() {
   local b="$1"
   gh pr list --repo "$GH_REPO" --head "$b" --state open --limit 1 \
-    --json number,title,body \
-    --jq '.[] | "\(.number)\(.title // "")\(.body // "")"' \
+    --json number,title,baseRefName,body \
+    --jq '.[] | "\(.number)\(.title // "")\(.baseRefName // "")\(.body // "")"' \
     2>/dev/null
 }
 
@@ -886,13 +886,17 @@ _gh_pr_create() {
   return 1
 }
 
-# Update an existing PR's title and/or body. Pass empty string for either to
-# skip that field. Returns 1 on failure (output captured + printed to stderr).
+# Update an existing PR's title, body, and/or base branch. Pass empty string
+# for any field to skip it. Returns 1 on failure (output captured + printed
+# to stderr).
 _gh_pr_edit() {
-  local num="$1" new_title="$2" new_body="$3"
+  local num="$1" new_title="$2" new_body="$3" new_base="${4-}"
   local args=( "$num" --repo "$GH_REPO" )
   if [[ -n "$new_title" ]]; then
     args+=( --title "$new_title" )
+  fi
+  if [[ -n "$new_base" ]]; then
+    args+=( --base "$new_base" )
   fi
   local stdin_needed=0
   if [[ -n "$new_body" ]]; then
@@ -2045,8 +2049,11 @@ cmd_pr_sync() {
   (( N > 0 )) || die "nothing to do — every stack branch is empty"
 
   # --- pass 1: query existing or create new (bottom-up) ---
-  # Parallel arrays indexed 0..N-1
-  local PR_NUMS=() PR_TITLES=() PR_BODIES=()
+  # Parallel arrays indexed 0..N-1. PR_BASES holds each PR's current base on
+  # GitHub — for newly-created PRs that's the parent we just passed, for
+  # existing ones it's whatever GH reports (which Pass 2 will re-align if it
+  # drifted from the stack).
+  local PR_NUMS=() PR_TITLES=() PR_BODIES=() PR_BASES=()
   local template_body=""
   if (( ! opt_no_template )); then
     template_body=$(_pr_template_body)
@@ -2062,13 +2069,16 @@ cmd_pr_sync() {
     fi
     found=$(_gh_pr_find "$b")
     if [[ -n "$found" ]]; then
-      local cur_num cur_title cur_body rest
+      local cur_num cur_title cur_base cur_body rest
       cur_num="${found%%$'\x1f'*}"
       rest="${found#*$'\x1f'}"
       cur_title="${rest%%$'\x1f'*}"
+      rest="${rest#*$'\x1f'}"
+      cur_base="${rest%%$'\x1f'*}"
       cur_body="${rest#*$'\x1f'}"
       PR_NUMS+=("$cur_num")
       PR_TITLES+=("$cur_title")
+      PR_BASES+=("$cur_base")
       PR_BODIES+=("$cur_body")
       log "${C_DIM}exists${C_RESET}  ${C_GREEN}#${cur_num}${C_RESET} ${C_CYAN}$b${C_RESET}"
     else
@@ -2079,6 +2089,7 @@ cmd_pr_sync() {
         log "${C_GREEN}create${C_RESET}  ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}  title='${fresh_title}'  body=${#template_body}B${C_RESET}"
         PR_NUMS+=("DRY")
         PR_TITLES+=("$fresh_title")
+        PR_BASES+=("$parent")
         PR_BODIES+=("$template_body")
         continue
       fi
@@ -2088,6 +2099,7 @@ cmd_pr_sync() {
       if new_num=$(_gh_pr_create "$b" "$parent" "$fresh_title" "$draft" "$template_body"); then
         PR_NUMS+=("$new_num")
         PR_TITLES+=("$fresh_title")
+        PR_BASES+=("$parent")
         PR_BODIES+=("$template_body")
         log "${C_GREEN}create${C_RESET}  ${C_GREEN}#${new_num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}${C_RESET}"
       else
@@ -2095,18 +2107,25 @@ cmd_pr_sync() {
         PR_FAILURES+=("$b")
         PR_NUMS+=("?")
         PR_TITLES+=("$fresh_title")
+        PR_BASES+=("$parent")
         PR_BODIES+=("$template_body")
       fi
     fi
   done
 
-  # --- pass 2: rewrite title + body with full chain context ---
+  # --- pass 2: rewrite title + body + base with full chain context ---
   for ((j = 0; j < N; j++)); do
     b="${ACTIVE[j]}"
     local num="${PR_NUMS[j]}"
     [[ "$num" == "?" ]] && continue   # creation failed; skip update
+    if (( j == 0 )); then
+      parent="$base0"
+    else
+      parent="${ACTIVE[j-1]}"
+    fi
     local cur_title="${PR_TITLES[j]}"
     local cur_body="${PR_BODIES[j]}"
+    local cur_base="${PR_BASES[j]}"
     leaf=$(_pr_branch_title "$b")
     local desired_title
     desired_title=$(_pr_title_with_pos "$((j+1))" "$N" "$cur_title" "$leaf")
@@ -2128,25 +2147,32 @@ cmd_pr_sync() {
     # CRLF -> LF). On a first re-sync after a fresh create, this can cause a
     # spurious body_changed=1 even when nothing meaningful changed — at worst
     # one redundant `gh pr edit` per PR, after which state stabilizes.
-    local title_changed=0 body_changed=0
+    local title_changed=0 body_changed=0 base_changed=0
     [[ "$desired_title" != "$cur_title" ]] && title_changed=1
     [[ "$desired_body" != "$cur_body" ]] && body_changed=1
-    if (( ! title_changed && ! body_changed )); then
+    [[ "$parent" != "$cur_base" ]] && base_changed=1
+    if (( ! title_changed && ! body_changed && ! base_changed )); then
       log_v "${C_DIM}ok${C_RESET}      ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
       continue
     fi
     if (( opt_dry_run )); then
-      local tc bc
+      local tc bc bsc
       (( title_changed )) && tc=yes || tc=no
       (( body_changed )) && bc=yes || bc=no
-      log "${C_BLUE}update${C_RESET}  ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}(title=$tc body=$bc)${C_RESET}"
+      (( base_changed )) && bsc=yes || bsc=no
+      log "${C_BLUE}update${C_RESET}  ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}(title=$tc body=$bc base=$bsc)${C_RESET}"
       continue
     fi
-    local pass_title="" pass_body=""
+    local pass_title="" pass_body="" pass_base=""
     (( title_changed )) && pass_title="$desired_title"
     (( body_changed ))  && pass_body="$desired_body"
-    if _gh_pr_edit "$num" "$pass_title" "$pass_body"; then
-      log "${C_BLUE}update${C_RESET}  ${C_GREEN}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+    (( base_changed ))  && pass_base="$parent"
+    if _gh_pr_edit "$num" "$pass_title" "$pass_body" "$pass_base"; then
+      if (( base_changed )); then
+        log "${C_BLUE}update${C_RESET}  ${C_GREEN}#${num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}(base: ${cur_base} -> ${parent})${C_RESET}"
+      else
+        log "${C_BLUE}update${C_RESET}  ${C_GREEN}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+      fi
     else
       warn "pr edit failed for $b (#${num})"
       PR_FAILURES+=("$b")

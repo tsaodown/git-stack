@@ -11,7 +11,7 @@
 #   gh pr create --repo R --head H --base B --title T [--draft] --body-file FILE
 #                                             -> emits PR URL ending in /pull/<n>;
 #                                                persists PR by branch+num
-#   gh pr edit <num> [--title T] [--body-file FILE]
+#   gh pr edit <num> [--title T] [--body-file FILE] [--base B]
 #                                             -> updates persisted PR (exit 0)
 #
 # Env vars:
@@ -214,12 +214,15 @@ case "$_sub1 $_sub2" in
     _has_title=0
     _new_body=""
     _has_body=0
-    # Look for --title / --body-file in the remaining args.
+    _new_base=""
+    _has_base=0
+    # Look for --title / --body-file / --base in the remaining args.
     shift 3
     while (( $# > 0 )); do
       case "$1" in
         --title)      _new_title="${2-}"; _has_title=1; shift 2 ;;
         --body-file)  _new_body="$_stdin"; _has_body=1; shift 2 ;;
+        --base)       _new_base="${2-}"; _has_base=1; shift 2 ;;
         *) shift ;;
       esac
     done
@@ -228,13 +231,24 @@ case "$_sub1 $_sub2" in
       # Just succeed silently (the production code is recording state too).
       exit 0
     fi
-    if (( _has_title )) && (( _has_body )); then
-      jq --arg t "$_new_title" --arg b "$_new_body" \
-        '.title = $t | .body = $b' "$_jf" > "$_jf.tmp" && mv "$_jf.tmp" "$_jf"
-    elif (( _has_title )); then
-      jq --arg t "$_new_title" '.title = $t' "$_jf" > "$_jf.tmp" && mv "$_jf.tmp" "$_jf"
-    elif (( _has_body )); then
-      jq --arg b "$_new_body" '.body = $b' "$_jf" > "$_jf.tmp" && mv "$_jf.tmp" "$_jf"
+    # Build a jq filter from whichever fields were set. jq is bash-3.2 safe
+    # and faster than chained reads.
+    _filter=""
+    _args=()
+    if (( _has_title )); then
+      _filter="${_filter}${_filter:+ | }.title = \$t"
+      _args+=( --arg t "$_new_title" )
+    fi
+    if (( _has_body )); then
+      _filter="${_filter}${_filter:+ | }.body = \$b"
+      _args+=( --arg b "$_new_body" )
+    fi
+    if (( _has_base )); then
+      _filter="${_filter}${_filter:+ | }.baseRefName = \$base"
+      _args+=( --arg base "$_new_base" )
+    fi
+    if [ -n "$_filter" ]; then
+      jq "${_args[@]}" "$_filter" "$_jf" > "$_jf.tmp" && mv "$_jf.tmp" "$_jf"
     fi
     exit 0
     ;;
