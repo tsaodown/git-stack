@@ -287,6 +287,30 @@ _resolve_branch_ref() {
   return 1
 }
 
+# Infer numeric-leaf width from a stack's existing leaves. Looks at the first
+# (lowest-numbered) branch and counts the leading-digit run. Returns 2 if no
+# branches were given (fresh-stack default).
+# Usage: _leaf_width_for <branch1> <branch2> ...
+_leaf_width_for() {
+  if (( $# == 0 )); then
+    printf '2\n'
+    return 0
+  fi
+  local first="$1"
+  local leaf="${first##*/}"
+  if [[ "$leaf" =~ ^([0-9]+)- ]]; then
+    printf '%d\n' "${#BASH_REMATCH[1]}"
+  else
+    printf '2\n'
+  fi
+}
+
+# Format an integer as a zero-padded leaf number of the given width.
+# Usage: _format_leaf <num> <width>
+_format_leaf() {
+  printf '%0*d\n' "$2" "$1"
+}
+
 # orig_sha_for <branch> — print the saved original SHA for the branch.
 orig_sha_for() {
   local target="$1"
