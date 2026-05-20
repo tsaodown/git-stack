@@ -2085,6 +2085,16 @@ cmd_new() {
   git checkout --quiet "$new_branch"
 
   log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label}, +$((${#rename_pairs[@]} / 2)) renames)${C_RESET}"
+
+  # Stage 2: remote rename. Skipped under --no-push.
+  if (( ! OPT_NO_PUSH )) && (( ${#rename_pairs[@]} > 0 )); then
+    _remote_rename_batch_or_skip "${rename_pairs[@]}"
+  fi
+
+  # Stage 3: pr sync. Skipped under --no-push OR --no-sync.
+  if (( ! OPT_NO_PUSH )); then
+    _post_rename_sync
+  fi
 }
 
 cmd_restack() {

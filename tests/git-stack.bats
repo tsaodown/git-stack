@@ -912,3 +912,35 @@ teardown() { teardown_repo; }
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/03-tail
 }
+
+@test "new --after: renames remote branches via gh api and triggers pr sync" {
+  make_stack_branches feat 01-a 02-b 03-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack new mid --after 1 --no-color
+  [ "$status" -eq 0 ]
+  # The two cascaded branches (was 02-b, was 03-c) must have been remote-renamed.
+  [ "$(gh_log_count 'api -X POST')" -ge 2 ]
+  # pr sync must have been invoked too (gh_log shows 'pr list' or 'pr create'/'pr edit').
+  [ "$(gh_log_count 'pr')" -ge 1 ]
+}
+
+@test "new --after --no-push: skips remote rename and pr sync" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack new mid --after 1 --no-push --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr')" -eq 0 ]
+}
+
+@test "new --after --no-sync: does remote rename but skips pr sync" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack new mid --after 1 --no-sync --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
+  [ "$(gh_log_count 'pr')" -eq 0 ]
+}
