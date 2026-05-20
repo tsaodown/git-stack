@@ -1259,6 +1259,27 @@ ${b}Subcommands:${r}
                                     \`history restore <id> [--yes]\`. Run-id may
                                     be full, action-tagged, bare timestamp, or
                                     \`@N\` (relative; @0 = newest).
+  ${sub}new${r} <slug> [${fl}--top${r}|${fl}--bottom${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--prefix${r} <p>]
+                                    Create an empty branch in the stack at the
+                                    chosen position. <ref> is a numeric leaf
+                                    or a full branch name. With no position
+                                    flag, opens an interactive picker
+                                    (\`[top]\` ... branches ... \`[bottom]\`).
+                                    Cascades leaf renames for branches above
+                                    the insertion; auto-renames remote refs
+                                    via GitHub branch-rename API so PRs follow,
+                                    then runs \`pr sync\`. With no stack
+                                    detected, prompts for or picks a prefix
+                                    (bootstrap path; non-TTY requires
+                                    ${fl}--prefix${r}).
+  ${sub}move${r} <branch> [${fl}--top${r}|${fl}--bottom${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--force${r}]
+                                    Relocate <branch> in the current stack to
+                                    the chosen position. Cherry-picks affected
+                                    branches onto their new predecessors using
+                                    the existing reflow state machine — on
+                                    conflict, resolve + \`git stack continue\`.
+                                    Cascades leaf renames + remote rename + pr
+                                    sync, same as ${sub}new${r}.
   ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}]
                                     Atomically rename every branch in the stack
                                     from <old>/<leaf> to <new>/<leaf>, carrying
@@ -1285,6 +1306,8 @@ ${b}Subcommands:${r}
 ${b}Common flags:${r}
   ${fl}--prefix${r} <p>                      Override the stack prefix (else
                                     git config stack.prefix, else auto-detect).
+  ${fl}--no-push${r}                         (new/move/rename) skip remote rename + pr sync.
+  ${fl}--no-sync${r}                         (new/move/rename) skip pr sync only.
   ${fl}--color${r} | ${fl}--no-color${r}              Force color on/off (default: auto-detect
                                     TTY; honors ${fl}NO_COLOR${r} env var).
   ${fl}-v${r}, ${fl}--verbose${r}                     More output.

@@ -1081,3 +1081,12 @@ teardown() { teardown_repo; }
   [ "$(gh_log_count 'api -X POST')" -eq 0 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
 }
+
+# ---------- help ----------
+
+@test "help: documents 'new' and 'move'" {
+  run git stack help --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"git stack new"* ]] || [[ "$output" == *" new "* ]]
+  [[ "$output" == *"move"* ]]
+}
