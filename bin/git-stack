@@ -1844,9 +1844,7 @@ cmd_rename() {
   log "${C_GREEN}done${C_RESET}    rename complete"
 }
 
-# ---------------------------------------------------------------------------
-# cmd_new helpers
-# ---------------------------------------------------------------------------
+# ---------- cmd_new helpers ----------
 
 # Slug validation: permissive — allows letters, digits, underscores, hyphens.
 # Must start with a letter or underscore. Slashes forbidden (they're the
@@ -1915,6 +1913,11 @@ cmd_new() {
   [[ -n "$opt_at"    ]] && (( n_pos++ )) || true
   (( n_pos <= 1 )) || die "new: --top, --bottom, --after, --at are mutually exclusive"
 
+  # Tasks 7-8 add --bottom/--after/--at. Until then, refuse rather than silently ignore.
+  if (( opt_bottom )) || [[ -n "$opt_after" ]] || [[ -n "$opt_at" ]]; then
+    die "new: --bottom/--after/--at not implemented yet"
+  fi
+
   require_in_repo
   require_clean_tree
   require_no_op_in_progress
@@ -1925,6 +1928,10 @@ cmd_new() {
 
   local branches=()
   _load_stack_branches "$prefix" branches
+
+  # Bootstrap path (empty stack) is handled in Task 11.
+  # Until then, die cleanly rather than crashing with set -u.
+  (( ${#branches[@]} > 0 )) || die "new: no stack branches under '$prefix' (bootstrap path not yet implemented)"
 
   # Slug collision check (against existing stack only).
   if (( ${#branches[@]} > 0 )) && _check_slug_collision "$slug" "${branches[@]}"; then

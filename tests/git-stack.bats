@@ -840,5 +840,12 @@ teardown() { teardown_repo; }
   git checkout -q feat/02-other
   run git stack new auth --no-color
   [ "$status" -ne 0 ]
-  [[ "$output" == *"auth"* ]]
+  [[ "$output" == *"collides"* ]] || [[ "$output" == *"feat/01-auth"* ]]
+}
+
+@test "new: refuses slug starting with a digit" {
+  make_stack_branches feat 01-a
+  run git stack new 1foo --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"slug"* ]]
 }
