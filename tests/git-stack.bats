@@ -1076,6 +1076,55 @@ teardown() { teardown_repo; }
   [ "$status" -ne 0 ]
 }
 
+# ---------- move (remote stages) ----------
+
+@test "move: renames remote branches via gh api and triggers pr sync" {
+  # Build stack with separate files (avoids cherry-pick conflicts during rebase).
+  git checkout -q -b feat/01-a
+  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack move feat/01-a --top --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -ge 2 ]
+  [ "$(gh_log_count 'pr')" -ge 1 ]
+}
+
+@test "move --no-push: skips remote rename and pr sync" {
+  # Build stack with separate files.
+  git checkout -q -b feat/01-a
+  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack move feat/01-a --top --no-push --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr')" -eq 0 ]
+}
+
+@test "move --no-sync: does remote rename but skips pr sync" {
+  git checkout -q -b feat/01-a
+  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack move feat/01-a --top --no-sync --no-color
+  [ "$status" -eq 0 ]
+  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
+  [ "$(gh_log_count 'pr')" -eq 0 ]
+}
+
 # ---------- rename (remote stages) ----------
 
 @test "rename: triggers remote rename for pushed branches" {

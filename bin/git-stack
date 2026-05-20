@@ -832,7 +832,7 @@ _finish_move_rename() {
     _remote_rename_batch_or_skip "${rename_pairs[@]}"
   fi
   if (( ! OPT_NO_PUSH )); then
-    _post_rename_sync
+    _post_rename_sync "$prefix"
   fi
 }
 
