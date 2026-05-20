@@ -1913,11 +1913,6 @@ cmd_new() {
   [[ -n "$opt_at"    ]] && (( n_pos++ )) || true
   (( n_pos <= 1 )) || die "new: --top, --bottom, --after, --at are mutually exclusive"
 
-  # Tasks 7-8 add --bottom/--after/--at. Until then, refuse rather than silently ignore.
-  if (( opt_bottom )) || [[ -n "$opt_after" ]] || [[ -n "$opt_at" ]]; then
-    die "new: --bottom/--after/--at not implemented yet"
-  fi
-
   require_in_repo
   require_clean_tree
   require_no_op_in_progress
@@ -1941,50 +1936,134 @@ cmd_new() {
   local width
   width=$(_leaf_width_for "${branches[@]}")
 
-  # MINIMAL VERSION: top-of-stack only. Tasks 7-8 add --after, --at, --bottom.
+  # Compute the 0-based insertion index in the post-mutation array.
   local insert_idx
-  if (( ${#branches[@]} == 0 )); then
+  if (( opt_top )); then
+    insert_idx=${#branches[@]}
+  elif (( opt_bottom )); then
     insert_idx=0
+  elif [[ -n "$opt_after" ]]; then
+    if (( ${#branches[@]} == 0 )); then
+      die "new --after: no branches in stack '$prefix'"
+    fi
+    local after_branch rc=0
+    after_branch=$(_resolve_branch_ref "$opt_after" "${branches[@]}") || rc=$?
+    (( rc == 0 )) || die "new --after: '$opt_after' not in stack '$prefix'"
+    insert_idx=$(branch_index "$after_branch" "${branches[@]}")
+    insert_idx=$((insert_idx + 1))
+  elif [[ -n "$opt_at" ]]; then
+    if (( ${#branches[@]} == 0 )); then
+      die "new --at: no branches in stack '$prefix'"
+    fi
+    local at_branch rc=0
+    at_branch=$(_resolve_branch_ref "$opt_at" "${branches[@]}") || rc=$?
+    (( rc == 0 )) || die "new --at: '$opt_at' not in stack '$prefix'"
+    insert_idx=$(branch_index "$at_branch" "${branches[@]}")
   else
+    # No position flag (and not picker — picker is wired in Task 9). Default: top.
     insert_idx=${#branches[@]}
   fi
 
   # Predecessor: where the new branch starts from.
-  local predecessor_ref
+  local predecessor_ref predecessor_label
   if (( insert_idx == 0 )); then
-    # Empty stack — start from the parent branch (main/master).
     local parent_name
-    parent_name=$(_resolve_parent_name) \
-      || die "new: cannot determine parent branch (set stack.base or create main/master)"
-    predecessor_ref=$(_resolve_parent_ref "$parent_name") \
-      || die "new: cannot resolve parent ref for '$parent_name'"
+    parent_name=$(_resolve_parent_name)
+    predecessor_ref=$(_resolve_parent_ref "$parent_name")
+    predecessor_label="$parent_name"
   else
-    predecessor_ref="${branches[$((insert_idx - 1))]}"
+    local prev="${branches[$((insert_idx - 1))]}"
+    predecessor_ref="refs/heads/$prev"
+    predecessor_label="$prev"
   fi
   local predecessor_sha
   predecessor_sha=$(git rev-parse "$predecessor_ref") \
     || die "new: cannot resolve predecessor '$predecessor_ref'"
 
-  # Compute the new branch's leaf number and full name.
-  local next_num leaf new_branch
-  next_num=$(_next_leaf_num "${branches[@]}")
-  leaf=$(_format_leaf "$next_num" "$width")
+  # Compute the new branch's leaf number based on insert position.
+  local new_num leaf new_branch
+  if (( insert_idx == 0 )); then
+    # Bottom insert: new leaf is 1; everything else shifts up.
+    new_num=1
+  elif (( insert_idx == ${#branches[@]} )); then
+    # Top append: next integer above the highest existing.
+    new_num=$(_next_leaf_num "${branches[@]}")
+  else
+    # Mid-insert: predecessor's leaf + 1.
+    local prev_branch="${branches[$((insert_idx - 1))]}"
+    local prev_leaf="${prev_branch##*/}"
+    [[ "$prev_leaf" =~ ^([0-9]+)- ]] || die "internal: prev_leaf '$prev_leaf' malformed"
+    new_num=$((10#${BASH_REMATCH[1]} + 1))
+  fi
+  leaf=$(_format_leaf "$new_num" "$width")
   new_branch="${prefix}${leaf}-${slug}"
 
-  # Refuse if the target ref already exists (paranoia).
+  # Build the rename batch for branches at insert_idx and above (each gets +1).
+  # rename_pairs is a flat array: old1 new1 old2 new2 ...
+  local rename_pairs=()
+  local i b old_leaf old_num new_leaf_str new_full
+  for ((i = insert_idx; i < ${#branches[@]}; i++)); do
+    b="${branches[$i]}"
+    old_leaf="${b##*/}"
+    [[ "$old_leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$old_leaf' malformed"
+    old_num=$((10#${BASH_REMATCH[1]}))
+    new_leaf_str=$(_format_leaf $((old_num + 1)) "$width")
+    new_full="${prefix}${new_leaf_str}-${old_leaf#*-}"
+    if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
+      die "new: cascade rename would collide with existing '$new_full'"
+    fi
+    rename_pairs+=("$b" "$new_full")
+  done
+
+  # Refuse if any branch in the cascade is checked out elsewhere.
+  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+    require_branch_not_in_worktree "${rename_pairs[$i]}"
+  done
+
+  # Paranoia: new branch ref must not exist.
   if git rev-parse --verify --quiet "refs/heads/$new_branch" >/dev/null; then
-    die "new: ref 'refs/heads/$new_branch' already exists"
+    die "new: target ref 'refs/heads/$new_branch' already exists"
   fi
 
   # Snapshot before mutation.
   snapshot_stack new "$prefix" "${branches[@]}"
 
-  # Create the new branch ref and switch HEAD.
-  git update-ref "refs/heads/$new_branch" "$predecessor_sha" \
-    || die "new: failed to create ref"
+  # Build the atomic update-ref batch.
+  local batch=""
+  batch+="create refs/heads/${new_branch} ${predecessor_sha}"$'\n'
+  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+    local old="${rename_pairs[$i]}"
+    local new="${rename_pairs[$((i + 1))]}"
+    local sha
+    sha=$(git rev-parse "refs/heads/$old")
+    batch+="create refs/heads/${new} ${sha}"$'\n'
+    batch+="delete refs/heads/${old} ${sha}"$'\n'
+  done
+
+  # Retarget HEAD if it points at a cascade-renamed branch.
+  local head_target_before="" head_new_target=""
+  if head_target_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
+    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+      if [[ "$head_target_before" == "refs/heads/${rename_pairs[$i]}" ]]; then
+        head_new_target="refs/heads/${rename_pairs[$((i + 1))]}"
+        git symbolic-ref HEAD "$head_new_target"
+        break
+      fi
+    done
+  fi
+
+  # Apply the batch.
+  if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack new $new_branch"; then
+    if [[ -n "$head_new_target" ]]; then
+      git symbolic-ref HEAD "$head_target_before" 2>/dev/null || true
+    fi
+    die "git update-ref batch failed; refs unchanged (atomic)"
+  fi
+
+  # Switch HEAD to the new branch.
   git checkout --quiet "$new_branch"
 
-  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_ref#refs/heads/})${C_RESET}"
+  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label}, +${#rename_pairs[@]} renames)${C_RESET}"
 }
 
 cmd_restack() {

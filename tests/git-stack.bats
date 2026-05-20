@@ -849,3 +849,38 @@ teardown() { teardown_repo; }
   [ "$status" -ne 0 ]
   [[ "$output" == *"slug"* ]]
 }
+
+@test "new --after: inserts between two named branches" {
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack new mid --after feat/01-a --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/02-mid
+  git rev-parse --verify --quiet refs/heads/feat/03-b
+  git rev-parse --verify --quiet refs/heads/feat/04-c
+  ! git rev-parse --verify --quiet refs/heads/feat/02-b
+  ! git rev-parse --verify --quiet refs/heads/feat/03-c
+}
+
+@test "new --after: accepts numeric leaf" {
+  make_stack_branches feat 01-a 02-b
+  run git stack new mid --after 1 --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/02-mid
+  git rev-parse --verify --quiet refs/heads/feat/03-b
+}
+
+@test "new --at: takes that slot, pushing it (and above) up" {
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack new newone --at 2 --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/02-newone
+  git rev-parse --verify --quiet refs/heads/feat/03-b
+  git rev-parse --verify --quiet refs/heads/feat/04-c
+}
+
+@test "new --after: fails on unknown ref" {
+  make_stack_branches feat 01-a 02-b
+  run git stack new mid --after 99 --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"99"* ]]
+}
