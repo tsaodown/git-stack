@@ -905,3 +905,10 @@ teardown() { teardown_repo; }
   git rev-parse --verify --quiet refs/heads/feat/03-b
   [ "$(git rev-parse feat/01-prep)" = "$(git rev-parse main)" ]
 }
+
+@test "new (no flag, non-TTY): defaults to --top" {
+  make_stack_branches feat 01-a 02-b
+  run git stack new tail --no-color </dev/null
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/03-tail
+}
