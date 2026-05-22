@@ -3419,7 +3419,7 @@ cmd_restack() {
   prefix=$(detect_prefix "$OPT_PREFIX")
   local branches=()
   _load_stack_branches "$prefix" branches
-  (( ${#branches[@]} >= 2 )) || die "stack '$prefix' has fewer than 2 branches"
+  (( ${#branches[@]} >= 1 )) || die "stack '$prefix' has no branches"
 
   local starting_branch
   starting_branch=$(require_branch)
