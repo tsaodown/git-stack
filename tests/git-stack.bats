@@ -820,13 +820,13 @@ HOOK
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches simple-abbreviation count (20)" {
-  # 20 simple aliases (gstk + 19 others), 3 compound functions.
+@test "init bash: alias count matches simple-abbreviation count (21)" {
+  # 21 simple aliases (gstk + 20 others, including gstkd), 3 compound functions.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk')
-  [ "$alias_count" -eq 20 ]
+  [ "$alias_count" -eq 21 ]
 }
 
 @test "init bash: emits gstkn, gstkmv (move), gstkrn" {
@@ -1247,7 +1247,7 @@ HOOK
   sha_10=$(git rev-parse refs/heads/feat/10-b)
   sha_11=$(git rev-parse refs/heads/feat/11-c)
   sha_12=$(git rev-parse refs/heads/feat/12-d)
-  run git stack doctor --no-color
+  run git stack doctor --yes --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/01-a
   ! git rev-parse --verify --quiet refs/heads/feat/00-a
@@ -1262,7 +1262,7 @@ HOOK
   printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
   git checkout -q -b feat/01-b
   printf '01-b\n' >> file && git add file && git commit -q -m '01-b'
-  run git stack doctor --no-color
+  run git stack doctor --yes --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/01-a
   git rev-parse --verify --quiet refs/heads/feat/02-b
@@ -1274,7 +1274,7 @@ HOOK
   local sha_01 sha_02
   sha_01=$(git rev-parse refs/heads/feat/01-a)
   sha_02=$(git rev-parse refs/heads/feat/02-b)
-  run git stack doctor --no-color
+  run git stack doctor --yes --no-color
   [ "$status" -eq 0 ]
   [[ "$output" == *"already valid"* ]]
   [ "$(git rev-parse refs/heads/feat/01-a)" = "$sha_01" ]
@@ -1297,6 +1297,126 @@ HOOK
   [ "$(git rev-parse refs/heads/feat/00-a)" = "$sha_00" ]
   [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
   ! git rev-parse --verify --quiet refs/heads/feat/01-a
+}
+
+# ---------- doctor squash ----------
+
+@test "doctor --yes: squashes a multi-commit branch into one commit" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  printf 'extra\n' >> file && git add file && git commit -q -m "02-b second"
+  local sha_01
+  sha_01=$(git rev-parse refs/heads/feat/01-a)
+  run git stack doctor --yes --no-rename --no-push --no-color
+  [ "$status" -eq 0 ]
+  # 02-b is now a single commit on top of feat/01-a.
+  assert_branch_parent_is feat/02-b "$sha_01"
+  # Combined commit message picks up both original subjects.
+  run git log -1 --format=%B refs/heads/feat/02-b
+  [[ "$output" == *"02-b"* ]]
+  [[ "$output" == *"02-b second"* ]]
+}
+
+@test "doctor --yes: squashes merge-tip and deletes upper branch absorbed by squash" {
+  make_stack_branches feat 01-a 02-b 03-c
+  # GH-style merge: 03-c into 02-b with a real merge commit. After squash,
+  # 02-b contains both 02-b's and 03-c's diffs — 03-c becomes redundant.
+  git checkout -q feat/02-b
+  git merge --no-ff -q -m "merge 03-c into 02-b" feat/03-c
+  git checkout -q feat/01-a
+  local sha_01
+  sha_01=$(git rev-parse refs/heads/feat/01-a)
+  run git stack doctor --yes --no-rename --no-push --no-color
+  [ "$status" -eq 0 ]
+  # 02-b becomes a single commit on top of feat/01-a — no longer a merge.
+  assert_branch_parent_is feat/02-b "$sha_01"
+  ! git rev-parse --verify --quiet refs/heads/feat/02-b^2
+  # 03-c was absorbed by the squash — doctor deleted it.
+  ! git rev-parse --verify --quiet refs/heads/feat/03-c
+}
+
+@test "doctor --yes: reflows non-absorbed upper branch after squash" {
+  # 02-b is multi-commit (squash will collapse). 03-c modifies an
+  # independent file, so its diff vs the new 02-b is non-empty — it must
+  # be re-threaded, not deleted.
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  printf 'extra\n' >> file && git add file && git commit -q -m "02-b second"
+  git checkout -q -b feat/03-c
+  printf '03-c\n' > c-file && git add c-file && git commit -q -m "03-c"
+  local sha_01 old_03
+  sha_01=$(git rev-parse refs/heads/feat/01-a)
+  old_03=$(git rev-parse refs/heads/feat/03-c)
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-rename --no-push --no-color
+  [ "$status" -eq 0 ]
+  assert_branch_parent_is feat/02-b "$sha_01"
+  # 03-c still exists, re-threaded onto the new 02-b.
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  local new_02
+  new_02=$(git rev-parse refs/heads/feat/02-b)
+  assert_branch_parent_is feat/03-c "$new_02"
+  [ "$(git rev-parse refs/heads/feat/03-c)" != "$old_03" ]
+}
+
+@test "doctor --yes: empty-squash branch is deleted" {
+  make_stack_branches feat 01-a 02-b
+  # Make 02-b's tree identical to feat/01-a by reverting 02-b's change.
+  git checkout -q feat/02-b
+  git rm -q file
+  printf '01-a\n' > file
+  git add file
+  git commit -q -m "02-b absorbed back to 01-a state"
+  # Sanity: trees are now equal.
+  [ "$(git rev-parse refs/heads/feat/01-a^{tree})" = "$(git rev-parse refs/heads/feat/02-b^{tree})" ]
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-rename --no-push --no-color
+  [ "$status" -eq 0 ]
+  # 02-b is deleted, 01-a still present.
+  ! git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/01-a
+}
+
+@test "doctor --dry-run: lists squash issues without applying" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  printf 'extra\n' >> file && git add file && git commit -q -m "02-b second"
+  local sha_02
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  run git stack doctor --dry-run --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"squash"* ]]
+  [[ "$output" == *"feat/02-b"* ]]
+  # Branch is unchanged.
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+}
+
+@test "doctor --no-squash: rename applies, multi-commit branch untouched" {
+  git checkout -q -b feat/00-a
+  printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
+  git checkout -q -b feat/02-b
+  printf '02-b\n' >> file && git add file && git commit -q -m '02-b'
+  # Add a second commit to feat/02-b so it's also multi-commit.
+  printf 'extra\n' >> file && git add file && git commit -q -m "02-b second"
+  local sha_02
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  run git stack doctor --yes --no-squash --no-push --no-color
+  [ "$status" -eq 0 ]
+  # The 00-a leaf was renamed to 01-a (gap above is preserved).
+  git rev-parse --verify --quiet refs/heads/feat/01-a
+  ! git rev-parse --verify --quiet refs/heads/feat/00-a
+  # feat/02-b is unchanged — --no-squash skipped the multi-commit fix.
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+}
+
+@test "doctor without --yes on non-tty refuses with a hint" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  printf 'extra\n' >> file && git add file && git commit -q -m "02-b second"
+  # bats runs commands with stdin/stdout piped, so the tty check fires.
+  run git stack doctor --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--yes"* ]]
 }
 
 # ---------- rename (remote stages) ----------

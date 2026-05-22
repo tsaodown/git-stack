@@ -1322,16 +1322,31 @@ ${b}Subcommands:${r}
                                     backup refs along by default. Refuses if
                                     state file exists, branch checked out
                                     elsewhere, or any target name collides.
-  ${sub}doctor${r} [${fl}--dry-run${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
-                                    Reflow the current stack's leaf numbers in
-                                    place so each branch's number is strictly
-                                    greater than the previous (and the first
-                                    is >= 1). Preserves intentional gaps;
-                                    only renames branches that are out of
-                                    order. Useful if leaves got into a
-                                    malformed state (e.g., a leftover
-                                    ${cy}00-${r} leaf). Same atomic rename +
-                                    remote-rename + pr sync flow as ${sub}new${r}.
+  ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}]
+          [${fl}--no-rename${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
+                                    Detect and offer to fix problems in the
+                                    current stack. Two issue types are checked:
+                                      • leaf numbers out of order (renamed to
+                                        cascade in place, preserving gaps)
+                                      • branches that violate the single-
+                                        commit-per-branch invariant — multi-
+                                        commit branches and merge-commit tips
+                                        (squashed into one commit on top of
+                                        their predecessor, then upper branches
+                                        are re-threaded via ${sub}restack${r})
+                                    Per-issue interactive prompts on a tty:
+                                    ${fl}y${r}=apply, ${fl}e${r}=apply with \$EDITOR for the
+                                    squash message, ${fl}N${r}=skip, ${fl}a${r}=apply all,
+                                    ${fl}q${r}=quit. Pass ${fl}--yes${r} to auto-apply every
+                                    fix (required for non-tty / scripts).
+                                    ${fl}--dry-run${r} previews the issue list and
+                                    proposed fixes without applying. ${fl}--no-squash${r}
+                                    skips the squash checks (rename-only mode);
+                                    ${fl}--no-rename${r} skips the leaf-rename pass.
+                                    Empty squashes (branch tree == predecessor
+                                    tree) offer to delete the absorbed branch.
+                                    Same atomic rename + remote-rename + pr
+                                    sync flow as ${sub}new${r}.
   ${sub}close${r} [${fl}--dry-run${r}] [${fl}--keep-history${r}]
                                     Delete every branch in the stack whose
                                     upstream is \`[gone]\` (run ${fl}git fetch
@@ -2526,38 +2541,17 @@ cmd_move() {
   run_reflow_loop
 }
 
-cmd_doctor() {
-  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local opt_dry_run=0
-  while (( $# > 0 )); do
-    if _consume_common_flag "$@"; then
-      shift "$_FLAG_SHIFT"
-      continue
-    fi
-    case "$1" in
-      --dry-run) opt_dry_run=1; shift ;;
-      -*)        die "unknown doctor flag: $1" ;;
-      *)         die "doctor takes no positional arguments" ;;
-    esac
-  done
+# ---------- doctor helpers ----------
 
-  require_in_repo
-  require_clean_tree
-  require_no_op_in_progress
-  require_no_state_file
-
-  local prefix
-  prefix=$(detect_prefix "$OPT_PREFIX")
-  local branches=()
-  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
-
+# Scan a stack for out-of-order leaf numbers. Populates the named array with
+# alternating <old branch> <new branch> pairs. Pure read-only.
+# Usage: _doctor_scan_renames <out_array_name> <prefix> <branch>...
+_doctor_scan_renames() {
+  local out_name="$1" prefix="$2"; shift 2
+  local branches=("$@")
   local width
   width=$(_leaf_width_for "${branches[@]}")
-
-  # Walk branches, ensuring each leaf number is > prev_num (and the first is
-  # therefore >= 1). Preserves gaps: branches whose existing number already
-  # exceeds prev_num are left alone.
-  local rename_pairs=()
+  eval "$out_name=()"
   local prev_num=0
   local i b leaf old_num old_rest new_num new_leaf new_full
   for ((i = 0; i < ${#branches[@]}; i++)); do
@@ -2573,48 +2567,46 @@ cmd_doctor() {
     new_num=$((prev_num + 1))
     new_leaf=$(_format_leaf "$new_num" "$width")
     new_full="${prefix}${new_leaf}-${old_rest}"
-    rename_pairs+=("$b" "$new_full")
+    eval "$out_name+=($(printf '%q ' "$b" "$new_full"))"
     prev_num=$new_num
   done
+}
 
-  if (( ${#rename_pairs[@]} == 0 )); then
-    log "${C_GREEN}doctor${C_RESET}  stack '$prefix' already valid"
-    return 0
-  fi
-
-  # Refuse if any cascade target collides with an existing branch that isn't
-  # itself being renamed away.
-  local j conflict
-  for ((i = 1; i < ${#rename_pairs[@]}; i+=2)); do
-    new_full="${rename_pairs[$i]}"
+# Refuse if any rename target collides with an existing branch that isn't
+# itself being renamed away.
+# Usage: _doctor_check_rename_collisions <rename_pairs>...
+_doctor_check_rename_collisions() {
+  local pairs=("$@")
+  local i j new_full conflict
+  for ((i = 1; i < ${#pairs[@]}; i+=2)); do
+    new_full="${pairs[$i]}"
     if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
       conflict=1
-      for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
-        if [[ "${rename_pairs[$j]}" == "$new_full" ]]; then conflict=0; break; fi
+      for ((j = 0; j < ${#pairs[@]}; j+=2)); do
+        if [[ "${pairs[$j]}" == "$new_full" ]]; then conflict=0; break; fi
       done
       (( conflict == 0 )) || die "doctor: cascade target '$new_full' already exists"
     fi
   done
+}
 
-  if (( opt_dry_run )); then
-    log "${C_BOLD}doctor (dry-run):${C_RESET}"
-    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-      log "  ${rename_pairs[$i]} -> ${rename_pairs[$((i+1))]}"
-    done
-    return 0
-  fi
+# Apply a confirmed batch of renames atomically via git update-ref --stdin.
+# Caller is responsible for snapshot + collision check.
+# Usage: _doctor_apply_renames_batch <prefix> <rename_pairs>...
+_doctor_apply_renames_batch() {
+  local prefix="$1"; shift
+  local pairs=("$@")
+  (( ${#pairs[@]} > 0 )) || return 0
 
-  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-    require_branch_not_in_worktree "${rename_pairs[$i]}"
+  local i
+  for ((i = 0; i < ${#pairs[@]}; i+=2)); do
+    require_branch_not_in_worktree "${pairs[$i]}"
   done
 
-  snapshot_stack doctor "$prefix" "${branches[@]}"
-
-  local batch=""
-  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-    local old="${rename_pairs[$i]}"
-    local new="${rename_pairs[$((i + 1))]}"
-    local sha
+  local batch="" old new sha
+  for ((i = 0; i < ${#pairs[@]}; i+=2)); do
+    old="${pairs[$i]}"
+    new="${pairs[$((i + 1))]}"
     sha=$(git rev-parse "refs/heads/$old")
     batch+="create refs/heads/${new} ${sha}"$'\n'
     batch+="delete refs/heads/${old} ${sha}"$'\n'
@@ -2622,9 +2614,9 @@ cmd_doctor() {
 
   local head_before="" head_new=""
   if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
-    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-      if [[ "$head_before" == "refs/heads/${rename_pairs[$i]}" ]]; then
-        head_new="refs/heads/${rename_pairs[$((i + 1))]}"
+    for ((i = 0; i < ${#pairs[@]}; i+=2)); do
+      if [[ "$head_before" == "refs/heads/${pairs[$i]}" ]]; then
+        head_new="refs/heads/${pairs[$((i + 1))]}"
         git symbolic-ref HEAD "$head_new"
         break
       fi
@@ -2638,11 +2630,541 @@ cmd_doctor() {
     die "git update-ref batch failed; refs unchanged (atomic)"
   fi
 
-  log "${C_GREEN}doctor${C_RESET}  reflowed stack '$prefix' (+$((${#rename_pairs[@]} / 2)) renames)"
+  log "${C_GREEN}doctor${C_RESET}  renamed ${C_BOLD}$((${#pairs[@]} / 2))${C_RESET} branch(es)"
 
   if (( ! OPT_NO_PUSH )); then
-    _remote_rename_batch_or_skip "${rename_pairs[@]}"
-    _post_rename_sync
+    _remote_rename_batch_or_skip "${pairs[@]}"
+    _post_rename_sync "$prefix"
+  fi
+}
+
+# Return 0 (prints "absorbed", "merge", "multi", or "both" to stdout) when
+# <branch> needs a fix relative to <prev_ref>; return 1 (silent) when clean.
+# "absorbed" means the branch's tree already equals the predecessor's tree —
+# it's been fully merged upstream and is now redundant.
+# Usage: _doctor_branch_squash_kind <branch> <prev_ref>
+_doctor_branch_squash_kind() {
+  local b="$1" prev_ref="$2"
+  local b_ref="refs/heads/$b"
+
+  # Tree equality dominates: a branch that's already been merged into its
+  # predecessor (e.g., PR merged upstream, local branch not yet cleaned up)
+  # should be offered for deletion, not squashed.
+  if _doctor_squash_is_empty "$b" "$prev_ref"; then
+    printf 'absorbed\n'
+    return 0
+  fi
+
+  local is_merge=0
+  if git rev-parse --verify --quiet "${b_ref}^2" >/dev/null 2>&1; then
+    is_merge=1
+  fi
+
+  # Same heuristic as do_one_step (bin/git-stack:691-694): a positive diff in
+  # reachable-commit counts indicates multi-commit. Sound for linear stacks;
+  # robust enough for the merge-tip case too because either flag suffices.
+  local count_b count_prev n_commits
+  count_b=$(git rev-list --count "$b_ref" 2>/dev/null || echo 0)
+  count_prev=$(git rev-list --count "$prev_ref" 2>/dev/null || echo 0)
+  n_commits=$((count_b - count_prev))
+  local is_multi=0
+  if (( n_commits > 1 )); then
+    is_multi=1
+  fi
+
+  if (( is_merge && is_multi )); then printf 'both\n';  return 0
+  elif (( is_merge ));               then printf 'merge\n'; return 0
+  elif (( is_multi ));               then printf 'multi\n'; return 0
+  fi
+  return 1
+}
+
+# Concatenated commit messages from prev..tip (oldest first, blank-line
+# separated). Used as the default squash commit message.
+# Usage: _doctor_default_squash_msg <prev_ref> <tip_ref>
+_doctor_default_squash_msg() {
+  local prev_ref="$1" tip_ref="$2"
+  git log --reverse --format='%B' "${prev_ref}..${tip_ref}"
+}
+
+# Tree-equality test for the empty-squash case (branch already absorbed into
+# predecessor). Returns 0 if trees are equal, 1 otherwise.
+_doctor_squash_is_empty() {
+  local b="$1" prev_ref="$2"
+  local tree_b tree_prev
+  tree_b=$(git rev-parse "refs/heads/${b}^{tree}")
+  tree_prev=$(git rev-parse "${prev_ref}^{tree}")
+  [[ "$tree_b" == "$tree_prev" ]]
+}
+
+# Soft-reset + commit a branch on top of its predecessor. Captures the full
+# prev..tip diff as one commit, regardless of whether prev was an ancestor of
+# the old tip.
+# Returns:
+#   0 — commit made
+#   2 — empty-squash case; branch left untouched, caller offers delete
+#   3 — user aborted the editor; branch left at predecessor with staged diff
+# Usage: _doctor_apply_squash <branch> <prev_ref> <edit_msg:0|1>
+_doctor_apply_squash() {
+  local b="$1" prev_ref="$2" edit_msg="$3"
+
+  # Pre-check tree equality so we never touch refs in the empty case.
+  if _doctor_squash_is_empty "$b" "$prev_ref"; then
+    return 2
+  fi
+
+  git checkout --quiet "$b"
+  git reset --soft --quiet "$prev_ref"
+  local msg
+  msg=$(_doctor_default_squash_msg "$prev_ref" "ORIG_HEAD")
+  if (( edit_msg )); then
+    git commit --quiet --edit -m "$msg" || return 3
+  else
+    git commit --quiet -m "$msg"
+  fi
+  return 0
+}
+
+# Delete a branch that's been fully absorbed into its predecessor.
+# Usage: _doctor_delete_branch <branch> <prev_ref>
+_doctor_delete_branch() {
+  local b="$1" prev_ref="$2"
+  git checkout --quiet "$prev_ref"
+  git update-ref -d "refs/heads/$b"
+}
+
+# Read one char from /dev/tty, lowercase it, echo to stdout. Empty string on
+# bare RET. Returns 1 if /dev/tty isn't readable.
+# Usage: _doctor_prompt <prompt-string>
+_doctor_prompt() {
+  local prompt="$1"
+  [[ -e /dev/tty ]] || return 1
+  printf '%s' "$prompt" >&2
+  local ans
+  read -r ans < /dev/tty || return 1
+  # Portable lowercase (bash 3.2 on macOS lacks ${var,,}).
+  ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')
+  ans="${ans:0:1}"
+  printf '%s\n' "$ans"
+}
+
+# Print the per-issue header to stderr.
+# Args: <idx_1based> <total> <branch> <kind>
+_doctor_print_issue_header() {
+  local idx="$1" total="$2" branch="$3" kind="$4"
+  local label
+  case "$kind" in
+    merge)  label="merge commit at tip" ;;
+    multi)  label="multi-commit branch" ;;
+    both)   label="merge commit + multi-commit" ;;
+    rename) label="leaf out of order" ;;
+    *)      label="$kind" ;;
+  esac
+  printf '\n%s[%d/%d]%s %s%s%s  %s%s%s\n' \
+    "$C_BOLD" "$idx" "$total" "$C_RESET" \
+    "$C_CYAN" "$branch" "$C_RESET" \
+    "$C_DIM" "$label" "$C_RESET" >&2
+}
+
+# Drive run_reflow_loop over the (possibly mutated) branch list to re-thread
+# any branches above a squash whose parent SHAs are now stale. Captures
+# CURRENT SHAs (post-squash) so do_one_step's skip checks see the new state.
+# Usage: _doctor_reflow_upper <prefix> <parent_ref> <from_idx> <branch>...
+_doctor_reflow_upper() {
+  local prefix="$1" parent_ref="$2" from_idx="$3"; shift 3
+  local branches=("$@")
+
+  STACK_BRANCHES=("${branches[@]}")
+  STACK_ORIG_SHAS=()
+  local i
+  for ((i = 0; i < ${#branches[@]}; i++)); do
+    STACK_ORIG_SHAS+=("$(git rev-parse "refs/heads/${branches[$i]}")")
+  done
+
+  STACK_STARTED_AT=$(date +%s)
+  STACK_STARTING_BRANCH=$(current_branch 2>/dev/null || echo "")
+  STACK_PREFIX="$prefix"
+  STACK_PUSH=0
+  # --force is safe here: every multi-commit / merge-tip branch was already
+  # either squashed or marked absorbed during the squash + sweep phases. Any
+  # remaining "ahead by >1" count is purely from stale predecessor ancestry
+  # left in the upper branches' history — do_one_step's tip-only cherry-pick
+  # is exactly the right behavior for that case. If a user skipped squashing
+  # a real multi-commit branch, doctor's snapshot lets them roll back.
+  STACK_FORCE=1
+  STACK_ONTO=""
+  STACK_ONTO_REF=""
+  STACK_FROM_IDX="$from_idx"
+  STACK_CURSOR="$from_idx"
+  STACK_PUSH_FAILURES=()
+
+  snapshot_stack doctor-reflow "$prefix" "${STACK_BRANCHES[@]}"
+  save_state
+  run_reflow_loop
+}
+
+cmd_doctor() {
+  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
+  local opt_dry_run=0 opt_yes=0 opt_no_squash=0 opt_no_rename=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --dry-run)   opt_dry_run=1; shift ;;
+      --yes|-y)    opt_yes=1; shift ;;
+      --no-squash) opt_no_squash=1; shift ;;
+      --no-rename) opt_no_rename=1; shift ;;
+      -*)          die "unknown doctor flag: $1" ;;
+      *)           die "doctor takes no positional arguments" ;;
+    esac
+  done
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  # Interactive only when stdin and stdout are both TTYs and the user hasn't
+  # opted out via --yes / --dry-run. Refuse otherwise to avoid silently
+  # mis-applying destructive fixes from a pipe.
+  local interactive=0
+  if (( opt_yes || opt_dry_run )); then
+    interactive=0
+  elif [[ -t 0 && -t 1 ]]; then
+    interactive=1
+  else
+    die "doctor: not running on a tty; pass --yes to auto-apply or --dry-run to preview"
+  fi
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+
+  local parent_name parent_ref
+  parent_name=$(_resolve_parent_name) \
+    || die "doctor: cannot determine parent branch (set stack.base or create main/master)"
+  parent_ref=$(_resolve_parent_ref "$parent_name") \
+    || die "doctor: cannot resolve parent ref for '$parent_name'"
+
+  # ----- Scan -----
+
+  local squash_idx=() squash_kind=()
+  if (( ! opt_no_squash )); then
+    local i b prev_ref kind
+    for ((i = 0; i < ${#branches[@]}; i++)); do
+      b="${branches[$i]}"
+      if (( i == 0 )); then
+        prev_ref="$parent_ref"
+      else
+        prev_ref="refs/heads/${branches[$((i-1))]}"
+      fi
+      if kind=$(_doctor_branch_squash_kind "$b" "$prev_ref"); then
+        squash_idx+=("$i")
+        squash_kind+=("$kind")
+      fi
+    done
+  fi
+
+  local rename_pairs=()
+  if (( ! opt_no_rename )); then
+    _doctor_scan_renames rename_pairs "$prefix" "${branches[@]}"
+    if (( ${#rename_pairs[@]} > 0 )); then
+      _doctor_check_rename_collisions "${rename_pairs[@]}"
+    fi
+  fi
+
+  local total_issues=$(( ${#squash_idx[@]} + ${#rename_pairs[@]} / 2 ))
+  if (( total_issues == 0 )); then
+    log "${C_GREEN}doctor${C_RESET}  stack '$prefix' already valid"
+    return 0
+  fi
+
+  # ----- Dry-run -----
+
+  if (( opt_dry_run )); then
+    log "${C_BOLD}doctor (dry-run):${C_RESET} stack ${C_CYAN}${prefix}${C_RESET}"
+    local k
+    for ((k = 0; k < ${#squash_idx[@]}; k++)); do
+      log "  squash  ${C_CYAN}${branches[${squash_idx[$k]}]}${C_RESET}  (${squash_kind[$k]})"
+    done
+    local i
+    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+      log "  rename  ${C_CYAN}${rename_pairs[$i]}${C_RESET} -> ${C_CYAN}${rename_pairs[$((i+1))]}${C_RESET}"
+    done
+    return 0
+  fi
+
+  # ----- Apply: one snapshot covers the whole session -----
+
+  snapshot_stack doctor "$prefix" "${branches[@]}"
+
+  local applied_squash=0 lowest_squash_idx=-1
+  local apply_all=$(( opt_yes ))
+  local user_quit=0
+
+  # ----- Squash phase (bottom-up, applies immediately) -----
+
+  if (( ${#squash_idx[@]} > 0 )); then
+    local k idx b prev_ref kind ans rc tip_sha tip_subj n_commits edit_msg
+    for ((k = 0; k < ${#squash_idx[@]}; k++)); do
+      (( user_quit )) && break
+      idx="${squash_idx[$k]}"
+      b="${branches[$idx]}"
+      kind="${squash_kind[$k]}"
+      if (( idx == 0 )); then
+        prev_ref="$parent_ref"
+      else
+        prev_ref="refs/heads/${branches[$((idx-1))]}"
+      fi
+
+      # Absorbed-branch case: no squash needed; offer delete directly.
+      if [[ "$kind" == "absorbed" ]]; then
+        _doctor_print_issue_header "$((k+1))" "${#squash_idx[@]}" "$b" "absorbed"
+        printf '  %sbranch is fully absorbed into %s%s%s (tree matches predecessor)%s\n' \
+          "$C_DIM" "$C_CYAN" "${prev_ref##refs/heads/}" "$C_DIM" "$C_RESET" >&2
+        local del_ans
+        if (( apply_all )); then
+          del_ans=y
+        elif (( interactive )); then
+          del_ans=$(_doctor_prompt "  delete branch? [y/N/q]: ") || del_ans=n
+        else
+          del_ans=y
+        fi
+        case "$del_ans" in
+          y)
+            _doctor_delete_branch "$b" "$prev_ref"
+            printf '  %sdeleted%s %s%s%s\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$b" "$C_RESET" >&2
+            local nb=() m
+            for ((m = 0; m < ${#branches[@]}; m++)); do
+              if (( m != idx )); then nb+=("${branches[$m]}"); fi
+            done
+            branches=("${nb[@]}")
+            local mm
+            for ((mm = k + 1; mm < ${#squash_idx[@]}; mm++)); do
+              squash_idx[$mm]=$(( squash_idx[mm] - 1 ))
+            done
+            applied_squash=$((applied_squash + 1))
+            if (( lowest_squash_idx < 0 )); then
+              lowest_squash_idx=$idx
+            fi
+            ;;
+          q) user_quit=1 ;;
+          *) printf '  %sskip%s\n' "$C_DIM" "$C_RESET" >&2 ;;
+        esac
+        continue
+      fi
+
+      _doctor_print_issue_header "$((k+1))" "${#squash_idx[@]}" "$b" "$kind"
+
+      tip_sha=$(git rev-parse --short "refs/heads/$b")
+      tip_subj=$(git log -1 --format='%s' "refs/heads/$b")
+      n_commits=$(( $(git rev-list --count "refs/heads/$b") - $(git rev-list --count "$prev_ref") ))
+      printf '  %stip:%s %s %s%s%s\n' \
+        "$C_DIM" "$C_RESET" "$tip_sha" "$C_DIM" "$tip_subj" "$C_RESET" >&2
+      printf '  %s%d commit(s) ahead of %s%s%s:%s\n' \
+        "$C_DIM" "$n_commits" "$C_CYAN" "${prev_ref##refs/heads/}" "$C_DIM" "$C_RESET" >&2
+      git log --reverse --format="    %h %s" "${prev_ref}..refs/heads/${b}" >&2 || true
+      printf '  %sdefault squash message:%s\n' "$C_DIM" "$C_RESET" >&2
+      _doctor_default_squash_msg "$prev_ref" "refs/heads/$b" | sed 's/^/    /' >&2
+
+      edit_msg=0
+      if (( apply_all )); then
+        ans=y
+      elif (( interactive )); then
+        ans=$(_doctor_prompt "  squash? [y/e/N/a/q]: ") || ans=n
+        case "$ans" in
+          y) ;;
+          e) edit_msg=1; ans=y ;;
+          a) apply_all=1; ans=y ;;
+          q) user_quit=1; continue ;;
+          *) ans=n ;;
+        esac
+      else
+        ans=n
+      fi
+
+      if [[ "$ans" != "y" ]]; then
+        printf '  %sskip%s\n' "$C_DIM" "$C_RESET" >&2
+        continue
+      fi
+
+      rc=0
+      _doctor_apply_squash "$b" "$prev_ref" "$edit_msg" || rc=$?
+      case "$rc" in
+        0)
+          local new_sha
+          new_sha=$(git rev-parse --short "refs/heads/$b")
+          printf '  %ssquashed%s %s%s%s: %s -> %s\n' \
+            "$C_GREEN" "$C_RESET" "$C_CYAN" "$b" "$C_RESET" "$tip_sha" "$new_sha" >&2
+          applied_squash=$((applied_squash + 1))
+          if (( lowest_squash_idx < 0 )); then
+            lowest_squash_idx=$idx
+          fi
+          ;;
+        2)
+          # Empty squash — branch is fully absorbed into predecessor. Offer delete.
+          local del_ans
+          printf '  %sbranch is fully absorbed into %s%s%s (no diff)%s\n' \
+            "$C_DIM" "$C_CYAN" "${prev_ref##refs/heads/}" "$C_DIM" "$C_RESET" >&2
+          if (( apply_all )); then
+            del_ans=y
+          elif (( interactive )); then
+            del_ans=$(_doctor_prompt "  delete branch? [y/N/q]: ") || del_ans=n
+          else
+            del_ans=y
+          fi
+          case "$del_ans" in
+            y)
+              _doctor_delete_branch "$b" "$prev_ref"
+              printf '  %sdeleted%s %s%s%s\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$b" "$C_RESET" >&2
+              local nb=() m
+              for ((m = 0; m < ${#branches[@]}; m++)); do
+                if (( m != idx )); then nb+=("${branches[$m]}"); fi
+              done
+              branches=("${nb[@]}")
+              # Subsequent squash_idx entries now refer to shifted positions.
+              local mm
+              for ((mm = k + 1; mm < ${#squash_idx[@]}; mm++)); do
+                squash_idx[$mm]=$(( squash_idx[mm] - 1 ))
+              done
+              applied_squash=$((applied_squash + 1))
+              if (( lowest_squash_idx < 0 )); then
+                lowest_squash_idx=$idx
+              fi
+              ;;
+            q) user_quit=1 ;;
+            *) printf '  %sskip%s (branch left untouched at original tip)\n' "$C_DIM" "$C_RESET" >&2 ;;
+          esac
+          ;;
+        3)
+          die "commit edit aborted on '$b'; branch left at predecessor with staged diff. Run 'git stack abort' to restore, or re-commit manually."
+          ;;
+      esac
+    done
+  fi
+
+  # ----- Rename phase -----
+
+  if (( ! opt_no_rename && ! user_quit )); then
+    # Re-scan in case any squashes/deletes changed the branch list.
+    rename_pairs=()
+    _doctor_scan_renames rename_pairs "$prefix" "${branches[@]}"
+    if (( ${#rename_pairs[@]} > 0 )); then
+      _doctor_check_rename_collisions "${rename_pairs[@]}"
+
+      local confirmed=()
+      local i from_b to_b label_idx label_total ans
+      label_total=$(( ${#rename_pairs[@]} / 2 ))
+      for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+        from_b="${rename_pairs[$i]}"
+        to_b="${rename_pairs[$((i+1))]}"
+        label_idx=$(( i / 2 + 1 ))
+        _doctor_print_issue_header "$label_idx" "$label_total" "$from_b" "rename"
+        printf '  %srename to:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$to_b" "$C_RESET" >&2
+
+        if (( apply_all )); then
+          ans=y
+        elif (( interactive )); then
+          ans=$(_doctor_prompt "  rename? [y/N/a/q]: ") || ans=n
+          case "$ans" in
+            y) ;;
+            a) apply_all=1; ans=y ;;
+            q) user_quit=1; ans=n ;;
+            *) ans=n ;;
+          esac
+        else
+          ans=n
+        fi
+
+        if [[ "$ans" == "y" ]]; then
+          confirmed+=("$from_b" "$to_b")
+        else
+          printf '  %sskip%s\n' "$C_DIM" "$C_RESET" >&2
+        fi
+        (( user_quit )) && break
+      done
+
+      if (( ${#confirmed[@]} > 0 )); then
+        _doctor_apply_renames_batch "$prefix" "${confirmed[@]}"
+        # Renames mutate ref names — reload branches for reflow.
+        branches=()
+        _load_stack_branches "$prefix" branches
+      fi
+    fi
+  fi
+
+  # ----- Post-squash absorbed-branch sweep -----
+  #
+  # When a merge-tip squash collapses an upper branch's diff into the
+  # squashed commit (e.g., 02-b absorbs 03-c via the merge), the upper
+  # branch is now redundant — same tree as its new predecessor. Reflow
+  # would hit an empty cherry-pick and bail. Sweep these first.
+
+  if (( applied_squash > 0 && ! user_quit )); then
+    local sweep_done=0
+    while (( ! sweep_done )); do
+      sweep_done=1
+      local s_idx
+      for ((s_idx = lowest_squash_idx + 1; s_idx < ${#branches[@]}; s_idx++)); do
+        local s_b="${branches[$s_idx]}"
+        local s_prev_ref
+        if (( s_idx == 0 )); then
+          s_prev_ref="$parent_ref"
+        else
+          s_prev_ref="refs/heads/${branches[$((s_idx-1))]}"
+        fi
+        if _doctor_squash_is_empty "$s_b" "$s_prev_ref"; then
+          printf '\n%ssweep%s %s%s%s  %sabsorbed by squash%s\n' \
+            "$C_BOLD" "$C_RESET" "$C_CYAN" "$s_b" "$C_RESET" \
+            "$C_DIM" "$C_RESET" >&2
+          printf '  %sbranch tree matches %s%s%s — nothing to cherry-pick%s\n' \
+            "$C_DIM" "$C_CYAN" "${s_prev_ref##refs/heads/}" "$C_DIM" "$C_RESET" >&2
+          local sw_ans
+          if (( apply_all )); then
+            sw_ans=y
+          elif (( interactive )); then
+            sw_ans=$(_doctor_prompt "  delete absorbed branch? [y/N/q]: ") || sw_ans=n
+          else
+            sw_ans=y
+          fi
+          case "$sw_ans" in
+            y)
+              _doctor_delete_branch "$s_b" "$s_prev_ref"
+              printf '  %sdeleted%s %s%s%s\n' "$C_YELLOW" "$C_RESET" "$C_CYAN" "$s_b" "$C_RESET" >&2
+              local nb=() m
+              for ((m = 0; m < ${#branches[@]}; m++)); do
+                if (( m != s_idx )); then nb+=("${branches[$m]}"); fi
+              done
+              branches=("${nb[@]}")
+              sweep_done=0
+              break
+              ;;
+            q) user_quit=1; sweep_done=1; break ;;
+            *) printf '  %sskip%s (branch left in place; reflow will likely fail with empty cherry-pick)\n' "$C_DIM" "$C_RESET" >&2 ;;
+          esac
+        fi
+      done
+    done
+  fi
+
+  # ----- Reflow phase -----
+
+  if (( applied_squash > 0 && lowest_squash_idx >= 0 && ! user_quit )); then
+    if (( lowest_squash_idx < ${#branches[@]} - 1 )); then
+      log ""
+      log "${C_DIM}reflow${C_RESET}  re-threading branches above index $lowest_squash_idx"
+      _doctor_reflow_upper "$prefix" "$parent_ref" "$((lowest_squash_idx + 1))" "${branches[@]}"
+    fi
+  fi
+
+  log ""
+  if (( user_quit )); then
+    log "${C_YELLOW}doctor${C_RESET}  stopped at user request; ${applied_squash} squash(es) applied"
+  else
+    log "${C_GREEN}doctor${C_RESET}  done"
   fi
 }
 
@@ -3495,6 +4017,7 @@ alias gstkhr='git stack history restore'
 alias gstkn='git stack new'
 alias gstkmv='git stack move'
 alias gstkrn='git stack rename'
+alias gstkd='git stack doctor'
 
 gstkrom() {
   local _b
@@ -3538,6 +4061,7 @@ abbr -a -g gstkhr git stack history restore
 abbr -a -g gstkn git stack new
 abbr -a -g gstkmv git stack move
 abbr -a -g gstkrn git stack rename
+abbr -a -g gstkd git stack doctor
 abbr -a -g gstkcl "git fetch --all --prune; and git stack close"
 FISH_EOF
 }
