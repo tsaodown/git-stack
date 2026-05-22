@@ -1207,8 +1207,8 @@ _osc8_link() {
 _gh_pr_inspect() {
   local b="$1"
   gh pr list --repo "$GH_REPO" --head "$b" --limit 1 \
-    --json number,title,state,isDraft,baseRefName,reviewDecision,comments \
-    --jq '.[] | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)"' \
+    --json number,title,state,isDraft,baseRefName,reviewDecision,comments,latestReviews,statusCheckRollup \
+    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($checks)"' \
     2>/dev/null
 }
 
@@ -3949,13 +3949,14 @@ cmd_pr_list() {
   local ACTIVE=()
   _pr_active_branches "$base0" ACTIVE "${branches[@]}"
 
-  # Branch column width for alignment.
+  # Branch column width for alignment across rows. Keeps the header line
+  # (branch + #PR + flags) in column parity so statuses are easy to compare.
   local b max_w=0
   for b in "${branches[@]}"; do
     (( ${#b} > max_w )) && max_w=${#b}
   done
 
-  local data num title state is_draft base_ref review_dec comments
+  local data num title state is_draft base_ref review_dec comments approvers change_reqs checks
   local marker branch_color flags expected_base pr_cell pr_url
   for b in "${branches[@]}"; do
     if [[ "$b" == "$current" ]]; then
@@ -3968,7 +3969,7 @@ cmd_pr_list() {
 
     data=$(_gh_pr_inspect "$b")
     if [[ -z "$data" ]]; then
-      printf '%s %s%-*s%s  %s(no PR)%s\n' \
+      printf '%s %s%-*s%s  %s(no PR)%s\n\n' \
         "$marker" "$branch_color" "$max_w" "$b" "$C_RESET" \
         "$C_DIM" "$C_RESET"
       continue
@@ -3980,7 +3981,10 @@ cmd_pr_list() {
     is_draft="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
     base_ref="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
     review_dec="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
-    comments="$data"
+    comments="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    approvers="${data%%$'\x1f'*}";  data="${data#*$'\x1f'}"
+    change_reqs="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
+    checks="$data"
 
     # Strip the [N/M] prefix from the displayed title — the row order already
     # conveys position, so showing the prefix here is just visual noise.
@@ -4024,22 +4028,85 @@ cmd_pr_list() {
       fi
     fi
 
-    case "$review_dec" in
-      APPROVED)          flags+="${C_GREEN}[approved]${C_RESET} " ;;
-      CHANGES_REQUESTED) flags+="${C_RED}[changes]${C_RESET} " ;;
-    esac
+    # Render reviewer flags based on who has actually reviewed, not on the
+    # overall reviewDecision — GitHub may report REVIEW_REQUIRED (e.g., when
+    # CODEOWNERS still wants more sign-off) even after someone has approved,
+    # but we still want to surface the approver. Both flags can coexist when
+    # different reviewers are in different states.
+    if [[ -n "$approvers" ]]; then
+      flags+="${C_GREEN}[approved: ${approvers//,/, }]${C_RESET} "
+    elif [[ "$review_dec" == "APPROVED" ]]; then
+      flags+="${C_GREEN}[approved]${C_RESET} "
+    fi
+    if [[ -n "$change_reqs" ]]; then
+      flags+="${C_RED}[changes: ${change_reqs//,/, }]${C_RESET} "
+    elif [[ "$review_dec" == "CHANGES_REQUESTED" ]]; then
+      flags+="${C_RED}[changes]${C_RESET} "
+    fi
+
+    # Merge blocker: required reviewers (e.g., CODEOWNERS) still need to sign
+    # off. Only relevant for open PRs.
+    if [[ "$state" == "OPEN" && "$review_dec" == "REVIEW_REQUIRED" ]]; then
+      flags+="${C_YELLOW}[review required]${C_RESET} "
+    fi
+
+    # CI / status checks rollup. Only relevant for open PRs — merged/closed
+    # PRs may still report a status but it isn't actionable. Counts come
+    # from jq as "pass,fail,pending"; segments with zero are suppressed.
+    if [[ "$state" == "OPEN" && -n "$checks" ]]; then
+      local c_pass c_fail c_pending
+      IFS=, read -r c_pass c_fail c_pending <<< "$checks"
+      if (( c_pass + c_fail + c_pending > 0 )); then
+        local check_parts=""
+        if (( c_fail > 0 )); then
+          check_parts+="${C_RED}${c_fail} fail${C_RESET}"
+        fi
+        if (( c_pending > 0 )); then
+          [[ -n "$check_parts" ]] && check_parts+=", "
+          check_parts+="${C_YELLOW}${c_pending} pending${C_RESET}"
+        fi
+        if (( c_pass > 0 )); then
+          [[ -n "$check_parts" ]] && check_parts+=", "
+          check_parts+="${C_GREEN}${c_pass} pass${C_RESET}"
+        fi
+        flags+="[checks: ${check_parts}] "
+      fi
+    fi
 
     # Trim trailing space on flags.
     flags="${flags% }"
 
+    # Comment count: filter out bot-authored comments. gh pr list's `comments`
+    # field counts everything (CI status comments, Atlantis plan outputs, etc.)
+    # but doesn't expose user.type, so we re-query via REST when there's at
+    # least one comment to filter. per_page=100 + --paginate keeps it to one
+    # request for typical PRs.
     local cnt_suffix=""
     if [[ "$comments" =~ ^[0-9]+$ ]] && (( comments > 0 )); then
-      cnt_suffix="  ${C_DIM}(${comments}c)${C_RESET}"
+      local human_count
+      human_count=$(gh api "repos/${GH_REPO}/issues/${num}/comments?per_page=100" --paginate \
+        --jq '[.[] | select(.user.type != "Bot")] | length' \
+        2>/dev/null)
+      if [[ "$human_count" =~ ^[0-9]+$ ]]; then
+        comments="$human_count"
+      fi
+      if (( comments == 1 )); then
+        cnt_suffix="  ${C_DIM}(1 comment)${C_RESET}"
+      elif (( comments > 0 )); then
+        cnt_suffix="  ${C_DIM}(${comments} comments)${C_RESET}"
+      fi
     fi
 
-    printf '%s %s%-*s%s  %s  %s  %s%s\n' \
+    # Three-line block per branch + trailing blank line for breathing room:
+    #   line 1: branch + #PR + comment count (identifier line)
+    #   line 2: flag list, indented (status line)
+    #   line 3: PR title, dim+indented (content line — settles into background
+    #           so the colored status flags above pop)
+    # Branch padded to max_w so #PR / comment columns line up across rows.
+    printf '%s %s%-*s%s  %s%s\n    %s\n    %s%s%s\n\n' \
       "$marker" "$branch_color" "$max_w" "$b" "$C_RESET" \
-      "$pr_cell" "$flags" "$title" "$cnt_suffix"
+      "$pr_cell" "$cnt_suffix" "$flags" \
+      "$C_DIM" "$title" "$C_RESET"
   done
 }
 
