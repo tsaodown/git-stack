@@ -704,6 +704,17 @@ do_one_step() {
     return 0
   fi
 
+  # Refuse merge commits explicitly. The single-commit-per-branch model assumes
+  # B_orig is a regular commit cherry-pickable onto the new predecessor; merge
+  # commits aren't, and `git cherry-pick` fails with a cryptic "is a merge but
+  # no -m option was given" message. We don't auto-pick `-m 1` because the
+  # correct mainline is ambiguous and silent wrongness is worse than a refusal.
+  # The multi-commit count guard catches most of these earlier, but --force
+  # bypasses it — this check stays sound under --force.
+  if git rev-parse --verify --quiet "${B_orig}^2" >/dev/null 2>&1; then
+    die "branch '$B' tip ($(git rev-parse --short "$B_orig")) is a merge commit; restack expects single-commit branches. Squash or rebase the merge into a linear commit, then retry. Use 'git stack abort' to roll back this in-flight restack."
+  fi
+
   log "${C_GREEN}restack${C_RESET} ${C_CYAN}$B${C_RESET} ${C_DIM}onto${C_RESET} ${C_CYAN}$prev_label${C_RESET}"
   git checkout --quiet "$B"
   git reset --hard --quiet "$prev_new"

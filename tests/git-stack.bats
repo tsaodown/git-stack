@@ -84,6 +84,20 @@ teardown() { teardown_repo; }
   [ "$status" -eq 0 ]
 }
 
+@test "restack: refuses merge commit at branch tip even with --force" {
+  make_stack_branches feat 01-a 02-b 03-c
+  # Make 02-b's tip a real merge commit (mirrors the GH 'Create a merge commit'
+  # button merging PR 03-c into 02-b). --force is used so we bypass the
+  # multi-commit count guard and specifically exercise the merge-commit check
+  # right before the cherry-pick.
+  git checkout -q feat/02-b
+  git merge --no-ff -q -m "merge 03-c into 02-b" feat/03-c
+  run git stack restack --force --from feat/02-b --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"merge commit"* ]]
+  [[ "$output" == *"feat/02-b"* ]]
+}
+
 # ---------- amend ----------
 
 @test "amend: amends current and reflows upper branches" {
