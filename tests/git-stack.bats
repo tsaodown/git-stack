@@ -105,6 +105,25 @@ teardown() { teardown_repo; }
   [[ "$output" == *"amend"* ]]
 }
 
+@test "amend: refuses early (before pre-commit hook) when nothing staged and tree dirty" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  # Install a pre-commit hook that records when it ran. If amend errors early,
+  # this marker must not exist.
+  mkdir -p .git/hooks
+  cat > .git/hooks/pre-commit <<'HOOK'
+#!/usr/bin/env bash
+touch "$(git rev-parse --git-dir)/hook-ran"
+HOOK
+  chmod +x .git/hooks/pre-commit
+  # Dirty the working tree without staging.
+  printf 'unstaged\n' >> file
+  run git stack amend --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"nothing staged"* ]]
+  [ ! -e .git/hook-ran ]
+}
+
 # ---------- history ----------
 
 @test "history list: shows snapshots after a restack" {
@@ -922,6 +941,62 @@ teardown() { teardown_repo; }
   [ "$(git rev-parse feat/01-prep)" = "$(git rev-parse main)" ]
 }
 
+@test "new --first: no cascade when first existing leaf is already > 1" {
+  make_stack_branches feat 05-a 06-b
+  local sha_05 sha_06
+  sha_05=$(git rev-parse refs/heads/feat/05-a)
+  sha_06=$(git rev-parse refs/heads/feat/06-b)
+  run git stack new prep --first --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/01-prep
+  # 05-a and 06-b must be untouched — no cascade because of the gap.
+  [ "$(git rev-parse refs/heads/feat/05-a)" = "$sha_05" ]
+  [ "$(git rev-parse refs/heads/feat/06-b)" = "$sha_06" ]
+  ! git rev-parse --verify --quiet refs/heads/feat/06-a
+  ! git rev-parse --verify --quiet refs/heads/feat/07-b
+}
+
+@test "new --after: cascade stops at first gap above insertion" {
+  make_stack_branches feat 01-a 05-b 06-c
+  local sha_05 sha_06
+  sha_05=$(git rev-parse refs/heads/feat/05-b)
+  sha_06=$(git rev-parse refs/heads/feat/06-c)
+  run git stack new mid --after feat/01-a --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/02-mid
+  # 05-b and 06-c sit in the gap and must not be renamed.
+  [ "$(git rev-parse refs/heads/feat/05-b)" = "$sha_05" ]
+  [ "$(git rev-parse refs/heads/feat/06-c)" = "$sha_06" ]
+  ! git rev-parse --verify --quiet refs/heads/feat/06-b
+  ! git rev-parse --verify --quiet refs/heads/feat/07-c
+}
+
+@test "new --after: partial cascade when gap is mid-stack" {
+  make_stack_branches feat 01-a 02-b 05-c
+  local sha_05
+  sha_05=$(git rev-parse refs/heads/feat/05-c)
+  run git stack new mid --after feat/02-b --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/01-a
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-mid
+  # The gap between 03-mid and 05-c is enough; 05-c stays put.
+  [ "$(git rev-parse refs/heads/feat/05-c)" = "$sha_05" ]
+  ! git rev-parse --verify --quiet refs/heads/feat/06-c
+}
+
+@test "new: refuses on stack with leaf 00 and hints at doctor" {
+  # Build a stack manually with a 00-leaf — make_stack_branches would also
+  # accept this, but be explicit about the malformed state.
+  git checkout -q -b feat/00-a
+  printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
+  git checkout -q -b feat/02-b
+  printf '02-b\n' >> file && git add file && git commit -q -m '02-b'
+  run git stack new prep --first --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"doctor"* ]]
+}
+
 @test "new (no flag, non-TTY): defaults to --last" {
   make_stack_branches feat 01-a 02-b
   run git stack new tail --no-color </dev/null
@@ -992,15 +1067,12 @@ teardown() { teardown_repo; }
   git checkout -q -b feat/03-c; printf 'c\n' > file-c; git add file-c; git commit -q -m "03-c"
   run git stack move feat/01-a --last --no-color
   [ "$status" -eq 0 ]
-  # 01-a content should now be last, renumbered.
-  # Stack order becomes: was-02-b, was-03-c, was-01-a.
-  # With auto-reflow: 01-b, 02-c, 03-a.
-  git rev-parse --verify --quiet refs/heads/feat/01-b
-  git rev-parse --verify --quiet refs/heads/feat/02-c
-  git rev-parse --verify --quiet refs/heads/feat/03-a
+  # Post-move order: [02-b, 03-c, 01-a]. Gap-aware cascade keeps the two
+  # already-in-order branches and renumbers only the out-of-order one.
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  git rev-parse --verify --quiet refs/heads/feat/04-a
   ! git rev-parse --verify --quiet refs/heads/feat/01-a
-  ! git rev-parse --verify --quiet refs/heads/feat/02-b
-  ! git rev-parse --verify --quiet refs/heads/feat/03-c
 }
 
 @test "move: refuses if target == source position" {
@@ -1044,10 +1116,10 @@ teardown() { teardown_repo; }
   git add file
   run git stack continue --no-color
   [ "$status" -eq 0 ]
-  # post=[02-b, 03-c, 01-a] → renumbered: 01-b, 02-c, 03-a
-  git rev-parse --verify --quiet refs/heads/feat/01-b
-  git rev-parse --verify --quiet refs/heads/feat/02-c
-  git rev-parse --verify --quiet refs/heads/feat/03-a
+  # post=[02-b, 03-c, 01-a] → gap-aware renumber keeps 02-b and 03-c, bumps 01-a to 04-a.
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  git rev-parse --verify --quiet refs/heads/feat/04-a
 }
 
 @test "move: abort mid-conflict restores original branches, no rename" {
@@ -1067,10 +1139,9 @@ teardown() { teardown_repo; }
   [ "$(git rev-parse refs/heads/feat/01-a)" = "$sha_01" ]
   [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
   [ "$(git rev-parse refs/heads/feat/03-c)" = "$sha_03" ]
-  # Renamed branches must not exist.
-  ! git rev-parse --verify --quiet refs/heads/feat/01-b
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c
-  ! git rev-parse --verify --quiet refs/heads/feat/03-a
+  # The rename that the move would have produced (01-a → 04-a under gap-aware
+  # post-rename) must not exist.
+  ! git rev-parse --verify --quiet refs/heads/feat/04-a
   # State file gone — continue should fail.
   run git stack continue --no-color
   [ "$status" -ne 0 ]
@@ -1090,7 +1161,9 @@ teardown() { teardown_repo; }
   export GH_STUB_REPO="test/repo"
   run git stack move feat/01-a --last --no-color
   [ "$status" -eq 0 ]
-  [ "$(gh_log_count 'api -X POST')" -ge 2 ]
+  # Gap-aware post-rename only renames the moved branch (01-a → 04-a); the
+  # other two branches keep their leaf numbers, so just one remote rename.
+  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
   [ "$(gh_log_count 'pr')" -ge 1 ]
 }
 
@@ -1123,6 +1196,93 @@ teardown() { teardown_repo; }
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -ge 1 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
+}
+
+@test "move: preserves gaps in post-rename" {
+  # Stack with an intentional gap above 02-b. Moving 01-a --last should keep
+  # 02-b and 10-c at their existing leaf numbers (their SHAs change because
+  # move rebases, but the leaf names stay), only bumping the moved branch.
+  git checkout -q -b feat/01-a; printf 'a\n' > file-a; git add file-a; git commit -q -m '01-a'
+  git checkout -q -b feat/02-b; printf 'b\n' > file-b; git add file-b; git commit -q -m '02-b'
+  git checkout -q -b feat/10-c; printf 'c\n' > file-c; git add file-c; git commit -q -m '10-c'
+  run git stack move feat/01-a --last --no-color
+  [ "$status" -eq 0 ]
+  # Post-move order: [02-b, 10-c, 01-a]. Gap-aware: keep 02-b, keep 10-c,
+  # bump 01-a → 11-a.
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/10-c
+  git rev-parse --verify --quiet refs/heads/feat/11-a
+  ! git rev-parse --verify --quiet refs/heads/feat/01-a
+  # The dense-collapse names from the old behavior must not appear either.
+  ! git rev-parse --verify --quiet refs/heads/feat/01-b
+  ! git rev-parse --verify --quiet refs/heads/feat/03-a
+}
+
+# ---------- doctor ----------
+
+@test "doctor: fixes 00 leaf to 01, preserves higher branches" {
+  git checkout -q -b feat/00-a
+  printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
+  git checkout -q -b feat/10-b
+  printf '10-b\n' >> file && git add file && git commit -q -m '10-b'
+  git checkout -q -b feat/11-c
+  printf '11-c\n' >> file && git add file && git commit -q -m '11-c'
+  git checkout -q -b feat/12-d
+  printf '12-d\n' >> file && git add file && git commit -q -m '12-d'
+  local sha_10 sha_11 sha_12
+  sha_10=$(git rev-parse refs/heads/feat/10-b)
+  sha_11=$(git rev-parse refs/heads/feat/11-c)
+  sha_12=$(git rev-parse refs/heads/feat/12-d)
+  run git stack doctor --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/01-a
+  ! git rev-parse --verify --quiet refs/heads/feat/00-a
+  # The 10/11/12 branches must not have been renamed.
+  [ "$(git rev-parse refs/heads/feat/10-b)" = "$sha_10" ]
+  [ "$(git rev-parse refs/heads/feat/11-c)" = "$sha_11" ]
+  [ "$(git rev-parse refs/heads/feat/12-d)" = "$sha_12" ]
+}
+
+@test "doctor: cascades when fixing 00 closes the gap with 01" {
+  git checkout -q -b feat/00-a
+  printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
+  git checkout -q -b feat/01-b
+  printf '01-b\n' >> file && git add file && git commit -q -m '01-b'
+  run git stack doctor --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/01-a
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  ! git rev-parse --verify --quiet refs/heads/feat/00-a
+}
+
+@test "doctor: no-op on already-valid stack" {
+  make_stack_branches feat 01-a 02-b
+  local sha_01 sha_02
+  sha_01=$(git rev-parse refs/heads/feat/01-a)
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  run git stack doctor --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"already valid"* ]]
+  [ "$(git rev-parse refs/heads/feat/01-a)" = "$sha_01" ]
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+}
+
+@test "doctor --dry-run: prints plan without renaming" {
+  git checkout -q -b feat/00-a
+  printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
+  git checkout -q -b feat/02-b
+  printf '02-b\n' >> file && git add file && git commit -q -m '02-b'
+  local sha_00 sha_02
+  sha_00=$(git rev-parse refs/heads/feat/00-a)
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  run git stack doctor --dry-run --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"feat/00-a"* ]]
+  [[ "$output" == *"feat/01-a"* ]]
+  # No actual rename — original refs unchanged.
+  [ "$(git rev-parse refs/heads/feat/00-a)" = "$sha_00" ]
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+  ! git rev-parse --verify --quiet refs/heads/feat/01-a
 }
 
 # ---------- rename (remote stages) ----------

@@ -321,6 +321,22 @@ _format_leaf() {
   printf '%0*d\n' "$2" "$1"
 }
 
+# Refuse to operate on a stack whose first branch has leaf number 0. The
+# `--first` insertion rule assumes a valid stack starts at leaf 1, so a leading
+# 0 would alias the inserted leaf and corrupt ordering. Suggests `git stack
+# doctor` for recovery.
+# Usage: _require_valid_leaf_nums <branch1> <branch2> ...
+_require_valid_leaf_nums() {
+  local b leaf
+  for b in "$@"; do
+    leaf="${b##*/}"
+    [[ "$leaf" =~ ^([0-9]+)- ]] || continue
+    if (( 10#${BASH_REMATCH[1]} == 0 )); then
+      die "stack contains invalid leaf '$b' (leaf number 0 is reserved); run 'git stack doctor' to reflow"
+    fi
+  done
+}
+
 # orig_sha_for <branch> — print the saved original SHA for the branch.
 orig_sha_for() {
   local target="$1"
@@ -785,19 +801,28 @@ _finish_move_rename() {
 
   local width
   width=$(_leaf_width_for "${post[@]+"${post[@]}"}")
+  # Gap-aware post-move cascade: keep each branch's existing leaf number if it
+  # already sits above the previous (kept or renamed) leaf; otherwise renumber
+  # it to prev_num + 1. Preserves intentional gaps left in the stack.
   local rename_pairs=()
+  local prev_num=0
   local i
   for ((i = 0; i < ${#post[@]}; i++)); do
     local old="${post[$i]}"
     local old_leaf="${old##*/}"
+    [[ "$old_leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$old_leaf' malformed"
+    local old_num=$((10#${BASH_REMATCH[1]}))
     local old_rest="${old_leaf#*-}"
-    local new_num=$((i + 1))
+    if (( old_num > prev_num )); then
+      prev_num=$old_num
+      continue
+    fi
+    local new_num=$((prev_num + 1))
     local new_leaf
     new_leaf=$(_format_leaf "$new_num" "$width")
     local new_full="${prefix}${new_leaf}-${old_rest}"
-    if [[ "$old" != "$new_full" ]]; then
-      rename_pairs+=("$old" "$new_full")
-    fi
+    rename_pairs+=("$old" "$new_full")
+    prev_num=$new_num
   done
 
   if (( ${#rename_pairs[@]} > 0 )); then
@@ -1286,6 +1311,16 @@ ${b}Subcommands:${r}
                                     backup refs along by default. Refuses if
                                     state file exists, branch checked out
                                     elsewhere, or any target name collides.
+  ${sub}doctor${r} [${fl}--dry-run${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
+                                    Reflow the current stack's leaf numbers in
+                                    place so each branch's number is strictly
+                                    greater than the previous (and the first
+                                    is >= 1). Preserves intentional gaps;
+                                    only renames branches that are out of
+                                    order. Useful if leaves got into a
+                                    malformed state (e.g., a leftover
+                                    ${cy}00-${r} leaf). Same atomic rename +
+                                    remote-rename + pr sync flow as ${sub}new${r}.
   ${sub}close${r} [${fl}--dry-run${r}] [${fl}--keep-history${r}]
                                     Delete every branch in the stack whose
                                     upstream is \`[gone]\` (run ${fl}git fetch
@@ -2092,6 +2127,10 @@ cmd_new() {
   local branches=()
   _load_stack_branches "$prefix" branches
 
+  if (( ${#branches[@]} > 0 )); then
+    _require_valid_leaf_nums "${branches[@]}"
+  fi
+
   # Slug collision check (against existing stack only).
   if (( ${#branches[@]} > 0 )) && _check_slug_collision "$slug" "${branches[@]}"; then
     die "new: slug '$slug' collides with existing branch '$_SLUG_COLLISION_BRANCH'"
@@ -2179,21 +2218,30 @@ cmd_new() {
   leaf=$(_format_leaf "$new_num" "$width")
   new_branch="${prefix}${leaf}-${slug}"
 
-  # Build the rename batch for branches at insert_idx and above (each gets +1).
+  # Build the rename batch for branches at insert_idx and above. Cascade is
+  # gap-aware: stop as soon as a branch's existing leaf number is already
+  # greater than what the predecessor (new branch, then the previously-renamed
+  # branch) occupies — no further renames are needed past that point.
   # rename_pairs is a flat array: old1 new1 old2 new2 ...
   local rename_pairs=()
-  local i b old_leaf old_num new_leaf_str new_full
+  local i b old_leaf old_num new_num_to_use new_leaf_str new_full
+  local prev_num=$new_num
   for ((i = insert_idx; i < ${#branches[@]}; i++)); do
     b="${branches[$i]}"
     old_leaf="${b##*/}"
     [[ "$old_leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$old_leaf' malformed"
     old_num=$((10#${BASH_REMATCH[1]}))
-    new_leaf_str=$(_format_leaf $((old_num + 1)) "$width")
+    if (( old_num > prev_num )); then
+      break
+    fi
+    new_num_to_use=$((prev_num + 1))
+    new_leaf_str=$(_format_leaf "$new_num_to_use" "$width")
     new_full="${prefix}${new_leaf_str}-${old_leaf#*-}"
     if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
       die "new: cascade rename would collide with existing '$new_full'"
     fi
     rename_pairs+=("$b" "$new_full")
+    prev_num=$new_num_to_use
   done
 
   # Refuse if any branch in the cascade is checked out elsewhere.
@@ -2300,6 +2348,8 @@ cmd_move() {
   local branches=()
   _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
   (( ${#branches[@]} >= 2 )) || die "move: stack has fewer than 2 branches"
+
+  _require_valid_leaf_nums "${branches[@]}"
 
   # Resolve source.
   local src_branch rc=0
@@ -2465,6 +2515,126 @@ cmd_move() {
   run_reflow_loop
 }
 
+cmd_doctor() {
+  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
+  local opt_dry_run=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --dry-run) opt_dry_run=1; shift ;;
+      -*)        die "unknown doctor flag: $1" ;;
+      *)         die "doctor takes no positional arguments" ;;
+    esac
+  done
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+
+  local width
+  width=$(_leaf_width_for "${branches[@]}")
+
+  # Walk branches, ensuring each leaf number is > prev_num (and the first is
+  # therefore >= 1). Preserves gaps: branches whose existing number already
+  # exceeds prev_num are left alone.
+  local rename_pairs=()
+  local prev_num=0
+  local i b leaf old_num old_rest new_num new_leaf new_full
+  for ((i = 0; i < ${#branches[@]}; i++)); do
+    b="${branches[$i]}"
+    leaf="${b##*/}"
+    [[ "$leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$leaf' malformed"
+    old_num=$((10#${BASH_REMATCH[1]}))
+    old_rest="${leaf#*-}"
+    if (( old_num > prev_num )); then
+      prev_num=$old_num
+      continue
+    fi
+    new_num=$((prev_num + 1))
+    new_leaf=$(_format_leaf "$new_num" "$width")
+    new_full="${prefix}${new_leaf}-${old_rest}"
+    rename_pairs+=("$b" "$new_full")
+    prev_num=$new_num
+  done
+
+  if (( ${#rename_pairs[@]} == 0 )); then
+    log "${C_GREEN}doctor${C_RESET}  stack '$prefix' already valid"
+    return 0
+  fi
+
+  # Refuse if any cascade target collides with an existing branch that isn't
+  # itself being renamed away.
+  local j conflict
+  for ((i = 1; i < ${#rename_pairs[@]}; i+=2)); do
+    new_full="${rename_pairs[$i]}"
+    if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
+      conflict=1
+      for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
+        if [[ "${rename_pairs[$j]}" == "$new_full" ]]; then conflict=0; break; fi
+      done
+      (( conflict == 0 )) || die "doctor: cascade target '$new_full' already exists"
+    fi
+  done
+
+  if (( opt_dry_run )); then
+    log "${C_BOLD}doctor (dry-run):${C_RESET}"
+    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+      log "  ${rename_pairs[$i]} -> ${rename_pairs[$((i+1))]}"
+    done
+    return 0
+  fi
+
+  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+    require_branch_not_in_worktree "${rename_pairs[$i]}"
+  done
+
+  snapshot_stack doctor "$prefix" "${branches[@]}"
+
+  local batch=""
+  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+    local old="${rename_pairs[$i]}"
+    local new="${rename_pairs[$((i + 1))]}"
+    local sha
+    sha=$(git rev-parse "refs/heads/$old")
+    batch+="create refs/heads/${new} ${sha}"$'\n'
+    batch+="delete refs/heads/${old} ${sha}"$'\n'
+  done
+
+  local head_before="" head_new=""
+  if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
+    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+      if [[ "$head_before" == "refs/heads/${rename_pairs[$i]}" ]]; then
+        head_new="refs/heads/${rename_pairs[$((i + 1))]}"
+        git symbolic-ref HEAD "$head_new"
+        break
+      fi
+    done
+  fi
+
+  if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack doctor"; then
+    if [[ -n "$head_new" ]]; then
+      git symbolic-ref HEAD "$head_before" 2>/dev/null || true
+    fi
+    die "git update-ref batch failed; refs unchanged (atomic)"
+  fi
+
+  log "${C_GREEN}doctor${C_RESET}  reflowed stack '$prefix' (+$((${#rename_pairs[@]} / 2)) renames)"
+
+  if (( ! OPT_NO_PUSH )); then
+    _remote_rename_batch_or_skip "${rename_pairs[@]}"
+    _post_rename_sync
+  fi
+}
+
 cmd_restack() {
   parse_common_flags "$@"
   require_in_repo
@@ -2627,6 +2797,16 @@ cmd_amend() {
   (( has_msg )) || commit_args+=("--no-edit")
 
   require_in_repo
+
+  # Pre-flight: if no pathspec was given and the index is empty, the amend
+  # would either be a no-op or message-only. Any unstaged working-tree changes
+  # would then trip require_clean_tree in the restack that follows — and we'd
+  # have already fired pre-commit hooks for nothing. Bail early.
+  if (( ${#pathspec[@]} == 0 )) && git diff --cached --quiet --no-ext-diff; then
+    if [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+      die "nothing staged to amend; stage with 'git add' or pass paths as args"
+    fi
+  fi
 
   # Snapshot the stack BEFORE git commit --amend rewrites the current branch
   # tip. cmd_restack will take a second 'restack' snapshot — intentional:
@@ -3385,6 +3565,7 @@ main() {
     rename)            shift; cmd_rename "$@" ;;
     new)               shift; cmd_new "$@" ;;
     move|mv)           shift; cmd_move "$@" ;;
+    doctor)            shift; cmd_doctor "$@" ;;
     close)             shift; cmd_close "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;
