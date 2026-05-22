@@ -912,9 +912,9 @@ teardown() { teardown_repo; }
   ! git rev-parse --verify --quiet refs/heads/feat/02-b
 }
 
-@test "new --bottom: inserts as leaf 01 and shifts all branches up" {
+@test "new --first: inserts as leaf 01 and shifts all branches up" {
   make_stack_branches feat 01-a 02-b
-  run git stack new prep --bottom --no-color
+  run git stack new prep --first --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/01-prep
   git rev-parse --verify --quiet refs/heads/feat/02-a
@@ -922,7 +922,7 @@ teardown() { teardown_repo; }
   [ "$(git rev-parse feat/01-prep)" = "$(git rev-parse main)" ]
 }
 
-@test "new (no flag, non-TTY): defaults to --top" {
+@test "new (no flag, non-TTY): defaults to --last" {
   make_stack_branches feat 01-a 02-b
   run git stack new tail --no-color </dev/null
   [ "$status" -eq 0 ]
@@ -984,15 +984,15 @@ teardown() { teardown_repo; }
 
 # ---------- move ----------
 
-@test "move: relocates a single-commit branch to top" {
+@test "move: relocates a single-commit branch to last" {
   # Each branch touches a different file to avoid cherry-pick conflicts when
   # the move reorders branches onto new parents.
   git checkout -q -b feat/01-a; printf 'a\n' > file-a; git add file-a; git commit -q -m "01-a"
   git checkout -q -b feat/02-b; printf 'b\n' > file-b; git add file-b; git commit -q -m "02-b"
   git checkout -q -b feat/03-c; printf 'c\n' > file-c; git add file-c; git commit -q -m "03-c"
-  run git stack move feat/01-a --top --no-color
+  run git stack move feat/01-a --last --no-color
   [ "$status" -eq 0 ]
-  # 01-a content should now be at the top, renumbered.
+  # 01-a content should now be last, renumbered.
   # Stack order becomes: was-02-b, was-03-c, was-01-a.
   # With auto-reflow: 01-b, 02-c, 03-a.
   git rev-parse --verify --quiet refs/heads/feat/01-b
@@ -1005,7 +1005,7 @@ teardown() { teardown_repo; }
 
 @test "move: refuses if target == source position" {
   make_stack_branches feat 01-a 02-b
-  run git stack move feat/01-a --bottom --no-color
+  run git stack move feat/01-a --first --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"already"* ]]
 }
@@ -1014,19 +1014,19 @@ teardown() { teardown_repo; }
   make_stack_branches feat 01-a 02-b
   git checkout -q main
   git branch outside
-  run git stack move outside --prefix feat --top --no-color
+  run git stack move outside --prefix feat --last --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"outside"* ]]
 }
 
 @test "move: cherry-pick conflict halts; continue completes move + rename" {
   # Use a 3-branch stack (01-a, 02-b, 03-c) where each branch appends to
-  # `file`. Move feat/01-a to --top so the post-move ordering is
+  # `file`. Move feat/01-a to --last so the post-move ordering is
   # [02-b, 03-c, 01-a] and all three are rebased (first_affected=0).
   # The rebase-reorder causes two cherry-pick conflicts (on feat/02-b, then
   # on feat/01-a). After both are resolved, the post-action (rename) fires.
   make_stack_branches feat 01-a 02-b 03-c
-  run git stack move feat/01-a --top --no-color
+  run git stack move feat/01-a --last --no-color
   [ "$status" -eq 2 ]
   [[ "$output" == *"conflict"* ]]
 
@@ -1057,7 +1057,7 @@ teardown() { teardown_repo; }
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   sha_03=$(git rev-parse refs/heads/feat/03-c)
 
-  run git stack move feat/01-a --top --no-color
+  run git stack move feat/01-a --last --no-color
   [ "$status" -eq 2 ]
 
   run git stack abort --no-color
@@ -1088,7 +1088,7 @@ teardown() { teardown_repo; }
   printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  run git stack move feat/01-a --top --no-color
+  run git stack move feat/01-a --last --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -ge 2 ]
   [ "$(gh_log_count 'pr')" -ge 1 ]
@@ -1104,7 +1104,7 @@ teardown() { teardown_repo; }
   printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  run git stack move feat/01-a --top --no-push --no-color
+  run git stack move feat/01-a --last --no-push --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -eq 0 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
@@ -1119,7 +1119,7 @@ teardown() { teardown_repo; }
   printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  run git stack move feat/01-a --top --no-sync --no-color
+  run git stack move feat/01-a --last --no-sync --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -ge 1 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
@@ -1161,7 +1161,7 @@ teardown() { teardown_repo; }
   # snapshot_stack is called before the rebase, so even if cherry-pick
   # conflicts the snapshot is already recorded.
   make_stack_branches feat 01-a 02-b
-  git stack move feat/01-a --top --no-push --no-color </dev/null 2>&1 || true
+  git stack move feat/01-a --last --no-push --no-color </dev/null 2>&1 || true
   run git stack history --no-color
   [ "$status" -eq 0 ]
   [[ "$output" == *"move"* ]]

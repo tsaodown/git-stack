@@ -1259,12 +1259,12 @@ ${b}Subcommands:${r}
                                     \`history restore <id> [--yes]\`. Run-id may
                                     be full, action-tagged, bare timestamp, or
                                     \`@N\` (relative; @0 = newest).
-  ${sub}new${r} <slug> [${fl}--top${r}|${fl}--bottom${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--prefix${r} <p>]
+  ${sub}new${r} <slug> [${fl}--last${r}|${fl}--first${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--prefix${r} <p>]
                                     Create an empty branch in the stack at the
                                     chosen position. <ref> is a numeric leaf
                                     or a full branch name. With no position
                                     flag, opens an interactive picker
-                                    (\`[top]\` ... branches ... \`[bottom]\`).
+                                    (\`[first]\` ... branches ... \`[last]\`).
                                     Cascades leaf renames for branches above
                                     the insertion; auto-renames remote refs
                                     via GitHub branch-rename API so PRs follow,
@@ -1272,7 +1272,7 @@ ${b}Subcommands:${r}
                                     detected, prompts for or picks a prefix
                                     (bootstrap path; non-TTY requires
                                     ${fl}--prefix${r}).
-  ${sub}move${r} <branch> [${fl}--top${r}|${fl}--bottom${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--force${r}]
+  ${sub}move${r} <branch> [${fl}--last${r}|${fl}--first${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--force${r}]
                                     Relocate <branch> in the current stack to
                                     the chosen position. Cherry-picks affected
                                     branches onto their new predecessors using
@@ -2016,15 +2016,15 @@ _next_leaf_num() {
 
 cmd_new() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local slug="" opt_top=0 opt_bottom=0 opt_after="" opt_at=""
+  local slug="" opt_last=0 opt_first=0 opt_after="" opt_at=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
       continue
     fi
     case "$1" in
-      --top)     opt_top=1; shift ;;
-      --bottom)  opt_bottom=1; shift ;;
+      --last)    opt_last=1; shift ;;
+      --first)   opt_first=1; shift ;;
       --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
       --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
       --force)   OPT_FORCE=1; shift ;;
@@ -2036,10 +2036,10 @@ cmd_new() {
   _validate_slug "$slug"
 
   # Mutual exclusion among position flags.
-  local n_pos=$(( opt_top + opt_bottom ))
+  local n_pos=$(( opt_last + opt_first ))
   [[ -n "$opt_after" ]] && (( n_pos++ )) || true
   [[ -n "$opt_at"    ]] && (( n_pos++ )) || true
-  (( n_pos <= 1 )) || die "new: --top, --bottom, --after, --at are mutually exclusive"
+  (( n_pos <= 1 )) || die "new: --last, --first, --after, --at are mutually exclusive"
 
   require_in_repo
   require_clean_tree
@@ -2099,14 +2099,14 @@ cmd_new() {
 
   # If no position flag and we have a TTY + branches, prompt.
   if (( n_pos == 0 )) && (( ${#branches[@]} > 0 )) && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
-    local picker_items=("[top]" "${branches[@]}" "[bottom]")
+    local picker_items=("[first]" "${branches[@]}" "[last]")
     local picked
     picked=$(_pick_one "insert new branch at position of:" "${picker_items[@]}") \
       || die "new: no position selected"
     case "$picked" in
-      "[top]")    opt_top=1 ;;
-      "[bottom]") opt_bottom=1 ;;
-      *)          opt_at="$picked" ;;
+      "[first]") opt_first=1 ;;
+      "[last]")  opt_last=1 ;;
+      *)         opt_at="$picked" ;;
     esac
     # Recompute n_pos so the position-resolution block treats this as flagged.
     n_pos=1
@@ -2117,9 +2117,9 @@ cmd_new() {
 
   # Compute the 0-based insertion index in the post-mutation array.
   local insert_idx
-  if (( opt_top )); then
+  if (( opt_last )); then
     insert_idx=${#branches[@]}
-  elif (( opt_bottom )); then
+  elif (( opt_first )); then
     insert_idx=0
   elif [[ -n "$opt_after" ]]; then
     if (( ${#branches[@]} == 0 )); then
@@ -2139,7 +2139,7 @@ cmd_new() {
     (( rc == 0 )) || die "new --at: '$opt_at' not in stack '$prefix'"
     insert_idx=$(branch_index "$at_branch" "${branches[@]}")
   else
-    # No position flag (picker not triggered — non-TTY or empty stack). Default: top.
+    # No position flag (picker not triggered — non-TTY or empty stack). Default: last.
     insert_idx=${#branches[@]}
   fi
 
@@ -2164,10 +2164,10 @@ cmd_new() {
   # Compute the new branch's leaf number based on insert position.
   local new_num leaf new_branch
   if (( insert_idx == 0 )); then
-    # Bottom insert: new leaf is 1; everything else shifts up.
+    # First insert: new leaf is 1; everything else shifts up.
     new_num=1
   elif (( insert_idx == ${#branches[@]} )); then
-    # Top append: next integer above the highest existing.
+    # Last append: next integer above the highest existing.
     new_num=$(_next_leaf_num "${branches[@]}")
   else
     # Mid-insert: predecessor's leaf + 1.
@@ -2263,15 +2263,15 @@ cmd_new() {
 
 cmd_move() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local src="" opt_top=0 opt_bottom=0 opt_after="" opt_at=""
+  local src="" opt_last=0 opt_first=0 opt_after="" opt_at=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
       continue
     fi
     case "$1" in
-      --top)     opt_top=1; shift ;;
-      --bottom)  opt_bottom=1; shift ;;
+      --last)    opt_last=1; shift ;;
+      --first)   opt_first=1; shift ;;
       --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
       --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
       --force)   OPT_FORCE=1; shift ;;
@@ -2280,14 +2280,14 @@ cmd_move() {
     esac
   done
 
-  [[ -n "$src" ]] || die "usage: git stack move <branch> [--top|--bottom|--after <ref>|--at <ref>]"
+  [[ -n "$src" ]] || die "usage: git stack move <branch> [--last|--first|--after <ref>|--at <ref>]"
 
   local n_pos=0
-  (( opt_top )) && (( n_pos++ )) || true
-  (( opt_bottom )) && (( n_pos++ )) || true
+  (( opt_last )) && (( n_pos++ )) || true
+  (( opt_first )) && (( n_pos++ )) || true
   [[ -n "$opt_after" ]] && (( n_pos++ )) || true
   [[ -n "$opt_at" ]] && (( n_pos++ )) || true
-  (( n_pos <= 1 )) || die "move: --top, --bottom, --after, --at are mutually exclusive"
+  (( n_pos <= 1 )) || die "move: --last, --first, --after, --at are mutually exclusive"
 
   require_in_repo
   require_clean_tree
@@ -2310,31 +2310,31 @@ cmd_move() {
 
   # TTY picker if no position flag.
   if (( n_pos == 0 )) && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
-    local picker_items=("[top]")
+    local picker_items=("[first]")
     local b
     for b in "${branches[@]}"; do
       [[ "$b" == "$src_branch" ]] && continue
       picker_items+=("$b")
     done
-    picker_items+=("[bottom]")
+    picker_items+=("[last]")
     local picked
     picked=$(_pick_one "move ${src_branch} to position of:" "${picker_items[@]}") \
       || die "move: no position selected"
     case "$picked" in
-      "[top]")    opt_top=1 ;;
-      "[bottom]") opt_bottom=1 ;;
-      *)          opt_at="$picked" ;;
+      "[first]") opt_first=1 ;;
+      "[last]")  opt_last=1 ;;
+      *)         opt_at="$picked" ;;
     esac
     n_pos=1
   fi
-  (( n_pos == 1 )) || die "move: no position specified (and no TTY for picker); pass --top/--bottom/--after/--at"
+  (( n_pos == 1 )) || die "move: no position specified (and no TTY for picker); pass --last/--first/--after/--at"
 
   # Resolve destination index in the *post-removal* array (i.e., the array with src_branch removed).
   # This is the index *where src will sit* after the move.
   local dst_idx
-  if (( opt_top )); then
+  if (( opt_last )); then
     dst_idx=$((${#branches[@]} - 1))
-  elif (( opt_bottom )); then
+  elif (( opt_first )); then
     dst_idx=0
   elif [[ -n "$opt_after" ]]; then
     local after_branch
