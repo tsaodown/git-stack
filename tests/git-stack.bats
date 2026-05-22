@@ -1419,6 +1419,125 @@ HOOK
   [[ "$output" == *"--yes"* ]]
 }
 
+# ---------- doctor duplicate leaves ----------
+
+# Create two sibling branches that both branch from feat/01-a and share
+# leaf 02. Each modifies an independent file so their cherry-picks compose.
+make_dup_siblings() {
+  git checkout -q -b feat/01-a
+  printf '01-a\n' >> file && git add file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '02-c'
+}
+
+@test "doctor --yes: duplicate leaf renumbered in sort-V order and reflowed" {
+  make_dup_siblings
+  local sha_01
+  sha_01=$(git rev-parse refs/heads/feat/01-a)
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-push --no-color
+  [ "$status" -eq 0 ]
+  # 02-b kept (sort-V order: b before c), 02-c renumbered to 03-c.
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  # 03-c's tip must sit on top of 02-b (reflow re-threaded it from 01-a → 02-b).
+  local sha_02
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  assert_branch_parent_is feat/03-c "$sha_02"
+  # 03-c still carries its diff (c-file).
+  git ls-tree -r --name-only refs/heads/feat/03-c | grep -qx 'c-file'
+  # And it inherits 02-b's diff via the new ancestry (b-file).
+  git ls-tree -r --name-only refs/heads/feat/03-c | grep -qx 'b-file'
+}
+
+@test "doctor --dry-run: lists duplicate leaf group without applying" {
+  make_dup_siblings
+  local sha_b sha_c
+  sha_b=$(git rev-parse refs/heads/feat/02-b)
+  sha_c=$(git rev-parse refs/heads/feat/02-c)
+  run git stack doctor --dry-run --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"duplicate leaf 2"* ]]
+  [[ "$output" == *"feat/02-b"* ]]
+  [[ "$output" == *"feat/02-c"* ]]
+  # Refs unchanged.
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_b" ]
+  [ "$(git rev-parse refs/heads/feat/02-c)" = "$sha_c" ]
+}
+
+@test "doctor --yes --no-rename: duplicates left untouched" {
+  make_dup_siblings
+  local sha_b sha_c
+  sha_b=$(git rev-parse refs/heads/feat/02-b)
+  sha_c=$(git rev-parse refs/heads/feat/02-c)
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-rename --no-push --no-color
+  [ "$status" -eq 0 ]
+  # Both 02 leaves still exist with original SHAs.
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_b" ]
+  [ "$(git rev-parse refs/heads/feat/02-c)" = "$sha_c" ]
+}
+
+@test "doctor --yes: three-way duplicate cascades correctly" {
+  git checkout -q -b feat/01-a
+  printf '01-a\n' >> file && git add file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '02-c'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-d
+  printf 'd\n' > d-file && git add d-file && git commit -q -m '02-d'
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-push --no-color
+  [ "$status" -eq 0 ]
+  # Sort-V order: 02-b stays, 02-c → 03-c, 02-d → 04-d.
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  git rev-parse --verify --quiet refs/heads/feat/04-d
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  ! git rev-parse --verify --quiet refs/heads/feat/02-d
+  local sha_02 sha_03
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  sha_03=$(git rev-parse refs/heads/feat/03-c)
+  assert_branch_parent_is feat/03-c "$sha_02"
+  assert_branch_parent_is feat/04-d "$sha_03"
+}
+
+@test "doctor --yes: duplicate plus existing higher leaf cascades all" {
+  # Setup: feat/01-a, feat/02-b, feat/02-c (sibling), feat/03-d (child of 02-b).
+  # After doctor: 02-c → 03-c, 03-d → 04-d, all re-threaded.
+  git checkout -q -b feat/01-a
+  printf '01-a\n' >> file && git add file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-d
+  printf 'd\n' > d-file && git add d-file && git commit -q -m '03-d'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '02-c'
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-push --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  git rev-parse --verify --quiet refs/heads/feat/04-d
+  local sha_02 sha_03
+  sha_02=$(git rev-parse refs/heads/feat/02-b)
+  sha_03=$(git rev-parse refs/heads/feat/03-c)
+  assert_branch_parent_is feat/03-c "$sha_02"
+  assert_branch_parent_is feat/04-d "$sha_03"
+  # All files reachable from the tip.
+  git ls-tree -r --name-only refs/heads/feat/04-d | grep -qx 'b-file'
+  git ls-tree -r --name-only refs/heads/feat/04-d | grep -qx 'c-file'
+  git ls-tree -r --name-only refs/heads/feat/04-d | grep -qx 'd-file'
+}
+
 # ---------- rename (remote stages) ----------
 
 @test "rename: triggers remote rename for pushed branches" {

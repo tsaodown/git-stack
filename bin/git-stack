@@ -1325,9 +1325,15 @@ ${b}Subcommands:${r}
   ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}]
           [${fl}--no-rename${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
                                     Detect and offer to fix problems in the
-                                    current stack. Two issue types are checked:
+                                    current stack. Three issue types are checked:
                                       • leaf numbers out of order (renamed to
                                         cascade in place, preserving gaps)
+                                      • duplicate leaf numbers — two or more
+                                        branches share the same leaf. Interactive
+                                        prompt lets you pick which branch keeps
+                                        the number; the rest cascade upward and
+                                        upper branches are re-threaded onto the
+                                        chosen predecessor.
                                       • branches that violate the single-
                                         commit-per-branch invariant — multi-
                                         commit branches and merge-commit tips
@@ -1337,12 +1343,17 @@ ${b}Subcommands:${r}
                                     Per-issue interactive prompts on a tty:
                                     ${fl}y${r}=apply, ${fl}e${r}=apply with \$EDITOR for the
                                     squash message, ${fl}N${r}=skip, ${fl}a${r}=apply all,
-                                    ${fl}q${r}=quit. Pass ${fl}--yes${r} to auto-apply every
-                                    fix (required for non-tty / scripts).
+                                    ${fl}q${r}=quit. Duplicate prompts take a
+                                    space- or comma-separated permutation of
+                                    1..N (RET to keep current order, ${fl}q${r} to
+                                    quit). Pass ${fl}--yes${r} to auto-apply every
+                                    fix using sort-V order for duplicates
+                                    (required for non-tty / scripts).
                                     ${fl}--dry-run${r} previews the issue list and
                                     proposed fixes without applying. ${fl}--no-squash${r}
                                     skips the squash checks (rename-only mode);
-                                    ${fl}--no-rename${r} skips the leaf-rename pass.
+                                    ${fl}--no-rename${r} skips the leaf-rename pass
+                                    (which also skips duplicate detection).
                                     Empty squashes (branch tree == predecessor
                                     tree) offer to delete the absorbed branch.
                                     Same atomic rename + remote-rename + pr
@@ -2638,6 +2649,137 @@ _doctor_apply_renames_batch() {
   fi
 }
 
+# Walk a stack and emit one line per group of branches sharing a leaf number.
+# Line format: <leaf_num><TAB><index1>,<index2>,...   (0-based positions in the
+# input array). Groups of size 1 are skipped — only true duplicates are reported.
+# Assumes the input is already in sort -V leaf order (as _load_stack_branches
+# produces), so duplicates appear consecutively.
+# Usage: _doctor_find_duplicate_groups <branch>...
+_doctor_find_duplicate_groups() {
+  local branches=("$@")
+  local i b leaf num cur_num="" cur_indices=""
+  for ((i = 0; i < ${#branches[@]}; i++)); do
+    b="${branches[$i]}"
+    leaf="${b##*/}"
+    [[ "$leaf" =~ ^([0-9]+)- ]] || continue
+    num=$((10#${BASH_REMATCH[1]}))
+    if [[ -n "$cur_num" && "$num" == "$cur_num" ]]; then
+      cur_indices+=",$i"
+    else
+      if [[ "$cur_indices" == *,* ]]; then
+        printf '%s\t%s\n' "$cur_num" "$cur_indices"
+      fi
+      cur_num="$num"
+      cur_indices="$i"
+    fi
+  done
+  if [[ "$cur_indices" == *,* ]]; then
+    printf '%s\t%s\n' "$cur_num" "$cur_indices"
+  fi
+}
+
+# Prompt the user to pick an order for one duplicate group, then reorder the
+# named branches array in place. The "top" branch in the user's order keeps the
+# group's current leaf number; the rest cascade upward when the rename pass runs.
+# Re-prompts on invalid input. Returns:
+#   0 — order accepted (with or without changes)
+#   1 — user quit
+# Usage: _doctor_resolve_duplicate_group <branches_array_name> <leaf_num> <indices_csv> <label_idx> <label_total>
+_doctor_resolve_duplicate_group() {
+  local out_name="$1" leaf_num="$2" indices_csv="$3"
+  local label_idx="$4" label_total="$5"
+
+  local _ifs="$IFS"
+  IFS=','
+  local indices=($indices_csv)
+  IFS="$_ifs"
+  local n=${#indices[@]}
+
+  local i idx_i val
+  local names=()
+  for ((i = 0; i < n; i++)); do
+    idx_i=${indices[$i]}
+    eval "val=\"\${$out_name[$idx_i]}\""
+    names+=("$val")
+  done
+
+  printf '\n%s[%d/%d]%s %s%s%s  %sduplicate leaf %s (%d branches)%s\n' \
+    "$C_BOLD" "$label_idx" "$label_total" "$C_RESET" \
+    "$C_CYAN" "leaf $leaf_num" "$C_RESET" \
+    "$C_DIM" "$leaf_num" "$n" "$C_RESET" >&2
+  printf '  %sthe top branch keeps leaf %s; others cascade upward%s\n' \
+    "$C_DIM" "$leaf_num" "$C_RESET" >&2
+
+  while :; do
+    printf '  %scurrent order:%s\n' "$C_DIM" "$C_RESET" >&2
+    for ((i = 0; i < n; i++)); do
+      printf '    %d) %s%s%s\n' "$((i + 1))" "$C_CYAN" "${names[$i]}" "$C_RESET" >&2
+    done
+    local example="" k
+    for ((k = 1; k <= n; k++)); do example="${example:+$example }$k"; done
+    printf '  %snew order (space/comma-separated, e.g. "%s"), RET=keep, q=quit:%s ' \
+      "$C_DIM" "$example" "$C_RESET" >&2
+
+    local input
+    if ! read -r input < /dev/tty; then
+      return 0
+    fi
+
+    if [[ -z "${input// /}" ]]; then
+      return 0
+    fi
+    if [[ "$input" =~ ^[[:space:]]*[Qq][[:space:]]*$ ]]; then
+      return 1
+    fi
+
+    local norm
+    norm=$(printf '%s' "$input" | tr ',' ' ')
+    local perm=($norm)
+
+    if (( ${#perm[@]} != n )); then
+      printf '  %serror:%s expected %d numbers, got %d\n' \
+        "$C_YELLOW" "$C_RESET" "$n" "${#perm[@]}" >&2
+      continue
+    fi
+
+    local valid=1 p seen=""
+    for p in "${perm[@]}"; do
+      if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > n )); then
+        printf '  %serror:%s "%s" not in 1..%d\n' \
+          "$C_YELLOW" "$C_RESET" "$p" "$n" >&2
+        valid=0; break
+      fi
+      if [[ ",$seen," == *",$p,"* ]]; then
+        printf '  %serror:%s "%s" repeated\n' \
+          "$C_YELLOW" "$C_RESET" "$p" >&2
+        valid=0; break
+      fi
+      seen="${seen}${seen:+,}${p}"
+    done
+    (( valid )) || continue
+
+    local j changed=0
+    local new_names=()
+    for ((j = 0; j < n; j++)); do
+      new_names+=("${names[$((perm[j] - 1))]}")
+      if [[ "${names[$j]}" != "${new_names[$j]}" ]]; then
+        changed=1
+      fi
+    done
+
+    if (( changed )); then
+      for ((j = 0; j < n; j++)); do
+        idx_i=${indices[$j]}
+        eval "$out_name[$idx_i]=$(printf '%q' "${new_names[$j]}")"
+      done
+      printf '  %sreordered%s\n' "$C_GREEN" "$C_RESET" >&2
+    else
+      printf '  %skept current order%s\n' "$C_DIM" "$C_RESET" >&2
+    fi
+    return 0
+  done
+}
+
 # Return 0 (prints "absorbed", "merge", "multi", or "both" to stdout) when
 # <branch> needs a fix relative to <prev_ref>; return 1 (silent) when clean.
 # "absorbed" means the branch's tree already equals the predecessor's tree —
@@ -2876,6 +3018,14 @@ cmd_doctor() {
     fi
   fi
 
+  local dup_groups=()
+  if (( ! opt_no_rename )); then
+    local _dline
+    while IFS= read -r _dline; do
+      [[ -n "$_dline" ]] && dup_groups+=("$_dline")
+    done < <(_doctor_find_duplicate_groups "${branches[@]}")
+  fi
+
   local total_issues=$(( ${#squash_idx[@]} + ${#rename_pairs[@]} / 2 ))
   if (( total_issues == 0 )); then
     log "${C_GREEN}doctor${C_RESET}  stack '$prefix' already valid"
@@ -2886,6 +3036,21 @@ cmd_doctor() {
 
   if (( opt_dry_run )); then
     log "${C_BOLD}doctor (dry-run):${C_RESET} stack ${C_CYAN}${prefix}${C_RESET}"
+    if (( ${#dup_groups[@]} > 0 )); then
+      local g_str leaf_num idx_csv _ifs di
+      for g_str in "${dup_groups[@]}"; do
+        leaf_num="${g_str%%$'\t'*}"
+        idx_csv="${g_str#*$'\t'}"
+        log "  ${C_YELLOW}duplicate leaf ${leaf_num}${C_RESET} (sort-V order; interactive mode lets you reorder):"
+        _ifs="$IFS"
+        IFS=','
+        local dup_indices=($idx_csv)
+        IFS="$_ifs"
+        for ((di = 0; di < ${#dup_indices[@]}; di++)); do
+          log "    ${C_CYAN}${branches[${dup_indices[$di]}]}${C_RESET}"
+        done
+      done
+    fi
     local k
     for ((k = 0; k < ${#squash_idx[@]}; k++)); do
       log "  squash  ${C_CYAN}${branches[${squash_idx[$k]}]}${C_RESET}  (${squash_kind[$k]})"
@@ -2902,6 +3067,7 @@ cmd_doctor() {
   snapshot_stack doctor "$prefix" "${branches[@]}"
 
   local applied_squash=0 lowest_squash_idx=-1
+  local lowest_dup_idx=-1
   local apply_all=$(( opt_yes ))
   local user_quit=0
 
@@ -3046,6 +3212,66 @@ cmd_doctor() {
     done
   fi
 
+  # ----- Duplicate-leaf resolution phase -----
+  #
+  # Detected after the squash phase so squash's tree/ancestry checks see the
+  # original positional ordering. For each group of branches sharing a leaf
+  # number, the user picks an order; the first member keeps the current number
+  # and the rest cascade upward via the rename pass. Reflow must run from the
+  # first cascaded index, since those branches' commit ancestry no longer
+  # matches their new positional predecessor.
+
+  if (( ! opt_no_rename && ! user_quit )); then
+    dup_groups=()
+    local _dline2
+    while IFS= read -r _dline2; do
+      [[ -n "$_dline2" ]] && dup_groups+=("$_dline2")
+    done < <(_doctor_find_duplicate_groups "${branches[@]}")
+
+    if (( ${#dup_groups[@]} > 0 )); then
+      local g_str leaf_num idx_csv label_idx label_total rc _ifs
+      label_total=${#dup_groups[@]}
+      for ((label_idx = 0; label_idx < label_total; label_idx++)); do
+        (( user_quit )) && break
+        g_str="${dup_groups[$label_idx]}"
+        leaf_num="${g_str%%$'\t'*}"
+        idx_csv="${g_str#*$'\t'}"
+
+        if (( apply_all )); then
+          # Auto: keep current sort-V order. Still flag for reflow because the
+          # second-and-later members will be renumbered.
+          :
+        elif (( interactive )); then
+          rc=0
+          _doctor_resolve_duplicate_group branches "$leaf_num" "$idx_csv" \
+            "$((label_idx + 1))" "$label_total" || rc=$?
+          if (( rc == 1 )); then
+            user_quit=1
+            continue
+          fi
+        fi
+
+        _ifs="$IFS"
+        IFS=','
+        local g_indices=($idx_csv)
+        IFS="$_ifs"
+        # The second slot is the first index that gets renumbered → reflow
+        # must start no later than there.
+        if (( lowest_dup_idx < 0 || ${g_indices[1]} < lowest_dup_idx )); then
+          lowest_dup_idx=${g_indices[1]}
+        fi
+      done
+    fi
+
+    # Once duplicates have been resolved, the cascading renames + reflow are
+    # mechanical consequences of the chosen order — auto-apply them. Skipping a
+    # rename here would desynchronize the in-memory (reordered) branches array
+    # from actual refs and corrupt the reflow that follows.
+    if (( lowest_dup_idx >= 0 && ! user_quit )); then
+      apply_all=1
+    fi
+  fi
+
   # ----- Rename phase -----
 
   if (( ! opt_no_rename && ! user_quit )); then
@@ -3151,13 +3377,28 @@ cmd_doctor() {
   fi
 
   # ----- Reflow phase -----
+  #
+  # Two independent triggers can require re-threading:
+  #   - squash: branches above a squashed branch must be replayed onto its
+  #     new (single-commit) tip. Start at lowest_squash_idx + 1.
+  #   - duplicate cascade: branches that got renumbered have a new positional
+  #     predecessor whose tip is a different commit than their actual parent.
+  #     Start at lowest_dup_idx (the first renumbered slot).
+  # When both fire, take the lower index so the cascade covers everything.
 
-  if (( applied_squash > 0 && lowest_squash_idx >= 0 && ! user_quit )); then
-    if (( lowest_squash_idx < ${#branches[@]} - 1 )); then
-      log ""
-      log "${C_DIM}reflow${C_RESET}  re-threading branches above index $lowest_squash_idx"
-      _doctor_reflow_upper "$prefix" "$parent_ref" "$((lowest_squash_idx + 1))" "${branches[@]}"
+  local reflow_from=-1
+  if (( applied_squash > 0 && lowest_squash_idx >= 0 )); then
+    reflow_from=$((lowest_squash_idx + 1))
+  fi
+  if (( lowest_dup_idx >= 0 )); then
+    if (( reflow_from < 0 || lowest_dup_idx < reflow_from )); then
+      reflow_from=$lowest_dup_idx
     fi
+  fi
+  if (( reflow_from >= 0 && reflow_from < ${#branches[@]} && ! user_quit )); then
+    log ""
+    log "${C_DIM}reflow${C_RESET}  re-threading branches from index $reflow_from"
+    _doctor_reflow_upper "$prefix" "$parent_ref" "$reflow_from" "${branches[@]}"
   fi
 
   log ""
