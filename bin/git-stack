@@ -21,7 +21,7 @@ REMAINING_ARGS=()
 # ---------- color ----------
 
 # Color palette. Initialized empty; color_init populates if appropriate.
-C_RESET=""; C_BOLD=""; C_DIM=""
+C_RESET=""; C_BOLD=""; C_DIM=""; C_UNDERLINE=""
 C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
 
 color_init() {
@@ -46,6 +46,7 @@ color_init() {
     C_BLUE=$'\033[34m'
     C_MAGENTA=$'\033[35m'
     C_CYAN=$'\033[36m'
+    C_UNDERLINE=$'\033[4m'
   fi
 }
 
@@ -1064,9 +1065,6 @@ _pr_render_nav_footer() {
   local b n t
   while (( $# >= 3 )); do
     b="$1"; n="$2"; t="$3"
-    if [[ "$t" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
-      t="${BASH_REMATCH[1]}"
-    fi
     if [[ -z "$b" ]]; then
       printf -- '- ~~#%s %s~~ (merged)\n' "$n" "$t"
     elif [[ "$b" == "$self" ]]; then
@@ -1223,6 +1221,11 @@ _osc8_link() {
   else
     printf '%s' "$text"
   fi
+}
+
+_pr_link() {
+  local n="$1"
+  _osc8_link "https://github.com/${GH_REPO}/pull/${n}" "${C_BLUE}${C_UNDERLINE}#${n}${C_RESET}"
 }
 
 # Inspect a PR for <branch> across all states (open/closed/merged). Emits one
@@ -3818,7 +3821,7 @@ cmd_pr_sync() {
       PR_TITLES+=("$cur_title")
       PR_BASES+=("$cur_base")
       PR_BODIES+=("$cur_body")
-      log "${C_DIM}exists${C_RESET}  ${C_GREEN}#${cur_num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+      log "${C_DIM}exists${C_RESET}  $(_pr_link "$cur_num") ${C_CYAN}$b${C_RESET}"
     else
       leaf=$(_pr_branch_title "$b")
       local fresh_title
@@ -3839,7 +3842,7 @@ cmd_pr_sync() {
         PR_TITLES+=("$fresh_title")
         PR_BASES+=("$parent")
         PR_BODIES+=("$template_body")
-        log "${C_GREEN}create${C_RESET}  ${C_GREEN}#${new_num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}${C_RESET}"
+        log "${C_GREEN}create${C_RESET}  $(_pr_link "$new_num") ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}${C_RESET}"
       else
         warn "pr create failed for $b"
         PR_FAILURES+=("$b")
@@ -3871,30 +3874,67 @@ cmd_pr_sync() {
     stripped=$(printf '%s' "$cur_body" | _pr_strip_nav_footer)
     # Detect merged predecessors: PR numbers in the old footer that are no
     # longer in the active stack and have since been merged on GitHub.
+    # Guard: only do this when the old footer is from the same stack lineage.
+    # Two sufficient signals: (a) another non-self PR from the old footer is
+    # still active — typical for partial merges; (b) self appears in the old
+    # footer — proof this footer was written by a prior pr sync on this exact
+    # PR, covering the case where every sibling was merged.
     local old_pr_nums merged_nums=() merged_titles=()
     old_pr_nums=$(printf '%s' "$cur_body" | _pr_extract_nav_pr_nums)
-    local old_num
+    local old_num other_in_active=0 self_in_footer=0
     while IFS= read -r old_num; do
       [[ -z "$old_num" ]] && continue
-      local found=0 k
-      for ((k = 0; k < N; k++)); do
-        [[ "${PR_NUMS[k]}" == "$old_num" ]] && found=1 && break
-      done
-      (( found )) && continue
-      if _gh_pr_is_merged "$old_num"; then
-        local mt
-        mt=$(gh pr view "$old_num" --repo "$GH_REPO" --json title --jq '.title' 2>/dev/null) \
-          || mt="PR #$old_num"
-        merged_nums+=("$old_num")
-        merged_titles+=("$mt")
+      if [[ "$old_num" == "$num" ]]; then
+        self_in_footer=1
+        continue
       fi
+      local k
+      for ((k = 0; k < N; k++)); do
+        if [[ "${PR_NUMS[k]}" == "$old_num" ]]; then
+          other_in_active=1
+          break
+        fi
+      done
+      (( other_in_active )) && break
     done <<< "$old_pr_nums"
+    if (( other_in_active || self_in_footer )); then
+      while IFS= read -r old_num; do
+        [[ -z "$old_num" ]] && continue
+        local found=0 k
+        for ((k = 0; k < N; k++)); do
+          [[ "${PR_NUMS[k]}" == "$old_num" ]] && found=1 && break
+        done
+        (( found )) && continue
+        if _gh_pr_is_merged "$old_num"; then
+          local mt
+          mt=$(gh pr view "$old_num" --repo "$GH_REPO" --json title --jq '.title' 2>/dev/null) \
+            || mt="PR #$old_num"
+          merged_nums+=("$old_num")
+          merged_titles+=("$mt")
+        fi
+      done <<< "$old_pr_nums"
+    fi
     local footer_args=("$b")
     for ((k = 0; k < ${#merged_nums[@]}; k++)); do
       footer_args+=("" "${merged_nums[k]}" "${merged_titles[k]}")
     done
     for ((k = 0; k < N; k++)); do
-      footer_args+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${PR_TITLES[k]}")
+      local act_title="${PR_TITLES[k]}"
+      local new_pos="[$((k+1))/$N]"
+      local old_pos="" bare_title="$act_title"
+      if [[ "$act_title" =~ ^\[([0-9]+/[0-9]+)\][[:space:]](.*)$ ]]; then
+        old_pos="[${BASH_REMATCH[1]}]"
+        bare_title="${BASH_REMATCH[2]}"
+      fi
+      local display_title
+      if grep -qxF "${PR_NUMS[k]}" <<< "$old_pr_nums" \
+         && [[ -n "$old_pos" ]] \
+         && [[ "$old_pos" != "$new_pos" ]]; then
+        display_title="~~${old_pos}~~ ${new_pos} ${bare_title}"
+      else
+        display_title="${new_pos} ${bare_title}"
+      fi
+      footer_args+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "$display_title")
     done
     local footer
     footer=$(_pr_render_nav_footer "${footer_args[@]}")
@@ -3913,7 +3953,7 @@ cmd_pr_sync() {
     [[ "$desired_body" != "$cur_body" ]] && body_changed=1
     [[ "$parent" != "$cur_base" ]] && base_changed=1
     if (( ! title_changed && ! body_changed && ! base_changed )); then
-      log_v "${C_DIM}ok${C_RESET}      ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+      log_v "${C_DIM}ok${C_RESET}      $(_pr_link "$num") ${C_CYAN}$b${C_RESET}"
       continue
     fi
     if (( opt_dry_run )); then
@@ -3921,7 +3961,7 @@ cmd_pr_sync() {
       (( title_changed )) && tc=yes || tc=no
       (( body_changed )) && bc=yes || bc=no
       (( base_changed )) && bsc=yes || bsc=no
-      log "${C_BLUE}update${C_RESET}  ${C_DIM}#${num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}(title=$tc body=$bc base=$bsc)${C_RESET}"
+      log "${C_BLUE}update${C_RESET}  $(_pr_link "$num") ${C_CYAN}$b${C_RESET} ${C_DIM}(title=$tc body=$bc base=$bsc)${C_RESET}"
       continue
     fi
     local pass_title="" pass_body="" pass_base=""
@@ -3930,9 +3970,9 @@ cmd_pr_sync() {
     (( base_changed ))  && pass_base="$parent"
     if _gh_pr_edit "$num" "$pass_title" "$pass_body" "$pass_base"; then
       if (( base_changed )); then
-        log "${C_BLUE}update${C_RESET}  ${C_GREEN}#${num}${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}(base: ${cur_base} -> ${parent})${C_RESET}"
+        log "${C_BLUE}update${C_RESET}  $(_pr_link "$num") ${C_CYAN}$b${C_RESET} ${C_DIM}(base: ${cur_base} -> ${parent})${C_RESET}"
       else
-        log "${C_BLUE}update${C_RESET}  ${C_GREEN}#${num}${C_RESET} ${C_CYAN}$b${C_RESET}"
+        log "${C_BLUE}update${C_RESET}  $(_pr_link "$num") ${C_CYAN}$b${C_RESET}"
       fi
     else
       warn "pr edit failed for $b (#${num})"
@@ -4006,7 +4046,7 @@ cmd_pr_list() {
   done
 
   local data num title state is_draft base_ref review_dec comments approvers change_reqs checks
-  local marker branch_color flags expected_base pr_cell pr_url
+  local marker branch_color flags expected_base pr_cell
   for b in "${branches[@]}"; do
     if [[ "$b" == "$current" ]]; then
       marker="${C_GREEN}${C_BOLD}*${C_RESET}"
@@ -4041,8 +4081,7 @@ cmd_pr_list() {
       title="${BASH_REMATCH[1]}"
     fi
 
-    pr_url="https://github.com/${GH_REPO}/pull/${num}"
-    pr_cell=$(_osc8_link "$pr_url" "#${num}")
+    pr_cell=$(_pr_link "$num")
 
     # Build flag list.
     flags=""
