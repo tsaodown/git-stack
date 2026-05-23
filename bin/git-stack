@@ -1036,8 +1036,25 @@ _pr_strip_nav_footer() {
   '
 }
 
+# Extract PR numbers referenced inside the nav footer block in stdin.
+# Outputs one number per line. Handles both active (#N) and merged (~~#N~~) entries.
+_pr_extract_nav_pr_nums() {
+  local in_block=0
+  while IFS= read -r line; do
+    [[ "$line" == *'<!-- git-stack:nav-start -->'* ]] && in_block=1 && continue
+    [[ "$line" == *'<!-- git-stack:nav-end -->'* ]] && in_block=0 && continue
+    (( in_block )) || continue
+    local tmp="$line"
+    while [[ "$tmp" =~ \#([0-9]+) ]]; do
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      tmp="${tmp#*#${BASH_REMATCH[1]}}"
+    done
+  done
+}
+
 # Emit the fenced stack-nav footer to stdout.
 # Args: <self_branch> then repeating triples of (branch, pr_num, title).
+# A branch value of "" marks a merged predecessor — rendered as strikethrough.
 # Titles with a leading "[N/M] " prefix have that prefix stripped before
 # display (the bracket info is redundant inside the chain listing).
 _pr_render_nav_footer() {
@@ -1050,7 +1067,9 @@ _pr_render_nav_footer() {
     if [[ "$t" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
       t="${BASH_REMATCH[1]}"
     fi
-    if [[ "$b" == "$self" ]]; then
+    if [[ -z "$b" ]]; then
+      printf -- '- ~~#%s %s~~ (merged)\n' "$n" "$t"
+    elif [[ "$b" == "$self" ]]; then
       printf -- '- #%s %s ← this PR\n' "$n" "$t"
     else
       printf -- '- #%s %s\n' "$n" "$t"
@@ -1116,6 +1135,13 @@ _gh_pr_find() {
     --json number,title,baseRefName,body \
     --jq '.[] | "\(.number)\(.title // "")\(.baseRefName // "")\(.body // "")"' \
     2>/dev/null
+}
+
+# Return 0 if PR <num> is merged on GitHub, 1 otherwise.
+_gh_pr_is_merged() {
+  local state
+  state=$(gh pr view "$1" --repo "$GH_REPO" --json state --jq '.state' 2>/dev/null) || return 1
+  [[ "$state" == "MERGED" ]]
 }
 
 # Create a draft PR (or non-draft if draft=0) for <branch>.
@@ -3843,7 +3869,30 @@ cmd_pr_sync() {
     desired_title=$(_pr_title_with_pos "$((j+1))" "$N" "$cur_title" "$leaf")
     local stripped
     stripped=$(printf '%s' "$cur_body" | _pr_strip_nav_footer)
-    local footer_args=("$b") k
+    # Detect merged predecessors: PR numbers in the old footer that are no
+    # longer in the active stack and have since been merged on GitHub.
+    local old_pr_nums merged_nums=() merged_titles=()
+    old_pr_nums=$(printf '%s' "$cur_body" | _pr_extract_nav_pr_nums)
+    local old_num
+    while IFS= read -r old_num; do
+      [[ -z "$old_num" ]] && continue
+      local found=0 k
+      for ((k = 0; k < N; k++)); do
+        [[ "${PR_NUMS[k]}" == "$old_num" ]] && found=1 && break
+      done
+      (( found )) && continue
+      if _gh_pr_is_merged "$old_num"; then
+        local mt
+        mt=$(gh pr view "$old_num" --repo "$GH_REPO" --json title --jq '.title' 2>/dev/null) \
+          || mt="PR #$old_num"
+        merged_nums+=("$old_num")
+        merged_titles+=("$mt")
+      fi
+    done <<< "$old_pr_nums"
+    local footer_args=("$b")
+    for ((k = 0; k < ${#merged_nums[@]}; k++)); do
+      footer_args+=("" "${merged_nums[k]}" "${merged_titles[k]}")
+    done
     for ((k = 0; k < N; k++)); do
       footer_args+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${PR_TITLES[k]}")
     done
