@@ -719,7 +719,16 @@ do_one_step() {
   log "${C_GREEN}restack${C_RESET} ${C_CYAN}$B${C_RESET} ${C_DIM}onto${C_RESET} ${C_CYAN}$prev_label${C_RESET}"
   git checkout --quiet "$B"
   git reset --hard --quiet "$prev_new"
-  if ! git cherry-pick "$B_orig"; then
+  local cp_out cp_rc=0
+  cp_out=$(git cherry-pick "$B_orig" 2>&1) || cp_rc=$?
+  if (( cp_rc != 0 )); then
+    if [[ -n "$cp_out" ]]; then
+      if [[ -n "$C_DIM" ]]; then
+        printf '%s%s%s\n' "$C_DIM" "$cp_out" "$C_RESET" >&2
+      else
+        printf '%s\n' "$cp_out" >&2
+      fi
+    fi
     return 2
   fi
   return 0
@@ -762,6 +771,16 @@ run_reflow_loop() {
       printf '\n%s%s: conflict%s on %s%s%s\n\n' \
         "$C_RED" "$PROG" "$C_RESET" \
         "$C_CYAN" "${STACK_BRANCHES[$cursor]}" "$C_RESET" >&2
+      local cf chunks s
+      while IFS= read -r cf; do
+        [[ -z "$cf" ]] && continue
+        chunks=$(grep -c '^<<<<<<< ' "$cf" 2>/dev/null || echo "?")
+        if [[ "$chunks" == "1" ]]; then s="chunk"; else s="chunks"; fi
+        printf '  %s%s%s %s(%s %s)%s\n' \
+          "$C_YELLOW" "$cf" "$C_RESET" \
+          "$C_DIM" "$chunks" "$s" "$C_RESET" >&2
+      done < <(git diff --name-only --diff-filter=U 2>/dev/null)
+      printf '\n' >&2
       printf '  resolve + resume: %sgit stack continue%s %s[gstkc]%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
       printf '  give up:          %sgit stack abort%s %s[gstka]%s\n'    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
       exit 2
