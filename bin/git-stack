@@ -333,7 +333,7 @@ _require_valid_leaf_nums() {
     leaf="${b##*/}"
     [[ "$leaf" =~ ^([0-9]+)- ]] || continue
     if (( 10#${BASH_REMATCH[1]} == 0 )); then
-      die "stack contains invalid leaf '$b' (leaf number 0 is reserved); run 'git stack doctor' to reflow"
+      die "stack contains invalid leaf '$b' (leaf number 0 is reserved); run 'git stack doctor' ${C_DIM}[gstkd]${C_RESET} to reflow"
     fi
   done
 }
@@ -468,7 +468,7 @@ clear_state() {
 require_no_state_file() {
   local f
   f=$(state_file)
-  [[ -f "$f" ]] && die "stack-rebase in progress ($f); resume with 'git stack continue' or 'git stack abort' first"
+  [[ -f "$f" ]] && die "stack-rebase in progress ($f); resume with 'git stack continue' ${C_DIM}[gstkc]${C_RESET} or 'git stack abort' ${C_DIM}[gstka]${C_RESET} first"
   return 0
 }
 
@@ -622,7 +622,7 @@ parse_run_id() {
     fi
   done
   case "${#matches[@]}" in
-    0) die "no snapshot matching '${input}' (try 'git stack history')" ;;
+    0) die "no snapshot matching '${input}' (try 'git stack history' ${C_DIM}[gstkh]${C_RESET})" ;;
     1) printf '%s\n' "${matches[0]}" ;;
     *) local m str="" ; for m in "${matches[@]}"; do str="${str:+${str}, }$m"; done
        die "ambiguous '${input}' matches: $str" ;;
@@ -713,7 +713,7 @@ do_one_step() {
   # The multi-commit count guard catches most of these earlier, but --force
   # bypasses it — this check stays sound under --force.
   if git rev-parse --verify --quiet "${B_orig}^2" >/dev/null 2>&1; then
-    die "branch '$B' tip ($(git rev-parse --short "$B_orig")) is a merge commit; restack expects single-commit branches. Squash or rebase the merge into a linear commit, then retry. Use 'git stack abort' to roll back this in-flight restack."
+    die "branch '$B' tip ($(git rev-parse --short "$B_orig")) is a merge commit; restack expects single-commit branches. Squash or rebase the merge into a linear commit, then retry. Use 'git stack abort' ${C_DIM}[gstka]${C_RESET} to roll back this in-flight restack."
   fi
 
   log "${C_GREEN}restack${C_RESET} ${C_CYAN}$B${C_RESET} ${C_DIM}onto${C_RESET} ${C_CYAN}$prev_label${C_RESET}"
@@ -762,8 +762,8 @@ run_reflow_loop() {
       printf '\n%s%s: conflict%s on %s%s%s\n\n' \
         "$C_RED" "$PROG" "$C_RESET" \
         "$C_CYAN" "${STACK_BRANCHES[$cursor]}" "$C_RESET" >&2
-      printf '  resolve + resume: %sgit stack continue%s\n' "$C_BOLD" "$C_RESET" >&2
-      printf '  give up:          %sgit stack abort%s\n'    "$C_BOLD" "$C_RESET" >&2
+      printf '  resolve + resume: %sgit stack continue%s %s[gstkc]%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+      printf '  give up:          %sgit stack abort%s %s[gstka]%s\n'    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
       exit 2
     fi
     if (( STACK_PUSH )); then
@@ -938,7 +938,7 @@ _remote_rename_batch_or_skip() {
       continue
     fi
     if ! _remote_rename_one "$old" "$new"; then
-      die "gh api branches/${old}/rename failed; local renames already applied. Resolve on GitHub (UI or 'gh api ... /rename') then 'git fetch --prune' and re-run 'git stack pr sync'."
+      die "gh api branches/${old}/rename failed; local renames already applied. Resolve on GitHub (UI or 'gh api ... /rename') then 'git fetch --prune' and re-run 'git stack pr sync' ${C_DIM}[gstkprs]${C_RESET}."
     fi
   done
 }
@@ -1857,7 +1857,7 @@ cmd_history_restore() {
 
   if (( ! yes )); then
     log ""
-    log "rerun with: ${C_BOLD}git stack history restore ${input} --yes${C_RESET}"
+    log "rerun with: ${C_BOLD}git stack history restore ${input} --yes${C_RESET} ${C_DIM}[gstkhr]${C_RESET}"
     return 0
   fi
   if [[ -z "$stdin" ]]; then
@@ -3235,7 +3235,7 @@ cmd_doctor() {
           esac
           ;;
         3)
-          die "commit edit aborted on '$b'; branch left at predecessor with staged diff. Run 'git stack abort' to restore, or re-commit manually."
+          die "commit edit aborted on '$b'; branch left at predecessor with staged diff. Run 'git stack abort' ${C_DIM}[gstka]${C_RESET} to restore, or re-commit manually."
           ;;
       esac
     done
@@ -4354,7 +4354,7 @@ cmd_checkout() {
   done
 
   case "${#matches[@]}" in
-    0) die "no stack branch with number '${input}' under '${prefix}' (try 'git stack list')" ;;
+    0) die "no stack branch with number '${input}' under '${prefix}' (try 'git stack list' ${C_DIM}[gstkl]${C_RESET})" ;;
     1) git checkout "${matches[0]}" ;;
     *) local m s=""; for m in "${matches[@]}"; do s="${s:+$s, }$m"; done
        die "ambiguous '${input}' matches: $s" ;;
