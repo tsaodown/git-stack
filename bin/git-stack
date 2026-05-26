@@ -1255,8 +1255,8 @@ _pr_link() {
 _gh_pr_inspect() {
   local b="$1"
   gh pr list --repo "$GH_REPO" --head "$b" --limit 1 \
-    --json number,title,state,isDraft,baseRefName,reviewDecision,comments,latestReviews,statusCheckRollup \
-    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($checks)"' \
+    --json number,title,state,isDraft,baseRefName,reviewDecision,comments,latestReviews,reviewRequests,statusCheckRollup \
+    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.reviewRequests // []) | map(if .__typename == "Team" then .name else .login end) | join(",")) as $req_rev | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($req_rev)\($checks)"' \
     2>/dev/null
 }
 
@@ -4064,7 +4064,7 @@ cmd_pr_list() {
     (( ${#b} > max_w )) && max_w=${#b}
   done
 
-  local data num title state is_draft base_ref review_dec comments approvers change_reqs checks
+  local data num title state is_draft base_ref review_dec comments approvers change_reqs req_reviewers checks
   local marker branch_color flags expected_base pr_cell
   for b in "${branches[@]}"; do
     if [[ "$b" == "$current" ]]; then
@@ -4091,7 +4091,8 @@ cmd_pr_list() {
     review_dec="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
     comments="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
     approvers="${data%%$'\x1f'*}";  data="${data#*$'\x1f'}"
-    change_reqs="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
+    change_reqs="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    req_reviewers="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
     checks="$data"
 
     # Strip the [N/M] prefix from the displayed title — the row order already
@@ -4154,7 +4155,11 @@ cmd_pr_list() {
     # Merge blocker: required reviewers (e.g., CODEOWNERS) still need to sign
     # off. Only relevant for open PRs.
     if [[ "$state" == "OPEN" && "$review_dec" == "REVIEW_REQUIRED" ]]; then
-      flags+="${C_YELLOW}[review required]${C_RESET} "
+      if [[ -n "$req_reviewers" ]]; then
+        flags+="${C_YELLOW}[review required: ${req_reviewers//,/, }]${C_RESET} "
+      else
+        flags+="${C_YELLOW}[review required]${C_RESET} "
+      fi
     fi
 
     # CI / status checks rollup. Only relevant for open PRs — merged/closed
