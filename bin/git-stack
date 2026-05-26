@@ -736,8 +736,14 @@ do_one_step() {
 
 push_branch() {
   local b="$1" sha short rt err
-  sha=$(git rev-parse --short "refs/heads/$b")
-  short="$sha"
+  sha=$(git rev-parse --verify --quiet "refs/heads/$b" 2>/dev/null) || return 0
+  short=$(git rev-parse --short "refs/heads/$b")
+  local remote_sha
+  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/origin/$b" 2>/dev/null || true)
+  if [[ -n "$remote_sha" && "$remote_sha" == "$sha" ]]; then
+    log "${C_DIM}skip${C_RESET}    ${C_CYAN}$b${C_RESET} ${C_DIM}(already synced)${C_RESET}"
+    return 0
+  fi
   log "${C_BLUE}push${C_RESET}    ${C_CYAN}$b${C_RESET} ${C_DIM}($short, --force-with-lease)${C_RESET}"
   err=$(git push --force-with-lease -u origin "refs/heads/$b:refs/heads/$b" 2>&1) && {
     log_v "$err"
