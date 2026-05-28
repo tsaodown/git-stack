@@ -112,15 +112,25 @@ git stack pr sync                 # open draft PRs for the chain (or update them
 ### Creating and moving branches
 
 ```sh
-git stack new auth                       # new branch at top (default)
-git stack new cache --after 01-auth      # insert between two branches
-git stack new prep --bottom              # new bottom branch (under main)
-git stack new                            # interactive picker
-git stack move feat/05-cache --top       # relocate to top
-git stack move feat/05-cache --at 02     # move into another slot
+git stack new auth                       # append (--last) — leaf 010 on a fresh stack
+git stack new cache --after 010-auth     # insert just after auth → leaf 015 (midpoint)
+git stack new prep --before 010-auth     # insert just before auth → leaf 005 (midpoint of 0..10)
+git stack new fix --at 7                 # explicit leaf placement → leaf 007
+git stack new                            # interactive picker (pick ref, before/after, leaf)
+git stack move feat/015-cache --last     # relocate to the end of the stack
+git stack move feat/015-cache --before feat/020-other --allow-pr-rebuild
+                                         # destructive move — refuses without the flag if the
+                                         # source has an open head PR (GitHub closes the PR
+                                         # when its head branch gets renamed)
 ```
 
-Auto-reflow keeps leaves consecutive: insert/move rewrites affected leaves locally, renames remote branches via GitHub's branch-rename API (so PRs follow), and re-runs `pr sync` to update `[N/M]` prefixes. Use `--no-push` for local-only operations or `--no-sync` to skip just the PR title refresh.
+Leaf numbers are **sparse** by default (3-digit, step 10) on fresh stacks, so inserts find a gap without renumbering any existing branch. `git stack new` is **never destructive** — it creates one new local ref and nothing else. If the chosen gap is exhausted (e.g., trying `--before` on a leaf-001 branch), the command refuses instead of cascading.
+
+`git stack move` and `git stack rename` change branch names by definition; if any affected branch has an open head PR on GitHub, those commands refuse by default. Pass `--allow-pr-rebuild` to accept that the PR will be closed by GitHub (head-ref deletion) and re-opened as a fresh PR by the subsequent `pr sync`. There's no way to retarget an existing PR to a new head branch via the GitHub API — the rename API only updates PRs that *target* the renamed branch (as their base), not PRs whose *head* is the renamed branch.
+
+`--first` has been removed — use `--before <lowest-ref>` instead. Use `--no-push` for local-only operations or `--no-sync` to skip the PR title/footer refresh after a move/rename.
+
+Legacy 2-digit stacks (created before sparse numbering) keep their existing width and step. Inserts in those stacks still go through the gap-find-or-refuse path, so a tightly-packed legacy stack may refuse `--before` / `--after` more often.
 
 ## Syncing PRs to GitHub
 

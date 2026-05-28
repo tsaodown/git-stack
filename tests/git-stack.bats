@@ -899,104 +899,106 @@ HOOK
   [[ "$output" == *"slug"* ]]
 }
 
-@test "new --after: inserts between two named branches" {
+@test "new --after: midpoint between named ref and successor (sparse stack)" {
+  # Sparse stack (3-digit width) has gaps for inserts.
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack new mid --after feat/010-a --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/015-mid
+  # Other branches untouched.
+  git rev-parse --verify --quiet refs/heads/feat/020-b
+  git rev-parse --verify --quiet refs/heads/feat/030-c
+}
+
+@test "new --after: refuses on tightly-packed legacy stack (no gap)" {
+  # Legacy 2-digit stack with step-1 leaves: --after feat/01-a has no room
+  # for a midpoint between 01 and 02.
   make_stack_branches feat 01-a 02-b 03-c
   run git stack new mid --after feat/01-a --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/02-mid
-  git rev-parse --verify --quiet refs/heads/feat/03-b
-  git rev-parse --verify --quiet refs/heads/feat/04-c
-  ! git rev-parse --verify --quiet refs/heads/feat/02-b
-  ! git rev-parse --verify --quiet refs/heads/feat/03-c
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gap exhausted"* ]] || [[ "$output" == *"no insertable leaf"* ]]
+  # 02-b and 03-c must be untouched.
+  git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/03-c
 }
 
-@test "new --after: accepts numeric leaf" {
-  make_stack_branches feat 01-a 02-b
-  run git stack new mid --after 1 --no-color
+@test "new --after: accepts numeric leaf (sparse)" {
+  make_stack_branches feat 010-a 020-b
+  run git stack new mid --after 10 --no-color
   [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/02-mid
-  git rev-parse --verify --quiet refs/heads/feat/03-b
+  git rev-parse --verify --quiet refs/heads/feat/015-mid
+  git rev-parse --verify --quiet refs/heads/feat/020-b
 }
 
-@test "new --at: takes that slot, pushing it (and above) up" {
-  make_stack_branches feat 01-a 02-b 03-c
-  run git stack new newone --at 2 --no-color
+@test "new --at: places at exact unused leaf" {
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack new newone --at 25 --no-color
   [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/02-newone
-  git rev-parse --verify --quiet refs/heads/feat/03-b
-  git rev-parse --verify --quiet refs/heads/feat/04-c
+  git rev-parse --verify --quiet refs/heads/feat/025-newone
+  # No existing branches were touched.
+  git rev-parse --verify --quiet refs/heads/feat/010-a
+  git rev-parse --verify --quiet refs/heads/feat/020-b
+  git rev-parse --verify --quiet refs/heads/feat/030-c
+}
+
+@test "new --at: refuses if leaf is already taken" {
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack new newone --at 20 --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already taken"* ]] || [[ "$output" == *"--at"* ]]
+  # Stack unchanged.
+  git rev-parse --verify --quiet refs/heads/feat/020-b
+  ! git rev-parse --verify --quiet refs/heads/feat/020-newone
+}
+
+@test "new --at: refuses non-integer arg" {
+  make_stack_branches feat 010-a 020-b
+  run git stack new mid --at feat/010-a --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"non-negative integer"* ]] || [[ "$output" == *"--at"* ]]
 }
 
 @test "new --after: fails on unknown ref" {
-  make_stack_branches feat 01-a 02-b
+  make_stack_branches feat 010-a 020-b
   run git stack new mid --after 99 --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"99"* ]]
 }
 
-@test "new --after: HEAD follows if currently on a cascade-renamed branch" {
-  make_stack_branches feat 01-a 02-b
-  git checkout -q feat/02-b
-  run git stack new mid --after 1 --no-color
+@test "new --before: midpoint between predecessor and named ref" {
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack new prep --before feat/020-b --no-color
   [ "$status" -eq 0 ]
-  # The final `git checkout` always lands on the new branch:
-  [ "$(git symbolic-ref --short HEAD)" = "feat/02-mid" ]
-  git rev-parse --verify --quiet refs/heads/feat/03-b
-  ! git rev-parse --verify --quiet refs/heads/feat/02-b
+  git rev-parse --verify --quiet refs/heads/feat/015-prep
+  # Other branches untouched.
+  git rev-parse --verify --quiet refs/heads/feat/010-a
+  git rev-parse --verify --quiet refs/heads/feat/020-b
+  git rev-parse --verify --quiet refs/heads/feat/030-c
 }
 
-@test "new --first: inserts as leaf 01 and shifts all branches up" {
-  make_stack_branches feat 01-a 02-b
+@test "new --before: lowest branch picks midpoint of (0, lowest.leaf)" {
+  make_stack_branches feat 010-a 020-b
+  run git stack new prep --before feat/010-a --no-color
+  [ "$status" -eq 0 ]
+  # midpoint(0, 10) = 5
+  git rev-parse --verify --quiet refs/heads/feat/005-prep
+  [ "$(git rev-parse feat/005-prep)" = "$(git rev-parse main)" ]
+}
+
+@test "new --before: refuses when gap is exhausted" {
+  make_stack_branches feat 001-a 002-b
+  run git stack new prep --before feat/001-a --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"gap exhausted"* ]] || [[ "$output" == *"no insertable leaf"* ]]
+  git rev-parse --verify --quiet refs/heads/feat/001-a
+  git rev-parse --verify --quiet refs/heads/feat/002-b
+}
+
+@test "new --first: removed — errors with migration hint" {
+  make_stack_branches feat 010-a 020-b
   run git stack new prep --first --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/01-prep
-  git rev-parse --verify --quiet refs/heads/feat/02-a
-  git rev-parse --verify --quiet refs/heads/feat/03-b
-  [ "$(git rev-parse feat/01-prep)" = "$(git rev-parse main)" ]
-}
-
-@test "new --first: no cascade when first existing leaf is already > 1" {
-  make_stack_branches feat 05-a 06-b
-  local sha_05 sha_06
-  sha_05=$(git rev-parse refs/heads/feat/05-a)
-  sha_06=$(git rev-parse refs/heads/feat/06-b)
-  run git stack new prep --first --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/01-prep
-  # 05-a and 06-b must be untouched — no cascade because of the gap.
-  [ "$(git rev-parse refs/heads/feat/05-a)" = "$sha_05" ]
-  [ "$(git rev-parse refs/heads/feat/06-b)" = "$sha_06" ]
-  ! git rev-parse --verify --quiet refs/heads/feat/06-a
-  ! git rev-parse --verify --quiet refs/heads/feat/07-b
-}
-
-@test "new --after: cascade stops at first gap above insertion" {
-  make_stack_branches feat 01-a 05-b 06-c
-  local sha_05 sha_06
-  sha_05=$(git rev-parse refs/heads/feat/05-b)
-  sha_06=$(git rev-parse refs/heads/feat/06-c)
-  run git stack new mid --after feat/01-a --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/02-mid
-  # 05-b and 06-c sit in the gap and must not be renamed.
-  [ "$(git rev-parse refs/heads/feat/05-b)" = "$sha_05" ]
-  [ "$(git rev-parse refs/heads/feat/06-c)" = "$sha_06" ]
-  ! git rev-parse --verify --quiet refs/heads/feat/06-b
-  ! git rev-parse --verify --quiet refs/heads/feat/07-c
-}
-
-@test "new --after: partial cascade when gap is mid-stack" {
-  make_stack_branches feat 01-a 02-b 05-c
-  local sha_05
-  sha_05=$(git rev-parse refs/heads/feat/05-c)
-  run git stack new mid --after feat/02-b --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/01-a
-  git rev-parse --verify --quiet refs/heads/feat/02-b
-  git rev-parse --verify --quiet refs/heads/feat/03-mid
-  # The gap between 03-mid and 05-c is enough; 05-c stays put.
-  [ "$(git rev-parse refs/heads/feat/05-c)" = "$sha_05" ]
-  ! git rev-parse --verify --quiet refs/heads/feat/06-c
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"--first"* ]] && [[ "$output" == *"--before"* ]]
 }
 
 @test "new: refuses on stack with leaf 00 and hints at doctor" {
@@ -1006,7 +1008,7 @@ HOOK
   printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
   git checkout -q -b feat/02-b
   printf '02-b\n' >> file && git add file && git commit -q -m '02-b'
-  run git stack new prep --first --no-color
+  run git stack new prep --before feat/00-a --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"doctor"* ]]
 }
@@ -1015,48 +1017,38 @@ HOOK
   make_stack_branches feat 01-a 02-b
   run git stack new tail --no-color </dev/null
   [ "$status" -eq 0 ]
+  # Legacy 2-digit stack: step 1 from highest = 03.
   git rev-parse --verify --quiet refs/heads/feat/03-tail
 }
 
-@test "new --after: renames remote branches via gh api and triggers pr sync" {
-  make_stack_branches feat 01-a 02-b 03-c
-  make_remote_origin
-  export GH_STUB_REPO="test/repo"
-  run git stack new mid --after 1 --no-color
+@test "new --last: sparse stack rounds up to next multiple of 10" {
+  make_stack_branches feat 010-a 015-b
+  run git stack new tail --last --no-color
   [ "$status" -eq 0 ]
-  # The two cascaded branches (was 02-b, was 03-c) must have been remote-renamed.
-  [ "$(gh_log_count 'api -X POST')" -ge 2 ]
-  # pr sync must have been invoked too (gh_log shows 'pr list' or 'pr create'/'pr edit').
-  [ "$(gh_log_count 'pr')" -ge 1 ]
+  # Next multiple of 10 above 15 is 20.
+  git rev-parse --verify --quiet refs/heads/feat/020-tail
 }
 
-@test "new --after --no-push: skips remote rename and pr sync" {
-  make_stack_branches feat 01-a 02-b
+@test "new: no remote work (cmd_new is local-only by design)" {
+  # cmd_new no longer touches origin or PRs; it just creates one local ref.
+  # Existing PRs must not be affected.
+  make_stack_branches feat 010-a 020-b
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  run git stack new mid --after 1 --no-push --no-color
+  run git stack new mid --after feat/010-a --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -eq 0 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
 }
 
-@test "new --after --no-sync: does remote rename but skips pr sync" {
-  make_stack_branches feat 01-a 02-b
-  make_remote_origin
-  export GH_STUB_REPO="test/repo"
-  run git stack new mid --after 1 --no-sync --no-color
-  [ "$status" -eq 0 ]
-  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
-  [ "$(gh_log_count 'pr')" -eq 0 ]
-}
-
-@test "new (bootstrap, --prefix): creates first branch of a new stack from main" {
-  # Already on main from setup. No stack exists.
+@test "new (bootstrap, --prefix): creates first branch with sparse 010 default" {
+  # Already on main from setup. No stack exists. Sparse default = 3-digit
+  # width, first leaf = 010.
   run git stack new auth --prefix feat --no-color </dev/null
   [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/01-auth
-  [ "$(git symbolic-ref --short HEAD)" = "feat/01-auth" ]
-  [ "$(git rev-parse feat/01-auth)" = "$(git rev-parse main)" ]
+  git rev-parse --verify --quiet refs/heads/feat/010-auth
+  [ "$(git symbolic-ref --short HEAD)" = "feat/010-auth" ]
+  [ "$(git rev-parse feat/010-auth)" = "$(git rev-parse main)" ]
 }
 
 @test "new (bootstrap, non-TTY, no --prefix): errors with hint" {
@@ -1065,10 +1057,12 @@ HOOK
   [[ "$output" == *"prefix"* ]]
 }
 
-@test "new (bootstrap, --prefix, --at): errors — empty stack" {
-  run git stack new auth --prefix feat --at 1 --no-color </dev/null
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"no branches"* ]]
+@test "new (bootstrap, --prefix, --at): explicit leaf placement on empty stack" {
+  # Under sparse semantics, --at <num> works on an empty stack — places at
+  # exactly that leaf with no collision possible.
+  run git stack new auth --prefix feat --at 100 --no-color </dev/null
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/100-auth
 }
 
 # ---------- move ----------
@@ -1091,9 +1085,11 @@ HOOK
 
 @test "move: refuses if target == source position" {
   make_stack_branches feat 01-a 02-b
-  run git stack move feat/01-a --first --no-color
+  # Moving feat/01-a --before feat/01-a (no-op) refuses.
+  run git stack move feat/01-a --before feat/01-a --no-color
   [ "$status" -ne 0 ]
-  [[ "$output" == *"already"* ]]
+  # Refuses with either "itself" (self-reference) or "already" (same position).
+  [[ "$output" == *"already"* ]] || [[ "$output" == *"itself"* ]]
 }
 
 @test "move: refuses if source not in stack" {
@@ -1209,7 +1205,11 @@ HOOK
   run git stack move feat/01-a --last --no-sync --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -ge 1 ]
-  [ "$(gh_log_count 'pr')" -eq 0 ]
+  # `pr list` may be invoked by the PR-orphan-guard preflight; we only care
+  # that no PR mutations (create/edit/close) happened.
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
 }
 
 @test "move: preserves gaps in post-rename" {
@@ -1563,8 +1563,9 @@ make_dup_siblings() {
 # ---------- new/move history interop ----------
 
 @test "history: 'new' produces a restorable snapshot" {
-  make_stack_branches feat 01-a 02-b
-  git stack new mid --after 1 --no-color </dev/null
+  # Use a sparse stack so --after has a gap to insert into.
+  make_stack_branches feat 010-a 020-b
+  git stack new mid --after 10 --no-color </dev/null
   run git stack history --no-color
   [ "$status" -eq 0 ]
   [[ "$output" == *"new"* ]]

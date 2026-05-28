@@ -299,12 +299,13 @@ _resolve_branch_ref() {
 }
 
 # Infer numeric-leaf width from a stack's existing leaves. Looks at the first
-# (lowest-numbered) branch and counts the leading-digit run. Returns 2 if no
-# branches were given (fresh-stack default).
+# (lowest-numbered) branch and counts the leading-digit run. Returns 3 if no
+# branches were given (fresh-stack default — sparse 3-digit scheme).
+# Existing 2-digit stacks keep their inferred width of 2 (legacy path).
 # Usage: _leaf_width_for <branch1> <branch2> ...
 _leaf_width_for() {
   if (( $# == 0 )); then
-    printf '2\n'
+    printf '3\n'
     return 0
   fi
   local first="$1"
@@ -312,7 +313,7 @@ _leaf_width_for() {
   if [[ "$leaf" =~ ^([0-9]+)- ]]; then
     printf '%d\n' "${#BASH_REMATCH[1]}"
   else
-    printf '2\n'
+    printf '3\n'
   fi
 }
 
@@ -1375,27 +1376,42 @@ ${b}Subcommands:${r}
                                     \`history restore <id> [--yes]\`. Run-id may
                                     be full, action-tagged, bare timestamp, or
                                     \`@N\` (relative; @0 = newest).
-  ${sub}new${r} <slug> [${fl}--last${r}|${fl}--first${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--prefix${r} <p>]
+  ${sub}new${r} <slug> [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--prefix${r} <p>]
                                     Create an empty branch in the stack at the
-                                    chosen position. <ref> is a numeric leaf
-                                    or a full branch name. With no position
-                                    flag, opens an interactive picker
-                                    (\`[first]\` ... branches ... \`[last]\`).
-                                    Cascades leaf renames for branches above
-                                    the insertion; auto-renames remote refs
-                                    via GitHub branch-rename API so PRs follow,
-                                    then runs \`pr sync\`. With no stack
-                                    detected, prompts for or picks a prefix
-                                    (bootstrap path; non-TTY requires
-                                    ${fl}--prefix${r}).
-  ${sub}move${r} <branch> [${fl}--last${r}|${fl}--first${r}|${fl}--after${r} <ref>|${fl}--at${r} <ref>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--force${r}]
-                                    Relocate <branch> in the current stack to
+                                    chosen position. Local-only — never renames
+                                    or touches any existing branch, never calls
+                                    GitHub APIs. <ref> is a numeric leaf or
+                                    full branch name; <num> is a non-negative
+                                    integer leaf to place at exactly. With no
+                                    position flag, opens an interactive picker
+                                    (pick branch, then before/after, then leaf
+                                    number from a curated list). New stacks
+                                    get sparse 3-digit leaves stepping by 10
+                                    (first branch = 010); legacy 2-digit
+                                    stacks keep their inferred width. Insert
+                                    flags pick the midpoint of the gap; if the
+                                    gap is exhausted, refuses with a clear
+                                    error (no cascade rename). ${fl}--first${r} has
+                                    been removed — use ${fl}--before${r} <lowest-ref>.
+                                    With no stack detected, prompts for or
+                                    picks a prefix (bootstrap path; non-TTY
+                                    requires ${fl}--prefix${r}).
+  ${sub}move${r} [<branch>] [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--force${r}] [${fl}--allow-pr-rebuild${r}]
+                                    Relocate <branch> (default: current branch)
+                                    in the current stack to
                                     the chosen position. Cherry-picks affected
                                     branches onto their new predecessors using
                                     the existing reflow state machine — on
                                     conflict, resolve + \`git stack continue\`.
-                                    Cascades leaf renames + remote rename + pr
-                                    sync, same as ${sub}new${r}.
+                                    Since the move renames branches (changing
+                                    leaf numbers + tip SHAs), refuses by
+                                    default if any affected branch has an open
+                                    head PR (GitHub auto-closes such PRs on
+                                    rename and there's no API to reattach).
+                                    Pass ${fl}--allow-pr-rebuild${r} to accept the
+                                    rebuild — the old PRs close and fresh ones
+                                    open via \`pr sync\`. ${fl}--first${r} removed; use
+                                    ${fl}--before${r} instead.
   ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}] [${fl}--allow-pr-rebuild${r}]
                                     Atomically rename every branch in the stack
                                     from <old>/<leaf> to <new>/<leaf>, carrying
@@ -2166,23 +2182,151 @@ _check_slug_collision() {
   return 1
 }
 
-# Pick the next integer leaf number above the highest existing one.
+# Pick the next integer leaf number for an append (--last) at the given width.
+# Width >= 3 (sparse): rounds up to the next multiple of 10. Empty stack returns 10.
+# Width < 3 (legacy 2-digit): returns highest + 1. Empty stack returns 1.
 # Args: <branch1> <branch2> ...  (sorted in stack order)
-# Echoes the integer.
+# Echoes the integer. Caller is responsible for refusing if result > 10^width - 1.
 _next_leaf_num() {
+  local width
+  width=$(_leaf_width_for "$@")
   if (( $# == 0 )); then
-    printf '1\n'
+    if (( width >= 3 )); then
+      printf '10\n'
+    else
+      printf '1\n'
+    fi
     return 0
   fi
   local last="${!#}"
   local leaf="${last##*/}"
   [[ "$leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$leaf' has no numeric prefix"
-  printf '%d\n' $((10#${BASH_REMATCH[1]} + 1))
+  local last_num=$((10#${BASH_REMATCH[1]}))
+  if (( width >= 3 )); then
+    printf '%d\n' $(( ((last_num / 10) + 1) * 10 ))
+  else
+    printf '%d\n' $((last_num + 1))
+  fi
+}
+
+# Compute the midpoint leaf number between two existing leaf positions, with
+# `lo < new < hi` (open interval). Echoes `floor((lo + hi) / 2)` on success;
+# returns non-zero with no output when the gap is too small (`hi - lo < 2`).
+# Usage: _midpoint_leaf <lo> <hi>
+_midpoint_leaf() {
+  local lo="$1" hi="$2"
+  if (( hi - lo < 2 )); then
+    return 1
+  fi
+  printf '%d\n' $(( (lo + hi) / 2 ))
+}
+
+# Three-step interactive position picker for `cmd_new` and `cmd_move`. Drives
+# the user through:
+#   1. pick a reference branch from the stack
+#   2. pick before/after that branch
+#   3. pick a leaf number from a curated list within the gap
+#
+# On success, sets two globals for the caller:
+#   _PICKED_LEAF_NUM    — the chosen integer leaf number
+#   _PICKED_PREDECESSOR — branch name to use as predecessor, or empty string to
+#                         indicate "use the stack base branch"
+# Returns 0 on success, non-zero if the user aborts at any step or the gap is
+# exhausted (in which case it die()s with the gap-exhausted message).
+#
+# Usage: _pick_position_for_new <branch1> <branch2> ...
+# Caller is responsible for excluding the source branch when used from cmd_move.
+_pick_position_for_new() {
+  _PICKED_LEAF_NUM=""
+  _PICKED_PREDECESSOR=""
+  local branches=("$@")
+  (( ${#branches[@]} > 0 )) || die "internal: _pick_position_for_new called with no branches"
+
+  # Step 1: pick reference branch.
+  local ref_branch
+  ref_branch=$(_pick_one "insert before/after which branch?" "${branches[@]}") \
+    || return 1
+
+  # Step 2: pick before/after.
+  local pos
+  pos=$(_pick_one "position relative to $ref_branch:" "before $ref_branch" "after $ref_branch") \
+    || return 1
+
+  # Compute lo/hi for the chosen position. Open-ended (hi == -1) signals
+  # --last-like behavior (no upper bound; use next multiple of 10).
+  local ref_idx ref_leaf_num lo hi
+  ref_idx=$(branch_index "$ref_branch" "${branches[@]}")
+  [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || die "internal: ref leaf malformed: $ref_branch"
+  ref_leaf_num=$((10#${BASH_REMATCH[1]}))
+
+  if [[ "$pos" == "before $ref_branch" ]]; then
+    hi=$ref_leaf_num
+    if (( ref_idx == 0 )); then
+      lo=0
+    else
+      [[ "${branches[$((ref_idx - 1))]##*/}" =~ ^([0-9]+)- ]] || die "internal: prev leaf malformed"
+      lo=$((10#${BASH_REMATCH[1]}))
+    fi
+    # Predecessor for "before X" is the branch just before X (or base).
+    if (( ref_idx == 0 )); then
+      _PICKED_PREDECESSOR=""
+    else
+      _PICKED_PREDECESSOR="${branches[$((ref_idx - 1))]}"
+    fi
+  else  # after
+    lo=$ref_leaf_num
+    if (( ref_idx == ${#branches[@]} - 1 )); then
+      hi=-1  # open-ended
+    else
+      [[ "${branches[$((ref_idx + 1))]##*/}" =~ ^([0-9]+)- ]] || die "internal: next leaf malformed"
+      hi=$((10#${BASH_REMATCH[1]}))
+    fi
+    _PICKED_PREDECESSOR="$ref_branch"
+  fi
+
+  # Step 3: build candidate leaf list and pick.
+  local candidates=()
+  if (( hi == -1 )); then
+    # Open-ended append. Default = next multiple of 10 above lo, plus +10/+20 alternatives.
+    local default_leaf=$(( ((lo / 10) + 1) * 10 ))
+    candidates=("$default_leaf" "$((default_leaf + 10))" "$((default_leaf + 20))")
+  else
+    if (( hi - lo < 2 )); then
+      die "no insertable leaf between $lo and $hi (gap exhausted); pick a different position or wait for doctor-reflow"
+    fi
+    local mid=$(( (lo + hi) / 2 ))
+    local gap=$((hi - lo - 1))  # number of valid leaves in the open interval
+    if (( gap <= 10 )); then
+      # Enumerate all valid leaves, midpoint first, then by proximity to midpoint.
+      local n
+      candidates+=("$mid")
+      for ((n = lo + 1; n < hi; n++)); do
+        (( n != mid )) && candidates+=("$n")
+      done
+    else
+      # Curate ~5 spread options.
+      local quart=$(( gap / 4 ))
+      local eighth=$(( gap / 8 ))
+      (( eighth < 1 )) && eighth=1
+      candidates+=("$mid")
+      (( mid - quart > lo )) && candidates+=("$((mid - quart))")
+      (( mid + quart < hi )) && candidates+=("$((mid + quart))")
+      (( mid - eighth > lo && mid - eighth != mid - quart )) && candidates+=("$((mid - eighth))")
+      (( mid + eighth < hi && mid + eighth != mid + quart )) && candidates+=("$((mid + eighth))")
+    fi
+  fi
+
+  local picked_leaf
+  picked_leaf=$(_pick_one "leaf number:" "${candidates[@]}") \
+    || return 1
+
+  _PICKED_LEAF_NUM="$picked_leaf"
+  return 0
 }
 
 cmd_new() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local slug="" opt_last=0 opt_first=0 opt_after="" opt_at=""
+  local slug="" opt_last=0 opt_before="" opt_after="" opt_at=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -2190,7 +2334,8 @@ cmd_new() {
     fi
     case "$1" in
       --last)    opt_last=1; shift ;;
-      --first)   opt_first=1; shift ;;
+      --first)   die "new: --first has been removed (it cascade-renumbered existing branches, which destroys their PRs on GitHub). Use '--before <ref>' instead — e.g. '--before <lowest-leaf>' to insert at the very start." ;;
+      --before)  shift; [[ $# -gt 0 ]] || die "--before needs an argument"; opt_before="$1"; shift ;;
       --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
       --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
       --force)   OPT_FORCE=1; shift ;;
@@ -2199,13 +2344,26 @@ cmd_new() {
     esac
   done
 
+  # If no slug was passed and we have a TTY, prompt for one. Non-TTY callers
+  # still get the existing "slug is required" die from _validate_slug.
+  if [[ -z "$slug" ]] && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
+    printf 'slug: ' >&2
+    read -r slug < /dev/tty || die "new: aborted"
+  fi
+
   _validate_slug "$slug"
 
+  # --at requires a non-negative integer (no slugs or branch refs).
+  if [[ -n "$opt_at" && ! "$opt_at" =~ ^[0-9]+$ ]]; then
+    die "new --at: requires a non-negative integer leaf number (got '$opt_at'); use --before/--after for branch-relative inserts"
+  fi
+
   # Mutual exclusion among position flags.
-  local n_pos=$(( opt_last + opt_first ))
-  [[ -n "$opt_after" ]] && (( n_pos++ )) || true
-  [[ -n "$opt_at"    ]] && (( n_pos++ )) || true
-  (( n_pos <= 1 )) || die "new: --last, --first, --after, --at are mutually exclusive"
+  local n_pos=$opt_last
+  [[ -n "$opt_before" ]] && (( n_pos++ )) || true
+  [[ -n "$opt_after"  ]] && (( n_pos++ )) || true
+  [[ -n "$opt_at"     ]] && (( n_pos++ )) || true
+  (( n_pos <= 1 )) || die "new: --last, --before, --after, --at are mutually exclusive"
 
   require_in_repo
   require_clean_tree
@@ -2267,123 +2425,191 @@ cmd_new() {
     die "new: slug '$slug' collides with existing branch '$_SLUG_COLLISION_BRANCH'"
   fi
 
-  # If no position flag and we have a TTY + branches, prompt.
-  if (( n_pos == 0 )) && (( ${#branches[@]} > 0 )) && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
-    local picker_items=("[first]" "${branches[@]}" "[last]")
-    local picked
-    picked=$(_pick_one "insert new branch at position of:" "${picker_items[@]}") \
-      || die "new: no position selected"
-    case "$picked" in
-      "[first]") opt_first=1 ;;
-      "[last]")  opt_last=1 ;;
-      *)         opt_at="$picked" ;;
-    esac
-    # Recompute n_pos so the position-resolution block treats this as flagged.
-    n_pos=1
-  fi
-
   local width
   width=$(_leaf_width_for "${branches[@]+"${branches[@]}"}")
 
-  # Compute the 0-based insertion index in the post-mutation array.
-  local insert_idx
-  if (( opt_last )); then
-    insert_idx=${#branches[@]}
-  elif (( opt_first )); then
-    insert_idx=0
-  elif [[ -n "$opt_after" ]]; then
-    if (( ${#branches[@]} == 0 )); then
-      die "new --after: no branches in stack '$prefix'"
-    fi
-    local after_branch rc=0
-    after_branch=$(_resolve_branch_ref "$opt_after" "${branches[@]}") || rc=$?
-    (( rc == 0 )) || die "new --after: '$opt_after' not in stack '$prefix'"
-    insert_idx=$(branch_index "$after_branch" "${branches[@]}")
-    insert_idx=$((insert_idx + 1))
-  elif [[ -n "$opt_at" ]]; then
-    if (( ${#branches[@]} == 0 )); then
-      die "new --at: no branches in stack '$prefix'"
-    fi
-    local at_branch rc=0
-    at_branch=$(_resolve_branch_ref "$opt_at" "${branches[@]}") || rc=$?
-    (( rc == 0 )) || die "new --at: '$opt_at' not in stack '$prefix'"
-    insert_idx=$(branch_index "$at_branch" "${branches[@]}")
-  else
-    # No position flag (picker not triggered — non-TTY or empty stack). Default: last.
-    insert_idx=${#branches[@]}
-  fi
+  # Resolve (new_num, predecessor) based on flag / picker / defaults.
+  local new_num predecessor_ref predecessor_label
+  local resolved=0
 
-  # Predecessor: where the new branch starts from.
-  local predecessor_ref predecessor_label
-  if (( insert_idx == 0 )); then
+  # Empty stack: skip prompts, use _next_leaf_num (10 for sparse / 1 for legacy).
+  # Exception: --at <num> on an empty stack is honored directly.
+  if (( ${#branches[@]} == 0 )) && (( n_pos == 0 )); then
+    new_num=$(_next_leaf_num)
     local parent_name
     parent_name=$(_resolve_parent_name) \
       || die "new: cannot determine parent branch (set stack.base or create main/master)"
     predecessor_ref=$(_resolve_parent_ref "$parent_name") \
       || die "new: cannot resolve parent ref for '$parent_name'"
     predecessor_label="$parent_name"
-  else
-    local prev="${branches[$((insert_idx - 1))]}"
-    predecessor_ref="refs/heads/$prev"
-    predecessor_label="$prev"
+    resolved=1
   fi
-  local predecessor_sha
-  predecessor_sha=$(git rev-parse "$predecessor_ref") \
-    || die "new: cannot resolve predecessor '$predecessor_ref'"
 
-  # Compute the new branch's leaf number based on insert position.
-  local new_num leaf new_branch
-  if (( insert_idx == 0 )); then
-    # First insert: new leaf is 1; everything else shifts up.
-    new_num=1
-  elif (( insert_idx == ${#branches[@]} )); then
-    # Last append: next integer above the highest existing.
-    new_num=$(_next_leaf_num "${branches[@]}")
-  else
-    # Mid-insert: predecessor's leaf + 1.
-    local prev_branch="${branches[$((insert_idx - 1))]}"
-    local prev_leaf="${prev_branch##*/}"
-    [[ "$prev_leaf" =~ ^([0-9]+)- ]] || die "internal: prev_leaf '$prev_leaf' malformed"
-    new_num=$((10#${BASH_REMATCH[1]} + 1))
+  # Interactive: no flag passed, branches exist, TTY available.
+  if (( ! resolved )) && (( n_pos == 0 )) && (( ${#branches[@]} > 0 )) \
+       && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
+    _pick_position_for_new "${branches[@]}" || die "new: cancelled"
+    new_num="$_PICKED_LEAF_NUM"
+    if [[ -z "$_PICKED_PREDECESSOR" ]]; then
+      local parent_name
+      parent_name=$(_resolve_parent_name) \
+        || die "new: cannot determine parent branch (set stack.base or create main/master)"
+      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
+        || die "new: cannot resolve parent ref for '$parent_name'"
+      predecessor_label="$parent_name"
+    else
+      predecessor_ref="refs/heads/$_PICKED_PREDECESSOR"
+      predecessor_label="$_PICKED_PREDECESSOR"
+    fi
+    resolved=1
   fi
+
+  # Non-TTY default: --last.
+  if (( ! resolved )) && (( n_pos == 0 )); then
+    opt_last=1
+    n_pos=1
+  fi
+
+  # Non-interactive flag resolution.
+  if (( ! resolved )) && (( opt_last )); then
+    new_num=$(_next_leaf_num "${branches[@]+"${branches[@]}"}")
+    if (( width >= 3 )) && (( new_num > 999 )); then
+      die "new --last: leaf space exhausted (would be $new_num, max 999); pick an --at value or wait for doctor-reflow"
+    fi
+    if (( ${#branches[@]} == 0 )); then
+      local parent_name
+      parent_name=$(_resolve_parent_name) \
+        || die "new: cannot determine parent branch (set stack.base or create main/master)"
+      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
+        || die "new: cannot resolve parent ref for '$parent_name'"
+      predecessor_label="$parent_name"
+    else
+      local prev="${branches[$((${#branches[@]} - 1))]}"
+      predecessor_ref="refs/heads/$prev"
+      predecessor_label="$prev"
+    fi
+    resolved=1
+  fi
+
+  if (( ! resolved )) && [[ -n "$opt_before" ]]; then
+    (( ${#branches[@]} > 0 )) || die "new --before: no branches in stack '$prefix'"
+    local ref_branch rc=0
+    ref_branch=$(_resolve_branch_ref "$opt_before" "${branches[@]}") || rc=$?
+    (( rc == 0 )) || die "new --before: '$opt_before' not in stack '$prefix'"
+    local ref_idx lo hi
+    ref_idx=$(branch_index "$ref_branch" "${branches[@]}")
+    [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || die "internal: ref leaf malformed"
+    hi=$((10#${BASH_REMATCH[1]}))
+    if (( ref_idx == 0 )); then
+      lo=0
+      local parent_name
+      parent_name=$(_resolve_parent_name) \
+        || die "new: cannot determine parent branch (set stack.base or create main/master)"
+      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
+        || die "new: cannot resolve parent ref for '$parent_name'"
+      predecessor_label="$parent_name"
+    else
+      local prev="${branches[$((ref_idx - 1))]}"
+      [[ "${prev##*/}" =~ ^([0-9]+)- ]] || die "internal: prev leaf malformed"
+      lo=$((10#${BASH_REMATCH[1]}))
+      predecessor_ref="refs/heads/$prev"
+      predecessor_label="$prev"
+    fi
+    if ! new_num=$(_midpoint_leaf "$lo" "$hi"); then
+      die "new --before $ref_branch: no insertable leaf between $lo and $hi (gap exhausted); pick a different position or wait for doctor-reflow"
+    fi
+    resolved=1
+  fi
+
+  if (( ! resolved )) && [[ -n "$opt_after" ]]; then
+    (( ${#branches[@]} > 0 )) || die "new --after: no branches in stack '$prefix'"
+    local ref_branch rc=0
+    ref_branch=$(_resolve_branch_ref "$opt_after" "${branches[@]}") || rc=$?
+    (( rc == 0 )) || die "new --after: '$opt_after' not in stack '$prefix'"
+    local ref_idx lo
+    ref_idx=$(branch_index "$ref_branch" "${branches[@]}")
+    [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || die "internal: ref leaf malformed"
+    lo=$((10#${BASH_REMATCH[1]}))
+    if (( ref_idx == ${#branches[@]} - 1 )); then
+      # Last branch: behave like --last anchored on ref.
+      if (( width >= 3 )); then
+        new_num=$(( ((lo / 10) + 1) * 10 ))
+      else
+        new_num=$((lo + 1))
+      fi
+      if (( width >= 3 )) && (( new_num > 999 )); then
+        die "new --after $ref_branch: leaf space exhausted (would be $new_num, max 999); pick an --at value or wait for doctor-reflow"
+      fi
+    else
+      local next="${branches[$((ref_idx + 1))]}"
+      [[ "${next##*/}" =~ ^([0-9]+)- ]] || die "internal: next leaf malformed"
+      local hi=$((10#${BASH_REMATCH[1]}))
+      if ! new_num=$(_midpoint_leaf "$lo" "$hi"); then
+        die "new --after $ref_branch: no insertable leaf between $lo and $hi (gap exhausted); pick a different position or wait for doctor-reflow"
+      fi
+    fi
+    predecessor_ref="refs/heads/$ref_branch"
+    predecessor_label="$ref_branch"
+    resolved=1
+  fi
+
+  if (( ! resolved )) && [[ -n "$opt_at" ]]; then
+    new_num="$opt_at"
+    # Check 999 ceiling.
+    if (( width >= 3 )) && (( new_num > 999 )); then
+      die "new --at: leaf $new_num exceeds 3-digit ceiling (999)"
+    fi
+    # Collision check: refuse if any existing branch occupies this leaf.
+    local b leaf_num
+    for b in "${branches[@]+"${branches[@]}"}"; do
+      [[ "${b##*/}" =~ ^([0-9]+)- ]] || continue
+      leaf_num=$((10#${BASH_REMATCH[1]}))
+      if (( leaf_num == new_num )); then
+        die "new --at: leaf $new_num is already taken by '$b'"
+      fi
+    done
+    # Determine insert position based on new_num vs existing leaves; that
+    # gives us the predecessor.
+    local insert_idx=${#branches[@]}
+    local i
+    for ((i = 0; i < ${#branches[@]}; i++)); do
+      [[ "${branches[$i]##*/}" =~ ^([0-9]+)- ]] || continue
+      if (( 10#${BASH_REMATCH[1]} > new_num )); then
+        insert_idx=$i
+        break
+      fi
+    done
+    if (( insert_idx == 0 )); then
+      local parent_name
+      parent_name=$(_resolve_parent_name) \
+        || die "new: cannot determine parent branch (set stack.base or create main/master)"
+      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
+        || die "new: cannot resolve parent ref for '$parent_name'"
+      predecessor_label="$parent_name"
+    else
+      local prev="${branches[$((insert_idx - 1))]}"
+      predecessor_ref="refs/heads/$prev"
+      predecessor_label="$prev"
+    fi
+    resolved=1
+  fi
+
+  (( resolved )) || die "internal: new: position resolution failed"
+
+  # Format the new branch name.
+  local leaf new_branch
   leaf=$(_format_leaf "$new_num" "$width")
   new_branch="${prefix}${leaf}-${slug}"
-
-  # Build the rename batch for branches at insert_idx and above. Cascade is
-  # gap-aware: stop as soon as a branch's existing leaf number is already
-  # greater than what the predecessor (new branch, then the previously-renamed
-  # branch) occupies — no further renames are needed past that point.
-  # rename_pairs is a flat array: old1 new1 old2 new2 ...
-  local rename_pairs=()
-  local i b old_leaf old_num new_num_to_use new_leaf_str new_full
-  local prev_num=$new_num
-  for ((i = insert_idx; i < ${#branches[@]}; i++)); do
-    b="${branches[$i]}"
-    old_leaf="${b##*/}"
-    [[ "$old_leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$old_leaf' malformed"
-    old_num=$((10#${BASH_REMATCH[1]}))
-    if (( old_num > prev_num )); then
-      break
-    fi
-    new_num_to_use=$((prev_num + 1))
-    new_leaf_str=$(_format_leaf "$new_num_to_use" "$width")
-    new_full="${prefix}${new_leaf_str}-${old_leaf#*-}"
-    if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
-      die "new: cascade rename would collide with existing '$new_full'"
-    fi
-    rename_pairs+=("$b" "$new_full")
-    prev_num=$new_num_to_use
-  done
-
-  # Refuse if any branch in the cascade is checked out elsewhere.
-  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-    require_branch_not_in_worktree "${rename_pairs[$i]}"
-  done
 
   # Paranoia: new branch ref must not exist.
   if git rev-parse --verify --quiet "refs/heads/$new_branch" >/dev/null; then
     die "new: target ref 'refs/heads/$new_branch' already exists"
   fi
+
+  # Resolve predecessor SHA.
+  local predecessor_sha
+  predecessor_sha=$(git rev-parse "$predecessor_ref") \
+    || die "new: cannot resolve predecessor '$predecessor_ref'"
 
   # Snapshot before mutation.
   if (( ${#branches[@]} > 0 )); then
@@ -2392,57 +2618,20 @@ cmd_new() {
     snapshot_stack new "$prefix"
   fi
 
-  # Build the atomic update-ref batch.
-  local batch=""
-  batch+="create refs/heads/${new_branch} ${predecessor_sha}"$'\n'
-  for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-    local old="${rename_pairs[$i]}"
-    local new="${rename_pairs[$((i + 1))]}"
-    local sha
-    sha=$(git rev-parse "refs/heads/$old")
-    batch+="create refs/heads/${new} ${sha}"$'\n'
-    batch+="delete refs/heads/${old} ${sha}"$'\n'
-  done
-
-  # Retarget HEAD if it points at a cascade-renamed branch.
-  local head_target_before="" head_new_target=""
-  if head_target_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
-    for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-      if [[ "$head_target_before" == "refs/heads/${rename_pairs[$i]}" ]]; then
-        head_new_target="refs/heads/${rename_pairs[$((i + 1))]}"
-        git symbolic-ref HEAD "$head_new_target"
-        break
-      fi
-    done
-  fi
-
-  # Apply the batch.
-  if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack new $new_branch"; then
-    if [[ -n "$head_new_target" ]]; then
-      git symbolic-ref HEAD "$head_target_before" 2>/dev/null || true
-    fi
-    die "git update-ref batch failed; refs unchanged (atomic)"
+  # Create the branch — single update-ref, no cascade.
+  if ! git update-ref "refs/heads/${new_branch}" "${predecessor_sha}" ""; then
+    die "git update-ref failed; ref unchanged"
   fi
 
   # Switch HEAD to the new branch.
   git checkout --quiet "$new_branch"
 
-  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label}, +$((${#rename_pairs[@]} / 2)) renames)${C_RESET}"
-
-  # Stage 2: remote rename. Skipped under --no-push.
-  if (( ! OPT_NO_PUSH )) && (( ${#rename_pairs[@]} > 0 )); then
-    _remote_rename_batch_or_skip "${rename_pairs[@]}"
-  fi
-
-  # Stage 3: pr sync. Skipped under --no-push OR --no-sync.
-  if (( ! OPT_NO_PUSH )); then
-    _post_rename_sync
-  fi
+  log "${C_GREEN}new${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label})${C_RESET}"
 }
 
 cmd_move() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local src="" opt_last=0 opt_first=0 opt_after="" opt_at="" opt_allow_pr_rebuild=0
+  local src="" opt_last=0 opt_before="" opt_after="" opt_at="" opt_allow_pr_rebuild=0
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -2450,7 +2639,8 @@ cmd_move() {
     fi
     case "$1" in
       --last)    opt_last=1; shift ;;
-      --first)   opt_first=1; shift ;;
+      --first)   die "move: --first has been removed (it cascade-renumbered branches, destroying their PRs on GitHub). Use '--before <ref>' instead — e.g. '--before <lowest-leaf>' to move to the very start." ;;
+      --before)  shift; [[ $# -gt 0 ]] || die "--before needs an argument"; opt_before="$1"; shift ;;
       --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
       --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
       --allow-pr-rebuild) opt_allow_pr_rebuild=1; shift ;;
@@ -2463,16 +2653,20 @@ cmd_move() {
   # Default <branch> to the current branch when omitted.
   if [[ -z "$src" ]]; then
     src=$(current_branch) \
-      || die "usage: git stack move [<branch>] [--last|--first|--after <ref>|--at <ref>] [--allow-pr-rebuild]
+      || die "usage: git stack move [<branch>] [--last|--before <ref>|--after <ref>|--at <num>] [--allow-pr-rebuild]
 move: no <branch> given and HEAD is detached"
   fi
 
-  local n_pos=0
-  (( opt_last )) && (( n_pos++ )) || true
-  (( opt_first )) && (( n_pos++ )) || true
+  # --at requires a non-negative integer (no slugs or branch refs).
+  if [[ -n "$opt_at" && ! "$opt_at" =~ ^[0-9]+$ ]]; then
+    die "move --at: requires a non-negative integer leaf number (got '$opt_at'); use --before/--after for branch-relative inserts"
+  fi
+
+  local n_pos=$opt_last
+  [[ -n "$opt_before" ]] && (( n_pos++ )) || true
   [[ -n "$opt_after" ]] && (( n_pos++ )) || true
   [[ -n "$opt_at" ]] && (( n_pos++ )) || true
-  (( n_pos <= 1 )) || die "move: --last, --first, --after, --at are mutually exclusive"
+  (( n_pos <= 1 )) || die "move: --last, --before, --after, --at are mutually exclusive"
 
   require_in_repo
   require_clean_tree
@@ -2495,34 +2689,47 @@ move: no <branch> given and HEAD is detached"
   local src_idx
   src_idx=$(branch_index "$src_branch" "${branches[@]}")
 
-  # TTY picker if no position flag.
+  # TTY picker if no position flag. Three-step picker (branch + before/after +
+  # leaf is overkill for move — pickers map cleanly to --before/--after/--last
+  # since the reflow recomputes leaves anyway). For simplicity we keep a
+  # single-step picker here showing each non-src branch as a "[before <X>]" /
+  # "[after <X>]" pair plus a "[last]" terminator.
   if (( n_pos == 0 )) && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
-    local picker_items=("[first]")
+    local picker_items=()
     local b
     for b in "${branches[@]}"; do
       [[ "$b" == "$src_branch" ]] && continue
-      picker_items+=("$b")
+      picker_items+=("before $b" "after $b")
     done
-    picker_items+=("[last]")
     local picked
-    picked=$(_pick_one "move ${src_branch} to position of:" "${picker_items[@]}") \
+    picked=$(_pick_one "move ${src_branch} to:" "${picker_items[@]}") \
       || die "move: no position selected"
-    case "$picked" in
-      "[first]") opt_first=1 ;;
-      "[last]")  opt_last=1 ;;
-      *)         opt_at="$picked" ;;
-    esac
+    if [[ "$picked" == "before "* ]]; then
+      opt_before="${picked#before }"
+    elif [[ "$picked" == "after "* ]]; then
+      opt_after="${picked#after }"
+    fi
     n_pos=1
   fi
-  (( n_pos == 1 )) || die "move: no position specified (and no TTY for picker); pass --last/--first/--after/--at"
+  (( n_pos == 1 )) || die "move: no position specified (and no TTY for picker); pass --last/--before/--after/--at"
 
   # Resolve destination index in the *post-removal* array (i.e., the array with src_branch removed).
   # This is the index *where src will sit* after the move.
   local dst_idx
   if (( opt_last )); then
     dst_idx=$((${#branches[@]} - 1))
-  elif (( opt_first )); then
-    dst_idx=0
+  elif [[ -n "$opt_before" ]]; then
+    local before_branch
+    before_branch=$(_resolve_branch_ref "$opt_before" "${branches[@]}") \
+      || die "move --before: '$opt_before' not in stack '$prefix'"
+    [[ "$before_branch" != "$src_branch" ]] || die "move: cannot reference itself"
+    local before_idx
+    before_idx=$(branch_index "$before_branch" "${branches[@]}")
+    if (( before_idx > src_idx )); then
+      dst_idx=$((before_idx - 1))
+    else
+      dst_idx=$before_idx
+    fi
   elif [[ -n "$opt_after" ]]; then
     local after_branch
     after_branch=$(_resolve_branch_ref "$opt_after" "${branches[@]}") \
@@ -2536,17 +2743,30 @@ move: no <branch> given and HEAD is detached"
       dst_idx=$((after_idx + 1))
     fi
   elif [[ -n "$opt_at" ]]; then
-    local at_branch
-    at_branch=$(_resolve_branch_ref "$opt_at" "${branches[@]}") \
-      || die "move --at: '$opt_at' not in stack '$prefix'"
-    [[ "$at_branch" != "$src_branch" ]] || die "move: cannot reference itself"
-    local at_idx
-    at_idx=$(branch_index "$at_branch" "${branches[@]}")
-    if (( at_idx > src_idx )); then
-      dst_idx=$((at_idx - 1))
-    else
-      dst_idx=$at_idx
-    fi
+    # --at <num>: explicit leaf placement. Refuses if leaf is taken by any
+    # branch other than src itself. Computes dst_idx from where <num> would
+    # sort among the (non-src) branches.
+    local at_num="$opt_at" b leaf_num
+    for b in "${branches[@]}"; do
+      [[ "$b" == "$src_branch" ]] && continue
+      [[ "${b##*/}" =~ ^([0-9]+)- ]] || continue
+      leaf_num=$((10#${BASH_REMATCH[1]}))
+      if (( leaf_num == at_num )); then
+        die "move --at: leaf $at_num is already taken by '$b'"
+      fi
+    done
+    # Compute dst_idx: index in the post-removal array where leaf at_num lands.
+    dst_idx=0
+    local seen=0 i
+    for ((i = 0; i < ${#branches[@]}; i++)); do
+      [[ "${branches[$i]}" == "$src_branch" ]] && continue
+      [[ "${branches[$i]##*/}" =~ ^([0-9]+)- ]] || { (( seen++ )); continue; }
+      leaf_num=$((10#${BASH_REMATCH[1]}))
+      if (( leaf_num < at_num )); then
+        (( seen++ ))
+      fi
+    done
+    dst_idx=$seen
   fi
 
   # Refuse if destination == source position.
