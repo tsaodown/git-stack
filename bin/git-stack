@@ -1280,6 +1280,30 @@ _pr_link() {
   _osc8_link "https://github.com/${GH_REPO}/pull/${n}" "#${n}"
 }
 
+# Convert a GitHub ISO 8601 timestamp (e.g. "2026-05-27T10:00:00Z") to a
+# human-readable relative time ("2h ago", "3d ago", etc.). Prints nothing on
+# parse failure so callers can treat empty output as "unknown".
+_relative_time() {
+  local ts="$1"
+  [[ -z "$ts" ]] && return 0
+  local epoch_ts epoch_now diff
+  epoch_ts=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null \
+    || date -d "$ts" +%s 2>/dev/null) || return 0
+  epoch_now=$(date +%s)
+  diff=$(( epoch_now - epoch_ts ))
+  if (( diff < 3600 )); then
+    printf '%dm ago' $(( diff / 60 ))
+  elif (( diff < 86400 )); then
+    printf '%dh ago' $(( diff / 3600 ))
+  elif (( diff < 604800 )); then
+    printf '%dd ago' $(( diff / 86400 ))
+  elif (( diff < 2592000 )); then
+    printf '%dw ago' $(( diff / 604800 ))
+  else
+    printf '%dmo ago' $(( diff / 2592000 ))
+  fi
+}
+
 # Inspect a PR for <branch> across all states (open/closed/merged). Emits one
 # line (\x1f-separated) on success:
 #   num<US>title<US>state<US>isDraft<US>baseRefName<US>reviewDecision<US>commentsCount
@@ -1287,9 +1311,9 @@ _pr_link() {
 # `--state open` filter — `pr list` should surface closed/merged PRs too.
 _gh_pr_inspect() {
   local b="$1"
-  gh pr list --repo "$GH_REPO" --head "$b" --limit 1 \
-    --json number,title,state,isDraft,baseRefName,reviewDecision,comments,latestReviews,reviewRequests,statusCheckRollup \
-    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.reviewRequests // []) | map(if .__typename == "Team" then .name else .login end) | join(",")) as $req_rev | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($req_rev)\($checks)"' \
+  gh pr list --repo "$GH_REPO" --head "$b" --state all --limit 1 \
+    --json number,title,state,isDraft,baseRefName,reviewDecision,comments,latestReviews,reviewRequests,statusCheckRollup,mergedAt,mergedBy \
+    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.reviewRequests // []) | map(if .__typename == "Team" then .name else .login end) | join(",")) as $req_rev | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($req_rev)\($checks)\u001f\(.mergedAt // "")\u001f\(.mergedBy.login // "")"' \
     2>/dev/null
 }
 
@@ -4350,7 +4374,7 @@ cmd_pr_list() {
     (( ${#b} > max_w )) && max_w=${#b}
   done
 
-  local data num title state is_draft base_ref review_dec comments approvers change_reqs req_reviewers checks
+  local data num title state is_draft base_ref review_dec comments approvers change_reqs req_reviewers checks merged_at merged_by
   local marker branch_color flags expected_base pr_cell
   for b in "${branches[@]}"; do
     if [[ "$b" == "$current" ]]; then
@@ -4379,7 +4403,8 @@ cmd_pr_list() {
     approvers="${data%%$'\x1f'*}";  data="${data#*$'\x1f'}"
     change_reqs="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
     req_reviewers="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
-    checks="$data"
+    checks="${data%%$'\x1f'*}";       data="${data#*$'\x1f'}"
+    merged_at="${data%%$'\x1f'*}";    merged_by="${data#*$'\x1f'}"
 
     # Strip the [N/M] prefix from the displayed title — the row order already
     # conveys position, so showing the prefix here is just visual noise.
@@ -4393,20 +4418,31 @@ cmd_pr_list() {
     flags=""
     case "$state" in
       CLOSED) flags+="${C_RED}${C_DIM}[closed]${C_RESET} " ;;
-      MERGED) flags+="${C_MAGENTA}${C_DIM}[merged]${C_RESET} " ;;
+      MERGED)
+        local merged_label="merged"
+        if [[ -n "$merged_by" ]]; then
+          merged_label+=" by ${merged_by}"
+        fi
+        if [[ -n "$merged_at" ]]; then
+          local rel_time
+          rel_time=$(_relative_time "$merged_at")
+          [[ -n "$rel_time" ]] && merged_label+=", ${rel_time}"
+        fi
+        flags+="${C_MAGENTA}${C_DIM}[${merged_label}]${C_RESET} "
+        ;;
     esac
     flags+="$(_upstream_status "$b") "
     if [[ "$is_draft" == "1" ]]; then
       flags+="${C_YELLOW}[draft]${C_RESET} "
     fi
 
-    # Base-mismatch check: only for active branches (skipped branches have
-    # no PR anyway, but be defensive).
+    # Base-mismatch check: only for active open PRs (merged/closed PRs may
+    # have a different base than the current stack target — that's expected).
     local in_active=0 a
     for a in "${ACTIVE[@]}"; do
       [[ "$a" == "$b" ]] && { in_active=1; break; }
     done
-    if (( in_active )); then
+    if (( in_active )) && [[ "$state" == "OPEN" ]]; then
       # Find expected base: previous *active* branch, or base0 for the bottom.
       local idx_in_active=-1 k
       for ((k = 0; k < ${#ACTIVE[@]}; k++)); do
