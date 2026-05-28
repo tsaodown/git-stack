@@ -2460,7 +2460,12 @@ cmd_move() {
     esac
   done
 
-  [[ -n "$src" ]] || die "usage: git stack move <branch> [--last|--first|--after <ref>|--at <ref>]"
+  # Default <branch> to the current branch when omitted.
+  if [[ -z "$src" ]]; then
+    src=$(current_branch) \
+      || die "usage: git stack move [<branch>] [--last|--first|--after <ref>|--at <ref>] [--allow-pr-rebuild]
+move: no <branch> given and HEAD is detached"
+  fi
 
   local n_pos=0
   (( opt_last )) && (( n_pos++ )) || true
