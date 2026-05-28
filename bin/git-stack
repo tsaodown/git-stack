@@ -1160,6 +1160,32 @@ _gh_pr_find() {
     2>/dev/null
 }
 
+# Return 0 (true) if ANY of the given branches has an open head PR on origin.
+# On true, sets _ORPHAN_PR_BRANCH and _ORPHAN_PR_NUM (globals) for the caller's
+# error message. On false (no open PRs found), returns 1 with empty globals.
+# Skips gracefully (returns 1) when gh isn't available or auth fails — same
+# preflight pattern as _post_rename_sync. GH_REPO must be set if gh is usable.
+# Usage: _check_no_open_prs <branch1> <branch2> ...
+_check_no_open_prs() {
+  _ORPHAN_PR_BRANCH=""
+  _ORPHAN_PR_NUM=""
+  command -v gh >/dev/null 2>&1 || return 1
+  gh auth status -h github.com >/dev/null 2>&1 || return 1
+  if [[ -z "${GH_REPO:-}" ]]; then
+    GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || return 1
+  fi
+  local b found
+  for b in "$@"; do
+    found=$(_gh_pr_find "$b")
+    if [[ -n "$found" ]]; then
+      _ORPHAN_PR_BRANCH="$b"
+      _ORPHAN_PR_NUM="${found%%$'\x1f'*}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Return 0 if PR <num> is merged on GitHub, 1 otherwise.
 _gh_pr_is_merged() {
   local state
@@ -1370,12 +1396,16 @@ ${b}Subcommands:${r}
                                     conflict, resolve + \`git stack continue\`.
                                     Cascades leaf renames + remote rename + pr
                                     sync, same as ${sub}new${r}.
-  ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}]
+  ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}] [${fl}--allow-pr-rebuild${r}]
                                     Atomically rename every branch in the stack
                                     from <old>/<leaf> to <new>/<leaf>, carrying
                                     backup refs along by default. Refuses if
                                     state file exists, branch checked out
                                     elsewhere, or any target name collides.
+                                    Also refuses if any branch has an open
+                                    head PR (same head-ref-deleted issue as
+                                    ${sub}move${r}); pass ${fl}--allow-pr-rebuild${r} to
+                                    proceed and rebuild the PRs.
   ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}]
           [${fl}--no-rename${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
                                     Detect and offer to fix problems in the
@@ -1989,20 +2019,21 @@ cmd_close() {
 
 cmd_rename() {
   OPT_PREFIX=""
-  local opt_dry_run=0 opt_no_history=0 new_pfx=""
+  local opt_dry_run=0 opt_no_history=0 opt_allow_pr_rebuild=0 new_pfx=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
       continue
     fi
     case "$1" in
-      --dry-run)    opt_dry_run=1; shift ;;
-      --no-history) opt_no_history=1; shift ;;
-      -*)           die "unknown rename flag: $1" ;;
-      *)            [[ -z "$new_pfx" ]] || die "rename: extra arg '$1'"; new_pfx="$1"; shift ;;
+      --dry-run)          opt_dry_run=1; shift ;;
+      --no-history)       opt_no_history=1; shift ;;
+      --allow-pr-rebuild) opt_allow_pr_rebuild=1; shift ;;
+      -*)                 die "unknown rename flag: $1" ;;
+      *)                  [[ -z "$new_pfx" ]] || die "rename: extra arg '$1'"; new_pfx="$1"; shift ;;
     esac
   done
-  [[ -n "$new_pfx" ]] || die "usage: git stack rename <new-prefix> [--dry-run] [--no-history]"
+  [[ -n "$new_pfx" ]] || die "usage: git stack rename <new-prefix> [--dry-run] [--no-history] [--allow-pr-rebuild]"
 
   require_in_repo
   require_clean_tree
@@ -2038,6 +2069,15 @@ cmd_rename() {
   for b in "${branches[@]}"; do
     require_branch_not_in_worktree "$b"
   done
+
+  # PR-orphan guard. Renaming the prefix renames every branch, which closes
+  # any open head PRs on GitHub. Refuse by default unless --allow-pr-rebuild
+  # or --no-push was passed.
+  if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )) && (( ! opt_dry_run )); then
+    if _check_no_open_prs "${branches[@]}"; then
+      die "rename would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated (a fresh PR opens for the renamed branch via 'pr sync')."
+    fi
+  fi
 
   local batch
   batch=$(emit_rename_batch "$old_pfx" "$new_pfx" $((1 - opt_no_history)))
