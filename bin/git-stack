@@ -4770,7 +4770,25 @@ gstkromp() {
   git fetch origin "$_b" && git stack restack --onto "origin/$_b" --push "$@"
 }
 gstkcl() {
-  git fetch --all --prune && git stack close "$@"
+  git fetch --all --prune || return
+  local _cur _track _b _prefix="" _leaf
+  _cur=$(git branch --show-current 2>/dev/null)
+  if [[ -n "$_cur" ]]; then
+    _track=$(git for-each-ref --format='%(upstream:track)' "refs/heads/$_cur" 2>/dev/null)
+    if [[ "$_track" == "[gone]" ]]; then
+      _leaf="${_cur##*/}"
+      if [[ "$_leaf" =~ ^[0-9]+- && "$_cur" == */* ]]; then
+        _prefix="${_cur%/*}/"
+      fi
+      _b=$(git stack default-branch) || return
+      git checkout "$_b" || return
+    fi
+  fi
+  if [[ -n "$_prefix" ]]; then
+    git stack close --prefix "$_prefix" "$@"
+  else
+    git stack close "$@"
+  fi
 }
 POSIX_EOF
 }
@@ -4802,7 +4820,28 @@ abbr -a -g gstkn git stack new
 abbr -a -g gstkmv git stack move
 abbr -a -g gstkrn git stack rename
 abbr -a -g gstkd git stack doctor
-abbr -a -g gstkcl "git fetch --all --prune; and git stack close"
+abbr --erase gstkcl 2>/dev/null; or true
+function gstkcl
+  git fetch --all --prune; or return
+  set -l _prefix ""
+  set -l _cur (git branch --show-current 2>/dev/null)
+  if test -n "$_cur"
+    set -l _track (git for-each-ref --format='%(upstream:track)' "refs/heads/$_cur" 2>/dev/null)
+    if test "$_track" = "[gone]"
+      set -l _leaf (string replace -r '^.+/' '' -- "$_cur")
+      if string match -qr '^[0-9]+-' -- "$_leaf"; and string match -q '*/*' -- "$_cur"
+        set _prefix (string replace -r '/[^/]+$' '/' -- "$_cur")
+      end
+      set -l _b (git stack default-branch); or return
+      git checkout "$_b"; or return
+    end
+  end
+  if test -n "$_prefix"
+    git stack close --prefix "$_prefix" $argv
+  else
+    git stack close $argv
+  end
+end
 FISH_EOF
 }
 
