@@ -662,11 +662,11 @@ HOOK
   run git stack pr list --no-fetch --no-color
   [ "$status" -eq 0 ]
   # First branch's expected base IS main, so no [base: X] flag on it.
-  local foo_line bar_line
-  foo_line=$(printf '%s\n' "$output" | grep 'feat/01-foo')
-  bar_line=$(printf '%s\n' "$output" | grep 'feat/02-bar')
-  [[ "$foo_line" != *"[base:"* ]]
-  [[ "$bar_line" == *"[base: main]"* ]]
+  local foo_block bar_block
+  foo_block=$(printf '%s\n' "$output" | grep -A 1 'feat/01-foo')
+  bar_block=$(printf '%s\n' "$output" | grep -A 1 'feat/02-bar')
+  [[ "$foo_block" != *"[base:"* ]]
+  [[ "$bar_block" == *"[base: main]"* ]]
 }
 
 @test "pr list: appends (Nc) comment-count suffix when comments > 0" {

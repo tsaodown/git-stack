@@ -1277,7 +1277,7 @@ _osc8_link() {
 
 _pr_link() {
   local n="$1"
-  _osc8_link "https://github.com/${GH_REPO}/pull/${n}" "${C_BLUE}${C_UNDERLINE}#${n}${C_RESET}"
+  _osc8_link "https://github.com/${GH_REPO}/pull/${n}" "#${n}"
 }
 
 # Inspect a PR for <branch> across all states (open/closed/merged). Emits one
@@ -4484,14 +4484,12 @@ cmd_pr_list() {
       local human_count
       human_count=$(gh api "repos/${GH_REPO}/issues/${num}/comments?per_page=100" --paginate \
         --jq '[.[] | select(.user.type != "Bot")] | length' \
-        2>/dev/null)
+        2>/dev/null) || true
       if [[ "$human_count" =~ ^[0-9]+$ ]]; then
         comments="$human_count"
       fi
-      if (( comments == 1 )); then
-        cnt_suffix="  ${C_DIM}(1 comment)${C_RESET}"
-      elif (( comments > 0 )); then
-        cnt_suffix="  ${C_DIM}(${comments} comments)${C_RESET}"
+      if (( comments > 0 )); then
+        cnt_suffix="  ${C_DIM}(${comments}c)${C_RESET}"
       fi
     fi
 
