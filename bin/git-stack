@@ -2244,7 +2244,7 @@ _pick_position_for_new() {
 
   # Step 1: pick reference branch.
   local ref_branch
-  ref_branch=$(_pick_one "insert before/after which branch?" "${branches[@]}") \
+  ref_branch=$(_pick_one "branch to insert before/after:" "${branches[@]}") \
     || return 1
 
   # Step 2: pick before/after.
@@ -2347,7 +2347,7 @@ cmd_new() {
   # If no slug was passed and we have a TTY, prompt for one. Non-TTY callers
   # still get the existing "slug is required" die from _validate_slug.
   if [[ -z "$slug" ]] && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
-    printf 'slug: ' >&2
+    printf '%sslug:%s ' "$C_DIM" "$C_RESET" >&2
     read -r slug < /dev/tty || die "new: aborted"
   fi
 
@@ -2391,7 +2391,7 @@ cmd_new() {
       picked=$(_pick_one "select stack prefix:" "${picker_items[@]}") \
         || die "new: no prefix selected"
       if [[ "$picked" == "[new prefix...]" ]]; then
-        printf 'prefix (without trailing /): ' >&2
+        printf '%sprefix (without trailing /):%s ' "$C_DIM" "$C_RESET" >&2
         local typed
         read -r typed < /dev/tty || die "new: aborted"
         prefix="${typed%/}/"
@@ -3215,7 +3215,7 @@ _doctor_delete_branch() {
 _doctor_prompt() {
   local prompt="$1"
   [[ -e /dev/tty ]] || return 1
-  printf '%s' "$prompt" >&2
+  printf '%s%s%s' "$C_DIM" "$prompt" "$C_RESET" >&2
   local ans
   read -r ans < /dev/tty || return 1
   # Portable lowercase (bash 3.2 on macOS lacks ${var,,}).
@@ -4568,9 +4568,9 @@ _pick_branch() {
   printf 'select branch (%s):\n' "$label" >&2
   for b in "$@"; do
     if (( i == cur_idx )); then
-      printf '* %2d) %s\n' "$i" "$b" >&2
+      printf '* %2d) %s%s%s\n' "$i" "$C_CYAN" "$b" "$C_RESET" >&2
     else
-      printf '  %2d) %s\n' "$i" "$b" >&2
+      printf '  %2d) %s%s%s\n' "$i" "$C_CYAN" "$b" "$C_RESET" >&2
     fi
     i=$((i + 1))
   done
@@ -4601,7 +4601,7 @@ cmd_checkout_interactive() {
         labels+=("${p:-<top-level>}")
       done
       local picked_label
-      picked_label=$(_pick_one "select stack" "${labels[@]}") \
+      picked_label=$(_pick_one "select stack:" "${labels[@]}") \
         || die "no stack selected"
       local i
       for ((i = 0; i < ${#labels[@]}; i++)); do
