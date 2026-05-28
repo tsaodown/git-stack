@@ -2442,7 +2442,7 @@ cmd_new() {
 
 cmd_move() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local src="" opt_last=0 opt_first=0 opt_after="" opt_at=""
+  local src="" opt_last=0 opt_first=0 opt_after="" opt_at="" opt_allow_pr_rebuild=0
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -2453,6 +2453,7 @@ cmd_move() {
       --first)   opt_first=1; shift ;;
       --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
       --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
+      --allow-pr-rebuild) opt_allow_pr_rebuild=1; shift ;;
       --force)   OPT_FORCE=1; shift ;;
       -*)        die "unknown move flag: $1" ;;
       *)         [[ -z "$src" ]] || die "move: extra arg '$1'"; src="$1"; shift ;;
@@ -2599,6 +2600,20 @@ cmd_move() {
   for ((i = first_affected; i < ${#post[@]}; i++)); do
     require_branch_not_in_worktree "${post[$i]}"
   done
+
+  # PR-orphan guard. The cherry-pick reflow rewrites each affected branch's
+  # commits (changing its tip SHA) and the post-rename phase changes leaf
+  # numbers. Both invalidate any open PR for those branches. Refuse by default
+  # when --allow-pr-rebuild was not passed.
+  if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
+    local affected=()
+    for ((i = first_affected; i < ${#post[@]}; i++)); do
+      affected+=("${post[$i]}")
+    done
+    if _check_no_open_prs "${affected[@]}"; then
+      die "move would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated."
+    fi
+  fi
 
   # Snapshot before mutation.
   snapshot_stack move "$prefix" "${branches[@]}"
