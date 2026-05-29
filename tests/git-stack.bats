@@ -1613,6 +1613,53 @@ make_conflicting_dups() {
   [ "$status" -ne 0 ]
 }
 
+# Doctor's remote tail (remote rename + pr sync for renumbered branches) now
+# runs through the engine as the final phase, after the local reflow. A remote
+# failure must retain state so 'continue' retries it — matching cmd_move/rename.
+@test "doctor: remote rename failure is resumable; continue completes the tail" {
+  make_dup_siblings
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_STUB_FAIL_RENAME="feat/02-c"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  [ "$status" -ne 0 ]
+  # Local renumber + reflow already applied before the remote tail ran.
+  git rev-parse --verify --quiet refs/heads/feat/03-c || return 1
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c || return 1
+  # State retained at the remote-sync phase → resumable.
+  [ -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  unset GH_STUB_FAIL_RENAME
+  run git stack continue --no-color
+  [ "$status" -eq 0 ]
+  [ ! -f "$(git rev-parse --git-dir)/stack-rebase-state" ]
+}
+
+# Aborting the combined (reflow-pick, remote-sync) plan at the remote-sync pause
+# walks back through reflow-pick too: it restores the reflowed branch to its
+# captured (post-rename, pre-reflow) SHA and clears state. The local rename was
+# applied outside the engine, so it persists — doctor's snapshot remains the
+# recovery path for that.
+@test "doctor: abort after remote failure unwinds reflow, keeps rename, clears state" {
+  make_dup_siblings
+  local orig_c
+  orig_c=$(git rev-parse refs/heads/feat/02-c)
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_STUB_FAIL_RENAME="feat/02-c"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  [ "$status" -ne 0 ]
+  [ -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  run git stack abort --no-color
+  [ "$status" -eq 0 ]
+  [ ! -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  # Rename kept (applied outside the engine); reflow unwound to the captured SHA.
+  git rev-parse --verify --quiet refs/heads/feat/03-c || return 1
+  [ "$(git rev-parse refs/heads/feat/03-c)" = "$orig_c" ] || return 1
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+}
+
 @test "doctor --dry-run: lists duplicate leaf group without applying" {
   make_dup_siblings
   local sha_b sha_c
@@ -1717,6 +1764,75 @@ make_conflicting_dups() {
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -eq 0 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
+}
+
+# The remote tail (remote rename + pr sync) must be resumable: a remote-rename
+# failure after the local renames are applied retains engine state so 'continue'
+# can retry the idempotent remote-sync phase, instead of leaving the user with a
+# half-done rename and only a manual-recovery hint.
+@test "rename: remote rename failure is resumable; continue completes the tail" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_STUB_FAIL_RENAME="feat/01-a"
+  run git stack rename newfeat --no-color
+  [ "$status" -ne 0 ]
+  # Local rename already applied (atomic, before the remote tail).
+  git rev-parse --verify --quiet refs/heads/newfeat/01-a || return 1
+  # State retained → resumable (the inline path left no state file).
+  [ -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  # Retry the remote tail; it is idempotent.
+  unset GH_STUB_FAIL_RENAME
+  run git stack continue --no-color
+  [ "$status" -eq 0 ]
+  # State cleared on full completion.
+  [ ! -f "$(git rev-parse --git-dir)/stack-rebase-state" ]
+}
+
+# Finalize checkout edge: when HEAD is on main (not a stack branch), the engine
+# must finalize back to main — never to a now-deleted old branch name.
+@test "rename from main: completes via engine and leaves HEAD on main" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git checkout -q main
+  run git stack rename newfeat --prefix feat --no-color
+  [ "$status" -eq 0 ]
+  [ "$(git symbolic-ref --short HEAD)" = "main" ] || return 1
+  git rev-parse --verify --quiet refs/heads/newfeat/01-a || return 1
+  ! git rev-parse --verify --quiet refs/heads/feat/01-a
+}
+
+# Finalize checkout edge: when HEAD was on a renamed stack branch, finalize must
+# check out the NEW name (the old ref is gone).
+@test "rename: HEAD on a stack branch follows to the renamed branch" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git checkout -q feat/01-a
+  run git stack rename newfeat --no-color
+  [ "$status" -eq 0 ]
+  [ "$(git symbolic-ref --short HEAD)" = "newfeat/01-a" ]
+}
+
+# Abort after a remote failure: returns to the starting branch and clears state.
+# The local rename is NOT undone (remote effects can't be auto-reversed), so the
+# renamed branches persist — abort only warns about the remote tail.
+@test "rename: abort after remote failure returns to main and clears state" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_STUB_FAIL_RENAME="feat/01-a"
+  git checkout -q main
+  run git stack rename newfeat --prefix feat --no-color
+  [ "$status" -ne 0 ]
+  [ -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  run git stack abort --no-color
+  [ "$status" -eq 0 ]
+  [ "$(git symbolic-ref --short HEAD)" = "main" ] || return 1
+  [ ! -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  # Local rename was applied before the remote tail and is left in place.
+  git rev-parse --verify --quiet refs/heads/newfeat/01-a
 }
 
 # ---------- new/move history interop ----------

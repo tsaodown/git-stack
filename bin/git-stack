@@ -1005,8 +1005,19 @@ _engine_finalize() {
      git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
     git checkout --quiet "$STACK_STARTING_BRANCH"
   fi
-  local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
-  log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
+  # Tailor the completion line to what the plan actually did: a reflow reports
+  # the branch count; a remote-only plan (rename / doctor renumber tail) didn't
+  # restack anything, so don't claim it did.
+  local p saw_reflow=0
+  for p in "${STACK_PHASES[@]+"${STACK_PHASES[@]}"}"; do
+    [[ "$p" == reflow-pick ]] && { saw_reflow=1; break; }
+  done
+  if (( saw_reflow )); then
+    local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
+    log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
+  else
+    log "${C_GREEN}done${C_RESET}    remote sync complete"
+  fi
   clear_state
 }
 
@@ -2505,17 +2516,41 @@ cmd_rename() {
 
   log "${C_GREEN}done${C_RESET}    rename complete"
 
-  # Stage 2 + 3: remote rename + pr sync. Build pairs from old branches → new prefix names.
+  # Stage 2 + 3: remote rename + pr sync. Routed through the engine's
+  # remote-sync phase (a one-phase plan) so a remote failure pauses with state
+  # retained — 'continue' retries the idempotent phase — instead of dying with
+  # only a manual-recovery hint. The local rename above stays inline: it does
+  # stack.prefix config + HEAD retargeting that the generic rename-batch phase
+  # doesn't cover.
   if (( ! OPT_NO_PUSH )); then
-    local rename_pairs=() b leaf
+    local b leaf
+    STACK_RENAME_PAIRS=()
+    STACK_BRANCHES=()
     for b in "${branches[@]}"; do
       leaf="${b##*/}"
-      rename_pairs+=("$b" "${new_pfx}/${leaf}")
+      STACK_RENAME_PAIRS+=("$b" "${new_pfx}/${leaf}")
+      STACK_BRANCHES+=("${new_pfx}/${leaf}")
     done
-    if (( ${#rename_pairs[@]} > 0 )); then
-      _remote_rename_batch_or_skip "${rename_pairs[@]}"
-    fi
-    _post_rename_sync "$new_pfx"
+    STACK_PREFIX="$new_pfx"
+    STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
+    STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
+    # Capture the starting branch AFTER the inline rename retargeted HEAD, so
+    # finalize/abort check out the new name (or main, if HEAD was not on the
+    # renamed stack) — never the now-deleted old name.
+    STACK_STARTING_BRANCH=$(current_branch 2>/dev/null || echo "")
+    STACK_STARTED_AT=$(date +%s)
+    STACK_ORIG_SHAS=()
+    STACK_PUSH_FAILURES=()
+    STACK_FROM_IDX=${#STACK_BRANCHES[@]}
+    STACK_PUSH=0
+    STACK_FORCE=0
+    STACK_ONTO=""
+    STACK_ONTO_REF=""
+    STACK_PHASES=(remote-sync)
+    STACK_PHASE_IDX=0
+    STACK_UNIT_IDX=0
+    save_engine_state
+    _engine_run
   fi
 }
 
@@ -3401,10 +3436,11 @@ _doctor_check_rename_collisions() {
 }
 
 # Apply a confirmed batch of renames atomically via git update-ref --stdin.
-# Caller is responsible for snapshot + collision check.
-# Usage: _doctor_apply_renames_batch <prefix> <rename_pairs>...
+# Local-only: the remote tail (remote rename + pr sync) is driven separately by
+# cmd_doctor's finish phase through the engine, so it's resumable and runs after
+# the reflow. Caller is responsible for snapshot + collision check.
+# Usage: _doctor_apply_renames_batch <rename_pairs>...
 _doctor_apply_renames_batch() {
-  local prefix="$1"; shift
   local pairs=("$@")
   (( ${#pairs[@]} > 0 )) || return 0
 
@@ -3441,11 +3477,6 @@ _doctor_apply_renames_batch() {
   fi
 
   log "${C_GREEN}doctor${C_RESET}  renamed ${C_BOLD}$((${#pairs[@]} / 2))${C_RESET} branch(es)"
-
-  if (( ! OPT_NO_PUSH )); then
-    _remote_rename_batch_or_skip "${pairs[@]}"
-    _post_rename_sync "$prefix"
-  fi
 }
 
 # Walk a stack and emit one line per group of branches sharing a leaf number.
@@ -3707,42 +3738,64 @@ _doctor_print_issue_header() {
     "$C_DIM" "$label" "$C_RESET" >&2
 }
 
-# Run the engine over the (possibly mutated) branch list to re-thread any
-# branches above a squash whose parent SHAs are now stale. Captures CURRENT
-# SHAs (post-squash) so do_one_step's skip checks see the new state.
-# Usage: _doctor_reflow_upper <prefix> <parent_ref> <from_idx> <branch>...
-_doctor_reflow_upper() {
-  local prefix="$1" parent_ref="$2" from_idx="$3"; shift 3
+# Finish a doctor run as ONE resumable engine plan, composing:
+#   - reflow-pick   when from_idx is in range (stale predecessors to re-thread
+#                   after a squash/sweep or duplicate renumber)
+#   - remote-sync   when renames were applied this run and push is enabled
+# Driving both through a single plan means 'continue'/'abort' carry the whole
+# remainder, and the remote tail (remote rename + pr sync) is the genuine last
+# step — pr sync reflects the reflowed SHAs, and a remote failure pauses with
+# state retained rather than dying with a manual-recovery hint. The caller sets
+# STACK_RENAME_PAIRS to the applied renames (alternating old/new); empty ⇒ no
+# remote tail. Returns 0 (no plan) when there's nothing to do.
+# Usage: _doctor_finish <prefix> <from_idx> <branch>...
+_doctor_finish() {
+  local prefix="$1" from_idx="$2"; shift 2
   local branches=("$@")
+
+  local want_reflow=0 want_remote=0
+  (( from_idx >= 0 && from_idx < ${#branches[@]} )) && want_reflow=1
+  (( ${#STACK_RENAME_PAIRS[@]} > 0 && ! OPT_NO_PUSH )) && want_remote=1
+  (( want_reflow || want_remote )) || return 0
 
   STACK_BRANCHES=("${branches[@]}")
   STACK_ORIG_SHAS=()
-  local i
-  for ((i = 0; i < ${#branches[@]}; i++)); do
-    STACK_ORIG_SHAS+=("$(git rev-parse "refs/heads/${branches[$i]}")")
-  done
-
+  STACK_PUSH_FAILURES=()
   STACK_STARTED_AT=$(date +%s)
   STACK_STARTING_BRANCH=$(current_branch 2>/dev/null || echo "")
   STACK_PREFIX="$prefix"
   STACK_PUSH=0
-  # --force is safe here: every multi-commit / merge-tip branch was already
-  # either squashed or marked absorbed during the squash + sweep phases. Any
-  # remaining "ahead by >1" count is purely from stale predecessor ancestry
-  # left in the upper branches' history — do_one_step's tip-only cherry-pick
-  # is exactly the right behavior for that case. If a user skipped squashing
-  # a real multi-commit branch, doctor's snapshot lets them roll back.
-  STACK_FORCE=1
   STACK_ONTO=""
   STACK_ONTO_REF=""
-  STACK_FROM_IDX="$from_idx"
-  STACK_PUSH_FAILURES=()
-  # Plan: a single reflow-pick phase over branches [from_idx .. last].
-  STACK_PHASES=(reflow-pick)
+  STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
+  STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
+  STACK_PHASES=()
   STACK_PHASE_IDX=0
   STACK_UNIT_IDX=0
 
-  snapshot_stack doctor-reflow "$prefix" "${STACK_BRANCHES[@]}"
+  if (( want_reflow )); then
+    local i
+    for ((i = 0; i < ${#branches[@]}; i++)); do
+      STACK_ORIG_SHAS+=("$(git rev-parse "refs/heads/${branches[$i]}")")
+    done
+    # --force is safe here: every multi-commit / merge-tip branch was already
+    # either squashed or marked absorbed during the squash + sweep phases. Any
+    # remaining "ahead by >1" count is purely from stale predecessor ancestry
+    # left in the upper branches' history — do_one_step's tip-only cherry-pick
+    # is exactly the right behavior for that case. If a user skipped squashing
+    # a real multi-commit branch, doctor's snapshot lets them roll back.
+    STACK_FORCE=1
+    STACK_FROM_IDX="$from_idx"
+    STACK_PHASES+=(reflow-pick)
+    log ""
+    log "${C_DIM}reflow${C_RESET}  re-threading branches from index $from_idx"
+    snapshot_stack doctor-reflow "$prefix" "${STACK_BRANCHES[@]}"
+  else
+    STACK_FORCE=0
+    STACK_FROM_IDX=${#STACK_BRANCHES[@]}
+  fi
+  (( want_remote )) && STACK_PHASES+=(remote-sync)
+
   save_engine_state
   _engine_run
 }
@@ -3872,6 +3925,9 @@ cmd_doctor() {
   local lowest_dup_idx=-1
   local apply_all=$(( opt_yes ))
   local user_quit=0
+  # Renames applied this run (alternating old/new), carried to the finish phase
+  # so its remote tail (remote rename + pr sync) runs after the reflow.
+  local doctor_rename_pairs=()
 
   # ----- Squash phase (bottom-up, applies immediately) -----
 
@@ -4116,7 +4172,8 @@ cmd_doctor() {
       done
 
       if (( ${#confirmed[@]} > 0 )); then
-        _doctor_apply_renames_batch "$prefix" "${confirmed[@]}"
+        _doctor_apply_renames_batch "${confirmed[@]}"
+        doctor_rename_pairs=("${confirmed[@]}")
         # Renames mutate ref names — reload branches for reflow.
         branches=()
         _load_stack_branches "$prefix" branches
@@ -4178,15 +4235,20 @@ cmd_doctor() {
     done
   fi
 
-  # ----- Reflow phase -----
+  # ----- Finish phase: reflow + remote tail, as one resumable engine plan -----
   #
-  # Two independent triggers can require re-threading:
+  # Reflow re-threads branches whose positional predecessor SHA went stale. Two
+  # independent triggers:
   #   - squash: branches above a squashed branch must be replayed onto its
   #     new (single-commit) tip. Start at lowest_squash_idx + 1.
   #   - duplicate cascade: branches that got renumbered have a new positional
   #     predecessor whose tip is a different commit than their actual parent.
   #     Start at lowest_dup_idx (the first renumbered slot).
   # When both fire, take the lower index so the cascade covers everything.
+  # The remote tail (remote rename + pr sync for any applied renames) is folded
+  # into the same plan so it runs *after* the reflow and is itself resumable.
+  # Reflow is skipped after a user quit; the remote tail still runs for renames
+  # already confirmed and applied this run (keeping local and remote in sync).
 
   local reflow_from=-1
   if (( applied_squash > 0 && lowest_squash_idx >= 0 )); then
@@ -4197,11 +4259,9 @@ cmd_doctor() {
       reflow_from=$lowest_dup_idx
     fi
   fi
-  if (( reflow_from >= 0 && reflow_from < ${#branches[@]} && ! user_quit )); then
-    log ""
-    log "${C_DIM}reflow${C_RESET}  re-threading branches from index $reflow_from"
-    _doctor_reflow_upper "$prefix" "$parent_ref" "$reflow_from" "${branches[@]}"
-  fi
+  (( user_quit )) && reflow_from=-1
+  STACK_RENAME_PAIRS=("${doctor_rename_pairs[@]+"${doctor_rename_pairs[@]}"}")
+  _doctor_finish "$prefix" "$reflow_from" "${branches[@]}"
 
   log ""
   if (( user_quit )); then
