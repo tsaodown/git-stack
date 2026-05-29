@@ -1260,6 +1260,23 @@ _pr_template_body() {
   return 0
 }
 
+# Filter stdin -> stdout, normalizing a PR body for round-trip-tolerant
+# comparison: strip CR (CRLF -> LF) and drop trailing blank/whitespace-only
+# lines. Used comparison-only in the reconciler — GitHub may re-emit a stored
+# body with CRLF or an extra trailing newline, which would otherwise look like a
+# body change on the next sync. Internal whitespace is preserved (never sent to
+# gh; the canonical desired body is what we write).
+_pr_body_normalize() {
+  tr -d '\r' | awk '
+    { lines[NR]=$0; last=NR }
+    END {
+      end=last
+      while (end > 0 && lines[end] ~ /^[[:space:]]*$/) end--
+      for (i=1; i<=end; i++) print lines[i]
+    }
+  '
+}
+
 # Filter stdin -> stdout, removing the fenced nav-footer block (inclusive of
 # both fence comments) plus any trailing blank lines. Idempotent.
 _pr_strip_nav_footer() {
@@ -1290,6 +1307,92 @@ _pr_extract_nav_pr_nums() {
       printf '%s\n' "${BASH_REMATCH[1]}"
       tmp="${tmp#*#${BASH_REMATCH[1]}}"
     done
+  done
+}
+
+# Pure lineage guard for merged-predecessor weaving. From an old nav-footer's
+# PR numbers, return those no longer in the active stack that are candidates
+# for "merged predecessor" rendering — but only when the old footer belongs to
+# this stack's lineage. Two sufficient signals: (a) another non-self old-footer
+# PR is still active (partial merge), or (b) self appears in the old footer
+# (proof a prior pr sync on this PR wrote it). Without a signal, the old footer
+# is unrelated and nothing is mined. No gh — the caller checks merged-status of
+# the returned candidates.
+# Usage: _merged_predecessor_candidates <self_num> <active_nums_csv> <old_num>...
+# Prints candidate PR numbers, one per line, in input order.
+_merged_predecessor_candidates() {
+  local self="$1" active_csv="$2"; shift 2
+  local n guard=0
+  for n in "$@"; do
+    [[ -z "$n" ]] && continue
+    if [[ "$n" == "$self" ]]; then guard=1; continue; fi
+    case ",$active_csv," in *",$n,"*) guard=1 ;; esac
+  done
+  (( guard )) || return 0
+  for n in "$@"; do
+    [[ -z "$n" ]] && continue
+    [[ "$n" == "$self" ]] && continue
+    case ",$active_csv," in *",$n,"*) continue ;; esac
+    printf '%s\n' "$n"
+  done
+}
+
+# Effectful gather step for merged-predecessor weaving. The pure lineage guard
+# (_merged_predecessor_candidates) selects which old-footer numbers are worth
+# checking; gh then confirms merged-status and fetches each title. Emits one
+# "num<TAB>title" line per confirmed merged predecessor (none -> no output), in
+# candidate order. This is the only gh touch the reconciler needs — its output
+# feeds the pure _pr_weave_footer_triples.
+# Usage: _pr_gather_merged_preds <self_num> <active_csv> <old_num>...
+_pr_gather_merged_preds() {
+  local self="$1" active_csv="$2"; shift 2
+  local cand mt
+  while IFS= read -r cand; do
+    [[ -z "$cand" ]] && continue
+    if _gh_pr_is_merged "$cand"; then
+      mt=$(gh pr view "$cand" --repo "$GH_REPO" --json title --jq '.title' 2>/dev/null) \
+        || mt="PR #$cand"
+      printf '%s\t%s\n' "$cand" "$mt"
+    fi
+  done < <(_merged_predecessor_candidates "$self" "$active_csv" "$@")
+}
+
+# Pure: assemble a PR nav-footer's body triples, encoding merged-predecessor
+# prepend + strikethrough-on-position-change. No gh, no git. The reconciler's
+# core presentation rule, extracted from cmd_pr_sync pass 2 so it's unit-tested
+# in isolation. Output: one TAB-separated triple per line
+# "<branch>\t<num>\t<display_title>" (the arg vector _pr_render_nav_footer wants
+# after the leading <self>). An empty branch field marks a merged predecessor
+# (rendered struck-through). Active entries get a "[pos/N]" prefix; the old
+# bracketed position is struck through as "~~[old]~~ [new]" ONLY when the entry's
+# number is in <old_nums_csv> (this PR's prior footer, exact-match) AND its
+# position actually moved — so a fresh entry, or an unchanged position, stays plain.
+# Usage: _pr_weave_footer_triples <old_nums_csv> [<m_num> <m_title>]... -- <a_branch> <a_num> <a_title>...
+_pr_weave_footer_triples() {
+  local old_csv="$1"; shift
+  # Merged predecessors first, up to the "--" separator.
+  while (( $# > 0 )) && [[ "$1" != "--" ]]; do
+    printf '\t%s\t%s\n' "$1" "${2-}"
+    shift 2
+  done
+  [[ "${1-}" == "--" ]] && shift
+  # Active entries: position is the 1-based ordinal among the remaining triples.
+  local n_active=$(( $# / 3 )) pos=0
+  while (( $# >= 3 )); do
+    local a_branch="$1" a_num="$2" a_title="$3"; shift 3
+    pos=$(( pos + 1 ))
+    local new_pos="[$pos/$n_active]" old_pos="" bare="$a_title"
+    if [[ "$a_title" =~ ^\[([0-9]+/[0-9]+)\][[:space:]](.*)$ ]]; then
+      old_pos="[${BASH_REMATCH[1]}]"
+      bare="${BASH_REMATCH[2]}"
+    fi
+    local in_old=0
+    case ",$old_csv," in *",$a_num,"*) in_old=1 ;; esac
+    if (( in_old )) && [[ -n "$old_pos" && "$old_pos" != "$new_pos" ]]; then
+      printf '%s\t%s\t~~%s~~ %s %s\n' "$a_branch" "$a_num" "$old_pos" "$new_pos" "$bare"
+    else
+      printf '%s\t%s\t%s %s\n' "$a_branch" "$a_num" "$new_pos" "$bare"
+    fi
   done
 }
 
@@ -4477,11 +4580,34 @@ cmd_pr_sync() {
     fi
   done
 
-  # --- pass 2: rewrite title + body + base with full chain context ---
+  # --- reconcile: pure desired-state computation -> edit plan ---
+  # Map the gathered chain-state (PR_* arrays) to a per-PR edit plan held in the
+  # PLAN_* arrays. The only gh touch is the isolated merged-predecessor gather
+  # (_pr_gather_merged_preds); every presentation rule — [N/M] prefix,
+  # strikethrough on position change, nav-footer weave, round-trip-tolerant
+  # change detection — runs through the pure _pr_* helpers. `apply` (below)
+  # owns all the writes, so `--dry-run` is just "reconcile, then skip apply".
+  local PLAN_ACTION=() PLAN_NUM=() PLAN_BRANCH=()
+  local PLAN_TITLE_CHANGED=() PLAN_BODY_CHANGED=() PLAN_BASE_CHANGED=()
+  local PLAN_DESIRED_TITLE=() PLAN_DESIRED_BODY=() PLAN_CUR_BASE=() PLAN_PARENT=()
+  local k
+  # Active chain as flat (branch, num, title) triples — the same for every PR's
+  # weave, so build it once.
+  local active_flat=()
+  for ((k = 0; k < N; k++)); do
+    active_flat+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${PR_TITLES[k]}")
+  done
   for ((j = 0; j < N; j++)); do
     b="${ACTIVE[j]}"
     local num="${PR_NUMS[j]}"
-    [[ "$num" == "?" ]] && continue   # creation failed; skip update
+    PLAN_NUM+=("$num")
+    PLAN_BRANCH+=("$b")
+    if [[ "$num" == "?" ]]; then          # creation failed; nothing to apply
+      PLAN_ACTION+=("skip")
+      PLAN_TITLE_CHANGED+=(0); PLAN_BODY_CHANGED+=(0); PLAN_BASE_CHANGED+=(0)
+      PLAN_DESIRED_TITLE+=(""); PLAN_DESIRED_BODY+=(""); PLAN_CUR_BASE+=(""); PLAN_PARENT+=("")
+      continue
+    fi
     if (( j == 0 )); then
       parent="$base0"
     else
@@ -4495,70 +4621,35 @@ cmd_pr_sync() {
     desired_title=$(_pr_title_with_pos "$((j+1))" "$N" "$cur_title" "$leaf")
     local stripped
     stripped=$(printf '%s' "$cur_body" | _pr_strip_nav_footer)
-    # Detect merged predecessors: PR numbers in the old footer that are no
-    # longer in the active stack and have since been merged on GitHub.
-    # Guard: only do this when the old footer is from the same stack lineage.
-    # Two sufficient signals: (a) another non-self PR from the old footer is
-    # still active — typical for partial merges; (b) self appears in the old
-    # footer — proof this footer was written by a prior pr sync on this exact
-    # PR, covering the case where every sibling was merged.
-    local old_pr_nums merged_nums=() merged_titles=()
+    # The old footer's PR numbers drive both the merged-predecessor gather and
+    # the strikethrough gate (a number is struck through only if it was in this
+    # PR's prior footer). Keep them as a newline list (for the gather, which
+    # splits) and a CSV (for the pure weave's exact-match membership test).
+    local old_pr_nums old_csv=""
     old_pr_nums=$(printf '%s' "$cur_body" | _pr_extract_nav_pr_nums)
-    local old_num other_in_active=0 self_in_footer=0
-    while IFS= read -r old_num; do
-      [[ -z "$old_num" ]] && continue
-      if [[ "$old_num" == "$num" ]]; then
-        self_in_footer=1
-        continue
-      fi
-      local k
-      for ((k = 0; k < N; k++)); do
-        if [[ "${PR_NUMS[k]}" == "$old_num" ]]; then
-          other_in_active=1
-          break
-        fi
-      done
-      (( other_in_active )) && break
+    local on
+    while IFS= read -r on; do
+      [[ -n "$on" ]] && old_csv="${old_csv:+$old_csv,}$on"
     done <<< "$old_pr_nums"
-    if (( other_in_active || self_in_footer )); then
-      while IFS= read -r old_num; do
-        [[ -z "$old_num" ]] && continue
-        local found=0 k
-        for ((k = 0; k < N; k++)); do
-          [[ "${PR_NUMS[k]}" == "$old_num" ]] && found=1 && break
-        done
-        (( found )) && continue
-        if _gh_pr_is_merged "$old_num"; then
-          local mt
-          mt=$(gh pr view "$old_num" --repo "$GH_REPO" --json title --jq '.title' 2>/dev/null) \
-            || mt="PR #$old_num"
-          merged_nums+=("$old_num")
-          merged_titles+=("$mt")
-        fi
-      done <<< "$old_pr_nums"
-    fi
+    local active_csv=""
+    for ((k = 0; k < N; k++)); do active_csv="${active_csv:+$active_csv,}${PR_NUMS[k]}"; done
+    # Gather merged predecessors (effectful), then weave the footer triples (pure).
+    local merged_flat=()
+    local mn mt
+    while IFS=$'\t' read -r mn mt; do
+      [[ -z "$mn" ]] && continue
+      merged_flat+=("$mn" "$mt")
+    done < <(_pr_gather_merged_preds "$num" "$active_csv" $old_pr_nums)
     local footer_args=("$b")
-    for ((k = 0; k < ${#merged_nums[@]}; k++)); do
-      footer_args+=("" "${merged_nums[k]}" "${merged_titles[k]}")
-    done
-    for ((k = 0; k < N; k++)); do
-      local act_title="${PR_TITLES[k]}"
-      local new_pos="[$((k+1))/$N]"
-      local old_pos="" bare_title="$act_title"
-      if [[ "$act_title" =~ ^\[([0-9]+/[0-9]+)\][[:space:]](.*)$ ]]; then
-        old_pos="[${BASH_REMATCH[1]}]"
-        bare_title="${BASH_REMATCH[2]}"
-      fi
-      local display_title
-      if grep -qxF "${PR_NUMS[k]}" <<< "$old_pr_nums" \
-         && [[ -n "$old_pos" ]] \
-         && [[ "$old_pos" != "$new_pos" ]]; then
-        display_title="~~${old_pos}~~ ${new_pos} ${bare_title}"
-      else
-        display_title="${new_pos} ${bare_title}"
-      fi
-      footer_args+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "$display_title")
-    done
+    local wline wb wn wt rest
+    # Split each TAB triple by hand: a merged predecessor has an empty leading
+    # (branch) field, and `IFS=$'\t' read` would strip it (TAB is IFS
+    # whitespace), shifting the fields left. Parameter expansion preserves it.
+    while IFS= read -r wline; do
+      wb="${wline%%$'\t'*}"; rest="${wline#*$'\t'}"
+      wn="${rest%%$'\t'*}"; wt="${rest#*$'\t'}"
+      footer_args+=("$wb" "$wn" "$wt")
+    done < <(_pr_weave_footer_triples "$old_csv" "${merged_flat[@]+"${merged_flat[@]}"}" -- "${active_flat[@]}")
     local footer
     footer=$(_pr_render_nav_footer "${footer_args[@]}")
     local desired_body
@@ -4567,18 +4658,41 @@ cmd_pr_sync() {
     else
       desired_body="$footer"
     fi
-    # Real GitHub may normalize bodies on the round-trip (trailing newline,
-    # CRLF -> LF). On a first re-sync after a fresh create, this can cause a
-    # spurious body_changed=1 even when nothing meaningful changed — at worst
-    # one redundant `gh pr edit` per PR, after which state stabilizes.
+    # Compare normalized bodies so a GitHub round-trip (CRLF / trailing newline)
+    # doesn't look like a body change. The desired body we write stays canonical
+    # — normalization is comparison-only.
     local title_changed=0 body_changed=0 base_changed=0
     [[ "$desired_title" != "$cur_title" ]] && title_changed=1
-    [[ "$desired_body" != "$cur_body" ]] && body_changed=1
+    local norm_desired norm_cur
+    norm_desired=$(printf '%s' "$desired_body" | _pr_body_normalize)
+    norm_cur=$(printf '%s' "$cur_body" | _pr_body_normalize)
+    [[ "$norm_desired" != "$norm_cur" ]] && body_changed=1
     [[ "$parent" != "$cur_base" ]] && base_changed=1
+    PLAN_TITLE_CHANGED+=("$title_changed")
+    PLAN_BODY_CHANGED+=("$body_changed")
+    PLAN_BASE_CHANGED+=("$base_changed")
+    PLAN_DESIRED_TITLE+=("$desired_title")
+    PLAN_DESIRED_BODY+=("$desired_body")
+    PLAN_CUR_BASE+=("$cur_base")
+    PLAN_PARENT+=("$parent")
     if (( ! title_changed && ! body_changed && ! base_changed )); then
+      PLAN_ACTION+=("none")
+    else
+      PLAN_ACTION+=("edit")
+    fi
+  done
+
+  # --- apply: execute the edit plan (all gh writes live here) ---
+  for ((j = 0; j < N; j++)); do
+    local action="${PLAN_ACTION[j]}"
+    local num="${PLAN_NUM[j]}"
+    b="${PLAN_BRANCH[j]}"
+    [[ "$action" == "skip" ]] && continue
+    if [[ "$action" == "none" ]]; then
       log_v "${C_DIM}ok${C_RESET}      $(_pr_link "$num") ${C_CYAN}$b${C_RESET}"
       continue
     fi
+    local title_changed="${PLAN_TITLE_CHANGED[j]}" body_changed="${PLAN_BODY_CHANGED[j]}" base_changed="${PLAN_BASE_CHANGED[j]}"
     if (( opt_dry_run )); then
       local tc bc bsc
       (( title_changed )) && tc=yes || tc=no
@@ -4588,12 +4702,12 @@ cmd_pr_sync() {
       continue
     fi
     local pass_title="" pass_body="" pass_base=""
-    (( title_changed )) && pass_title="$desired_title"
-    (( body_changed ))  && pass_body="$desired_body"
-    (( base_changed ))  && pass_base="$parent"
+    (( title_changed )) && pass_title="${PLAN_DESIRED_TITLE[j]}"
+    (( body_changed ))  && pass_body="${PLAN_DESIRED_BODY[j]}"
+    (( base_changed ))  && pass_base="${PLAN_PARENT[j]}"
     if _gh_pr_edit "$num" "$pass_title" "$pass_body" "$pass_base"; then
       if (( base_changed )); then
-        log "${C_BLUE}update${C_RESET}  $(_pr_link "$num") ${C_CYAN}$b${C_RESET} ${C_DIM}(base: ${cur_base} -> ${parent})${C_RESET}"
+        log "${C_BLUE}update${C_RESET}  $(_pr_link "$num") ${C_CYAN}$b${C_RESET} ${C_DIM}(base: ${PLAN_CUR_BASE[j]} -> ${PLAN_PARENT[j]})${C_RESET}"
       else
         log "${C_BLUE}update${C_RESET}  $(_pr_link "$num") ${C_CYAN}$b${C_RESET}"
       fi

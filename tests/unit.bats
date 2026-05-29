@@ -239,3 +239,118 @@ engine_next() {
   [ "$status" -eq 0 ]
   [ "$output" == $'paused\t1\t2' ]
 }
+
+# --- pr-sync reconciler: merged-predecessor lineage guard ---
+# Pure: from an old nav-footer's PR numbers, return those no longer in the
+# active stack that are CANDIDATES for merged-predecessor weaving — but only
+# when the old footer is from this stack's lineage (another old-footer PR is
+# still active, or self appears in the old footer). No gh. One num per line.
+# Usage: _merged_predecessor_candidates <self_num> <active_nums_csv> <old_num>...
+
+mpc() {
+  run bash -c "source '$GIT_STACK_BIN'; _merged_predecessor_candidates \"\$@\"" _ "$@"
+}
+
+@test "merged candidates: no lineage signal yields nothing" {
+  # self=101 not in the old footer; old footer=[201]; only 101 is active.
+  # 201 is non-active but neither guard signal holds, so it is not mined.
+  mpc 101 "101" 201
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "merged candidates: self in footer unlocks candidates" {
+  mpc 101 "101" 101 201
+  [ "$status" -eq 0 ]
+  [ "$output" == "201" ]
+}
+
+@test "merged candidates: another still-active footer PR unlocks candidates" {
+  mpc 101 "101,102" 102 201
+  [ "$status" -eq 0 ]
+  [ "$output" == "201" ]
+}
+
+@test "merged candidates: excludes active and self, lists multiple in order" {
+  mpc 101 "101" 101 201 202
+  [ "$status" -eq 0 ]
+  [ "$output" == $'201\n202' ]
+}
+
+# --- pr-sync reconciler: nav-footer weave + strikethrough on position change ---
+# Pure: assemble a PR nav-footer's body triples. Output is one TAB-separated
+# triple per line "<branch>\t<num>\t<display_title>"; an empty branch field
+# marks a merged predecessor (the renderer strikes it through). Active entries
+# get a "[pos/N]" prefix, struck through as "~~[old]~~ [new]" only when the
+# entry's number is in <old_nums_csv> (this PR's prior footer) AND its bracketed
+# position actually moved. No gh, no git.
+# Usage: _pr_weave_footer_triples <old_nums_csv> [<m_num> <m_title>]... -- <a_branch> <a_num> <a_title>...
+
+weave() {
+  run bash -c "source '$GIT_STACK_BIN'; _pr_weave_footer_triples \"\$@\"" _ "$@"
+}
+
+@test "weave: fresh footer (nothing in old footer) gets plain [N/M] prefixes" {
+  weave "" -- feat/010-a 101 "auth" feat/020-b 102 "[9/9] login"
+  [ "$status" -eq 0 ]
+  [ "$output" == $'feat/010-a\t101\t[1/2] auth\nfeat/020-b\t102\t[2/2] login' ]
+}
+
+@test "weave: position change on an in-old-footer PR strikes through the old prefix" {
+  # #102 was [3/3] in its own old footer, now [2/2]; struck through. #101 holds
+  # its [1/2] position, so it stays plain even though it is in the old footer.
+  weave "101,102" -- feat/010-a 101 "[1/2] auth" feat/020-b 102 "[3/3] login"
+  [ "$status" -eq 0 ]
+  [ "$output" == $'feat/010-a\t101\t[1/2] auth\nfeat/020-b\t102\t~~[3/3]~~ [2/2] login' ]
+}
+
+@test "weave: position change is NOT struck through when the PR is not in the old footer" {
+  # #102 moved [3/3]->[2/2] but isn't in the old footer (fresh to this PR), so no
+  # strikethrough. #101 holds [1/2] and stays plain.
+  weave "101" -- feat/010-a 101 "[1/2] auth" feat/020-b 102 "[3/3] login"
+  [ "$status" -eq 0 ]
+  [ "$output" == $'feat/010-a\t101\t[1/2] auth\nfeat/020-b\t102\t[2/2] login' ]
+}
+
+@test "weave: number membership is exact (#10 in old footer does not match #100)" {
+  # old footer has #10 only; #100 moved position. #100 must NOT be struck through.
+  weave "10" -- feat/010-a 100 "[3/9] auth"
+  [ "$status" -eq 0 ]
+  [ "$output" == $'feat/010-a\t100\t[1/1] auth' ]
+}
+
+@test "weave: merged predecessors are emitted first as empty-branch triples" {
+  weave "101" 55 "old base" -- feat/010-a 101 "[1/1] auth"
+  [ "$status" -eq 0 ]
+  [ "$output" == $'\t55\told base\nfeat/010-a\t101\t[1/1] auth' ]
+}
+
+# --- pr-sync reconciler: round-trip-tolerant body normalization ---
+# Pure filter (stdin -> stdout): strip CR, drop trailing blank lines. Used
+# comparison-only so a GitHub body round-trip (CRLF, trailing newline) does not
+# emit a spurious body_changed edit. Never sent to gh.
+
+# Run the filter on a literal body and assert its exact output. Uses `run` so a
+# missing function surfaces as a non-zero status / wrong output (not a false
+# pass from two empty strings comparing equal).
+normalize() {
+  run bash -c "source '$GIT_STACK_BIN'; _pr_body_normalize" <<< "$1"
+}
+
+@test "body normalize: CRLF normalizes to LF (round-trip CRLF body is not a spurious change)" {
+  normalize $'line one\r\nline two\r\n'
+  [ "$status" -eq 0 ]
+  [ "$output" == $'line one\nline two' ]
+}
+
+@test "body normalize: trailing blank/whitespace lines are trimmed" {
+  normalize $'content\n\n  \n'
+  [ "$status" -eq 0 ]
+  [ "$output" == "content" ]
+}
+
+@test "body normalize: internal blank lines and indentation are preserved" {
+  normalize $'a\n\n    b'
+  [ "$status" -eq 0 ]
+  [ "$output" == $'a\n\n    b' ]
+}

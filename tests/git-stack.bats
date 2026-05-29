@@ -596,6 +596,53 @@ HOOK
   [ "$title_arg" = "[1/2] Old name" ]
 }
 
+@test "pr sync: weaves a merged predecessor into the nav footer (struck through)" {
+  # The active stack is feat/02-bar + feat/03-baz. #101 (feat/01-foo) was the
+  # merged bottom of the chain — its branch is gone, but its PR is MERGED on
+  # GitHub and still referenced by the active PRs' old nav footers. pr sync must
+  # detect it (merged-status + title fetched via `gh pr view`) and weave it back
+  # in as a struck-through merged predecessor.
+  make_stack_branches feat 02-bar 03-baz
+  make_remote_origin
+  local old_footer='<!-- git-stack:nav-start -->
+## Stack
+
+- #101 [1/3] 01-foo
+- #102 [2/3] 02-bar
+- #103 [3/3] 03-baz
+
+<!-- git-stack:nav-end -->'
+  export GH_PR_feat_02_bar__NUM=102
+  export GH_PR_feat_02_bar__TITLE="[2/3] 02-bar"
+  export GH_PR_feat_02_bar__BODY="prose two
+
+$old_footer"
+  export GH_PR_feat_03_baz__NUM=103
+  export GH_PR_feat_03_baz__TITLE="[3/3] 03-baz"
+  export GH_PR_feat_03_baz__BODY="prose three
+
+$old_footer"
+  # #101 is a merged predecessor known only by number.
+  export GH_PR_NUM_101__STATE=MERGED
+  export GH_PR_NUM_101__TITLE="01-foo"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ] || return 1
+  # The merged-status of #101 was checked via `gh pr view`.
+  grep -q '^gh pr view 101 ' "$GH_STUB_LOG" || return 1
+  # The body written to #102 weaves #101 as a struck-through merged predecessor
+  # (the "(merged)" line + the title "01-foo" can only have come from the
+  # merged-title fetch), and re-brackets the active entries to [1/2]/[2/2].
+  # NB: bats only fails a test on the LAST command's status, so each assertion
+  # is guarded with `|| return 1` to make it a real check.
+  local body
+  body=$(gh_log_stdin "pr edit 102")
+  [[ "$body" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
+  [[ "$body" == *"[1/2] 02-bar"* ]] || return 1
+  [[ "$body" == *"[2/2] 03-baz"* ]] || return 1
+  # The prose above the footer is preserved.
+  [[ "$body" == *"prose two"* ]] || return 1
+}
+
 # ---------- pr list ----------
 
 @test "pr list: lists synced branches with PR numbers and titles" {

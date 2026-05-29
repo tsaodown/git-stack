@@ -13,6 +13,10 @@
 #                                                persists PR by branch+num
 #   gh pr edit <num> [--title T] [--body-file FILE] [--base B]
 #                                             -> updates persisted PR (exit 0)
+#   gh pr view <num> --json FIELDS [--jq EXPR]
+#                                             -> emits {number,state,title} for
+#                                                the PR (by-num seed, then
+#                                                persisted JSON, then defaults)
 #
 # Env vars:
 #   GH_STUB_LOG          path to log file; "argv\t<stdin-b64>" per invocation
@@ -22,6 +26,8 @@
 #   GH_PR_<safe>__NUM    seed: existing PR number for branch (safe = / -> _)
 #   GH_PR_<safe>__TITLE  seed: existing PR title
 #   GH_PR_<safe>__BODY   seed: existing PR body (multi-line allowed)
+#   GH_PR_NUM_<n>__STATE seed: state for `pr view <n>` (OPEN|MERGED|CLOSED)
+#   GH_PR_NUM_<n>__TITLE seed: title for `pr view <n>` (e.g. a merged predecessor)
 #
 # Env-var seeds override persisted state. When a seed is set and `pr create`
 # is called for that branch, gh-stub emits an "already exists" error so the
@@ -249,6 +255,29 @@ case "$_sub1 $_sub2" in
     fi
     if [ -n "$_filter" ]; then
       jq "${_args[@]}" "$_filter" "$_jf" > "$_jf.tmp" && mv "$_jf.tmp" "$_jf"
+    fi
+    exit 0
+    ;;
+  "pr view")
+    _num="${3-}"
+    _jq=$(_flagval --jq "$@" || true)
+    # Resolve the PR's fields. by-num env seeds first (for PRs not created in
+    # this test, e.g. a merged predecessor referenced only by number), then the
+    # persisted by-num JSON, then OPEN/empty defaults.
+    _vseed_state=$(_envget "GH_PR_NUM_${_num}__STATE")
+    _vseed_title=$(_envget "GH_PR_NUM_${_num}__TITLE")
+    if [ -n "$_vseed_state" ] || [ -n "$_vseed_title" ]; then
+      _vobj=$(jq -n --arg n "$_num" --arg s "${_vseed_state:-OPEN}" --arg t "$_vseed_title" \
+        '{number: ($n|tonumber), state: $s, title: $t}')
+    elif [ -f "$_stub_dir/by-num/$_num.json" ]; then
+      _vobj=$(jq '{state: "OPEN", title: ""} * .' "$_stub_dir/by-num/$_num.json")
+    else
+      _vobj=$(jq -n --arg n "$_num" '{number: ($n|tonumber), state: "OPEN", title: ""}')
+    fi
+    if [ -n "$_jq" ]; then
+      printf '%s' "$_vobj" | jq -r "$_jq"
+    else
+      printf '%s\n' "$_vobj"
     fi
     exit 0
     ;;
