@@ -2260,6 +2260,231 @@ _midpoint_leaf() {
   printf '%d\n' $(( (lo + hi) / 2 ))
 }
 
+# Pure placement resolver shared by cmd_new and cmd_move flag modes. Given a
+# placement MODE, its ARG, the stack WIDTH, and the ordered branch list, decide
+# the new leaf number and predecessor. No git, no die: it prints a result and
+# returns a status so callers own the user-facing error message.
+#
+#   MODE    ARG             meaning
+#   last    (ignored)       append at the end of the stack
+#   at      <leaf-num>      explicit leaf placement
+#   before  <full-branch>   insert just below an existing branch
+#   after   <full-branch>   insert just above an existing branch
+#
+# before/after take an already-resolved full branch name (caller runs
+# _resolve_branch_ref first). On success prints "<leaf><TAB><predecessor>"
+# (empty predecessor = use the stack base) and returns 0. On failure prints one
+# of the following and returns 1:
+#   "ceiling<TAB><leaf>"            next/explicit leaf exceeds the 999 ceiling
+#   "collision<TAB><branch>"        explicit leaf already taken
+#   "gap-exhausted<TAB><lo><TAB><hi>"  no integer leaf fits the open (lo,hi)
+#   "not-found<TAB><ref>"           before/after ref not in the stack
+#
+# Usage: _placement_resolve <mode> <arg> <width> <branch>...
+_placement_resolve() {
+  local mode="$1" arg="$2" width="$3"
+  shift 3
+  local branches=("$@")
+  local n=$#
+
+  case "$mode" in
+    last)
+      local new_num
+      new_num=$(_next_leaf_num "${branches[@]+"${branches[@]}"}")
+      if (( width >= 3 )) && (( new_num > 999 )); then
+        printf 'ceiling\t%d\n' "$new_num"; return 1
+      fi
+      if (( n == 0 )); then
+        printf '%d\t\n' "$new_num"
+      else
+        printf '%d\t%s\n' "$new_num" "${branches[$((n - 1))]}"
+      fi
+      ;;
+    at)
+      local new_num="$arg"
+      if (( width >= 3 )) && (( new_num > 999 )); then
+        printf 'ceiling\t%d\n' "$new_num"; return 1
+      fi
+      local b
+      for b in "${branches[@]+"${branches[@]}"}"; do
+        [[ "${b##*/}" =~ ^([0-9]+)- ]] || continue
+        if (( 10#${BASH_REMATCH[1]} == new_num )); then
+          printf 'collision\t%s\n' "$b"; return 1
+        fi
+      done
+      local insert_idx=$n i
+      for ((i = 0; i < n; i++)); do
+        [[ "${branches[$i]##*/}" =~ ^([0-9]+)- ]] || continue
+        if (( 10#${BASH_REMATCH[1]} > new_num )); then insert_idx=$i; break; fi
+      done
+      if (( insert_idx == 0 )); then
+        printf '%d\t\n' "$new_num"
+      else
+        printf '%d\t%s\n' "$new_num" "${branches[$((insert_idx - 1))]}"
+      fi
+      ;;
+    before)
+      local ref_idx rc=0
+      ref_idx=$(branch_index "$arg" "${branches[@]+"${branches[@]}"}") || rc=$?
+      (( rc == 0 )) || { printf 'not-found\t%s\n' "$arg"; return 1; }
+      [[ "${arg##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$arg"; return 1; }
+      local hi=$((10#${BASH_REMATCH[1]})) lo pred
+      if (( ref_idx == 0 )); then
+        lo=0; pred=""
+      else
+        local prev="${branches[$((ref_idx - 1))]}"
+        [[ "${prev##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$arg"; return 1; }
+        lo=$((10#${BASH_REMATCH[1]})); pred="$prev"
+      fi
+      local mid
+      if mid=$(_midpoint_leaf "$lo" "$hi"); then
+        printf '%d\t%s\n' "$mid" "$pred"
+      else
+        printf 'gap-exhausted\t%d\t%d\n' "$lo" "$hi"; return 1
+      fi
+      ;;
+    after)
+      local ref_idx rc=0
+      ref_idx=$(branch_index "$arg" "${branches[@]+"${branches[@]}"}") || rc=$?
+      (( rc == 0 )) || { printf 'not-found\t%s\n' "$arg"; return 1; }
+      [[ "${arg##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$arg"; return 1; }
+      local lo=$((10#${BASH_REMATCH[1]}))
+      if (( ref_idx == n - 1 )); then
+        local new_num
+        if (( width >= 3 )); then
+          new_num=$(( ((lo / 10) + 1) * 10 ))
+        else
+          new_num=$((lo + 1))
+        fi
+        if (( width >= 3 )) && (( new_num > 999 )); then
+          printf 'ceiling\t%d\n' "$new_num"; return 1
+        fi
+        printf '%d\t%s\n' "$new_num" "$arg"
+      else
+        local next="${branches[$((ref_idx + 1))]}"
+        [[ "${next##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$arg"; return 1; }
+        local hi=$((10#${BASH_REMATCH[1]})) mid
+        if mid=$(_midpoint_leaf "$lo" "$hi"); then
+          printf '%d\t%s\n' "$mid" "$arg"
+        else
+          printf 'gap-exhausted\t%d\t%d\n' "$lo" "$hi"; return 1
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Caller-side bridge over _placement_resolve: map its error kinds to a
+# user-facing die() with command context, and resolve the predecessor into a
+# ref. On success sets _PL_LEAF, _PL_PRED_REF, _PL_PRED_LABEL (an empty
+# placement predecessor means "use the stack base", resolved here).
+# Usage: _resolve_placement <cmd-context> <mode> <arg> <width> <branch>...
+_resolve_placement() {
+  local cmd="$1"; shift
+  local out rc=0
+  out=$(_placement_resolve "$@") || rc=$?
+  if (( rc != 0 )); then
+    local kind="${out%%$'\t'*}" rest="${out#*$'\t'}"
+    case "$kind" in
+      ceiling)
+        die "$cmd: leaf space exhausted (would be $rest, max 999); pick an --at value or wait for doctor-reflow" ;;
+      collision)
+        die "$cmd: leaf is already taken by '$rest'" ;;
+      gap-exhausted)
+        die "$cmd: no insertable leaf between ${rest%%$'\t'*} and ${rest#*$'\t'} (gap exhausted); pick a different position or wait for doctor-reflow" ;;
+      not-found)
+        die "$cmd: '$rest' not in stack" ;;
+      *)
+        die "internal: placement failed: $out" ;;
+    esac
+  fi
+  _PL_LEAF="${out%%$'\t'*}"
+  local pred="${out#*$'\t'}"
+  if [[ -z "$pred" ]]; then
+    local parent_name
+    parent_name=$(_resolve_parent_name) \
+      || die "$cmd: cannot determine parent branch (set stack.base or create main/master)"
+    _PL_PRED_REF=$(_resolve_parent_ref "$parent_name") \
+      || die "$cmd: cannot resolve parent ref for '$parent_name'"
+    _PL_PRED_LABEL="$parent_name"
+  else
+    _PL_PRED_REF="refs/heads/$pred"
+    _PL_PRED_LABEL="$pred"
+  fi
+}
+
+# Pure candidate-list generator for the interactive picker. Given the chosen
+# reference branch, a before|after position, and the ordered branch list,
+# produce the predecessor and a ranked list of insertable leaf numbers. No git,
+# no die. On success prints "<predecessor><TAB><leaf> <leaf> ..." (empty
+# predecessor = use the stack base) and returns 0. On a too-tight gap prints
+# "gap-exhausted<TAB><lo><TAB><hi>" and returns 1.
+# Usage: _placement_candidates <ref_branch> <before|after> <branch>...
+_placement_candidates() {
+  local ref_branch="$1" pos="$2"
+  shift 2
+  local branches=("$@")
+  local n=$#
+  local ref_idx rc=0
+  ref_idx=$(branch_index "$ref_branch" "${branches[@]+"${branches[@]}"}") || rc=$?
+  (( rc == 0 )) || { printf 'not-found\t%s\n' "$ref_branch"; return 1; }
+  [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$ref_branch"; return 1; }
+  local ref_leaf_num=$((10#${BASH_REMATCH[1]}))
+
+  local lo hi pred=""
+  if [[ "$pos" == "before" ]]; then
+    hi=$ref_leaf_num
+    if (( ref_idx == 0 )); then
+      lo=0; pred=""
+    else
+      local prev="${branches[$((ref_idx - 1))]}"
+      [[ "${prev##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$ref_branch"; return 1; }
+      lo=$((10#${BASH_REMATCH[1]})); pred="$prev"
+    fi
+  else  # after
+    lo=$ref_leaf_num; pred="$ref_branch"
+    if (( ref_idx == n - 1 )); then
+      hi=-1  # open-ended (append)
+    else
+      local next="${branches[$((ref_idx + 1))]}"
+      [[ "${next##*/}" =~ ^([0-9]+)- ]] || { printf 'not-found\t%s\n' "$ref_branch"; return 1; }
+      hi=$((10#${BASH_REMATCH[1]}))
+    fi
+  fi
+
+  local candidates=()
+  if (( hi == -1 )); then
+    local default_leaf=$(( ((lo / 10) + 1) * 10 ))
+    candidates=("$default_leaf" "$((default_leaf + 10))" "$((default_leaf + 20))")
+  elif (( hi - lo < 2 )); then
+    printf 'gap-exhausted\t%d\t%d\n' "$lo" "$hi"; return 1
+  else
+    local mid=$(( (lo + hi) / 2 ))
+    local gap=$((hi - lo - 1))  # valid leaves in the open interval
+    if (( gap <= 10 )); then
+      # Enumerate all valid leaves, midpoint first, then ascending fill.
+      local k
+      candidates+=("$mid")
+      for ((k = lo + 1; k < hi; k++)); do
+        (( k != mid )) && candidates+=("$k")
+      done
+    else
+      # Curate ~5 spread options.
+      local quart=$(( gap / 4 ))
+      local eighth=$(( gap / 8 ))
+      (( eighth < 1 )) && eighth=1
+      candidates+=("$mid")
+      (( mid - quart > lo )) && candidates+=("$((mid - quart))")
+      (( mid + quart < hi )) && candidates+=("$((mid + quart))")
+      (( mid - eighth > lo && mid - eighth != mid - quart )) && candidates+=("$((mid - eighth))")
+      (( mid + eighth < hi && mid + eighth != mid + quart )) && candidates+=("$((mid + eighth))")
+    fi
+  fi
+  printf '%s\t%s\n' "$pred" "${candidates[*]}"
+  return 0
+}
+
 # Three-step interactive position picker for `cmd_new` and `cmd_move`. Drives
 # the user through:
 #   1. pick a reference branch from the stack
@@ -2290,71 +2515,26 @@ _pick_position_for_new() {
   local pos
   pos=$(_pick_one "position relative to $ref_branch:" "before $ref_branch" "after $ref_branch") \
     || return 1
+  local pos_kw="before"
+  if [[ "$pos" == "after $ref_branch" ]]; then pos_kw="after"; fi
 
-  # Compute lo/hi for the chosen position. Open-ended (hi == -1) signals
-  # --last-like behavior (no upper bound; use next multiple of 10).
-  local ref_idx ref_leaf_num lo hi
-  ref_idx=$(branch_index "$ref_branch" "${branches[@]}")
-  [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || die "internal: ref leaf malformed: $ref_branch"
-  ref_leaf_num=$((10#${BASH_REMATCH[1]}))
-
-  if [[ "$pos" == "before $ref_branch" ]]; then
-    hi=$ref_leaf_num
-    if (( ref_idx == 0 )); then
-      lo=0
-    else
-      [[ "${branches[$((ref_idx - 1))]##*/}" =~ ^([0-9]+)- ]] || die "internal: prev leaf malformed"
-      lo=$((10#${BASH_REMATCH[1]}))
-    fi
-    # Predecessor for "before X" is the branch just before X (or base).
-    if (( ref_idx == 0 )); then
-      _PICKED_PREDECESSOR=""
-    else
-      _PICKED_PREDECESSOR="${branches[$((ref_idx - 1))]}"
-    fi
-  else  # after
-    lo=$ref_leaf_num
-    if (( ref_idx == ${#branches[@]} - 1 )); then
-      hi=-1  # open-ended
-    else
-      [[ "${branches[$((ref_idx + 1))]##*/}" =~ ^([0-9]+)- ]] || die "internal: next leaf malformed"
-      hi=$((10#${BASH_REMATCH[1]}))
-    fi
-    _PICKED_PREDECESSOR="$ref_branch"
+  # Compute predecessor + ranked candidate leaves (pure).
+  local out rc=0
+  out=$(_placement_candidates "$ref_branch" "$pos_kw" "${branches[@]}") || rc=$?
+  if (( rc != 0 )); then
+    local kind="${out%%$'\t'*}" rest="${out#*$'\t'}"
+    case "$kind" in
+      gap-exhausted)
+        die "no insertable leaf between ${rest%%$'\t'*} and ${rest#*$'\t'} (gap exhausted); pick a different position or wait for doctor-reflow" ;;
+      *)
+        die "internal: placement candidates failed: $out" ;;
+    esac
   fi
+  _PICKED_PREDECESSOR="${out%%$'\t'*}"
+  local candidates=() c
+  for c in ${out#*$'\t'}; do candidates+=("$c"); done
 
-  # Step 3: build candidate leaf list and pick.
-  local candidates=()
-  if (( hi == -1 )); then
-    # Open-ended append. Default = next multiple of 10 above lo, plus +10/+20 alternatives.
-    local default_leaf=$(( ((lo / 10) + 1) * 10 ))
-    candidates=("$default_leaf" "$((default_leaf + 10))" "$((default_leaf + 20))")
-  else
-    if (( hi - lo < 2 )); then
-      die "no insertable leaf between $lo and $hi (gap exhausted); pick a different position or wait for doctor-reflow"
-    fi
-    local mid=$(( (lo + hi) / 2 ))
-    local gap=$((hi - lo - 1))  # number of valid leaves in the open interval
-    if (( gap <= 10 )); then
-      # Enumerate all valid leaves, midpoint first, then by proximity to midpoint.
-      local n
-      candidates+=("$mid")
-      for ((n = lo + 1; n < hi; n++)); do
-        (( n != mid )) && candidates+=("$n")
-      done
-    else
-      # Curate ~5 spread options.
-      local quart=$(( gap / 4 ))
-      local eighth=$(( gap / 8 ))
-      (( eighth < 1 )) && eighth=1
-      candidates+=("$mid")
-      (( mid - quart > lo )) && candidates+=("$((mid - quart))")
-      (( mid + quart < hi )) && candidates+=("$((mid + quart))")
-      (( mid - eighth > lo && mid - eighth != mid - quart )) && candidates+=("$((mid - eighth))")
-      (( mid + eighth < hi && mid + eighth != mid + quart )) && candidates+=("$((mid + eighth))")
-    fi
-  fi
-
+  # Step 3: pick a leaf from the candidate list.
   local picked_leaf
   picked_leaf=$(_pick_one "leaf number:" "${candidates[@]}") \
     || return 1
@@ -2509,24 +2689,11 @@ cmd_new() {
     n_pos=1
   fi
 
-  # Non-interactive flag resolution.
+  # Non-interactive flag resolution — all four modes go through the pure
+  # placement resolver.
   if (( ! resolved )) && (( opt_last )); then
-    new_num=$(_next_leaf_num "${branches[@]+"${branches[@]}"}")
-    if (( width >= 3 )) && (( new_num > 999 )); then
-      die "new --last: leaf space exhausted (would be $new_num, max 999); pick an --at value or wait for doctor-reflow"
-    fi
-    if (( ${#branches[@]} == 0 )); then
-      local parent_name
-      parent_name=$(_resolve_parent_name) \
-        || die "new: cannot determine parent branch (set stack.base or create main/master)"
-      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
-        || die "new: cannot resolve parent ref for '$parent_name'"
-      predecessor_label="$parent_name"
-    else
-      local prev="${branches[$((${#branches[@]} - 1))]}"
-      predecessor_ref="refs/heads/$prev"
-      predecessor_label="$prev"
-    fi
+    _resolve_placement "new --last" last "" "$width" "${branches[@]+"${branches[@]}"}"
+    new_num="$_PL_LEAF"; predecessor_ref="$_PL_PRED_REF"; predecessor_label="$_PL_PRED_LABEL"
     resolved=1
   fi
 
@@ -2535,28 +2702,8 @@ cmd_new() {
     local ref_branch rc=0
     ref_branch=$(_resolve_branch_ref "$opt_before" "${branches[@]}") || rc=$?
     (( rc == 0 )) || die "new --before: '$opt_before' not in stack '$prefix'"
-    local ref_idx lo hi
-    ref_idx=$(branch_index "$ref_branch" "${branches[@]}")
-    [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || die "internal: ref leaf malformed"
-    hi=$((10#${BASH_REMATCH[1]}))
-    if (( ref_idx == 0 )); then
-      lo=0
-      local parent_name
-      parent_name=$(_resolve_parent_name) \
-        || die "new: cannot determine parent branch (set stack.base or create main/master)"
-      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
-        || die "new: cannot resolve parent ref for '$parent_name'"
-      predecessor_label="$parent_name"
-    else
-      local prev="${branches[$((ref_idx - 1))]}"
-      [[ "${prev##*/}" =~ ^([0-9]+)- ]] || die "internal: prev leaf malformed"
-      lo=$((10#${BASH_REMATCH[1]}))
-      predecessor_ref="refs/heads/$prev"
-      predecessor_label="$prev"
-    fi
-    if ! new_num=$(_midpoint_leaf "$lo" "$hi"); then
-      die "new --before $ref_branch: no insertable leaf between $lo and $hi (gap exhausted); pick a different position or wait for doctor-reflow"
-    fi
+    _resolve_placement "new --before $ref_branch" before "$ref_branch" "$width" "${branches[@]}"
+    new_num="$_PL_LEAF"; predecessor_ref="$_PL_PRED_REF"; predecessor_label="$_PL_PRED_LABEL"
     resolved=1
   fi
 
@@ -2565,71 +2712,14 @@ cmd_new() {
     local ref_branch rc=0
     ref_branch=$(_resolve_branch_ref "$opt_after" "${branches[@]}") || rc=$?
     (( rc == 0 )) || die "new --after: '$opt_after' not in stack '$prefix'"
-    local ref_idx lo
-    ref_idx=$(branch_index "$ref_branch" "${branches[@]}")
-    [[ "${ref_branch##*/}" =~ ^([0-9]+)- ]] || die "internal: ref leaf malformed"
-    lo=$((10#${BASH_REMATCH[1]}))
-    if (( ref_idx == ${#branches[@]} - 1 )); then
-      # Last branch: behave like --last anchored on ref.
-      if (( width >= 3 )); then
-        new_num=$(( ((lo / 10) + 1) * 10 ))
-      else
-        new_num=$((lo + 1))
-      fi
-      if (( width >= 3 )) && (( new_num > 999 )); then
-        die "new --after $ref_branch: leaf space exhausted (would be $new_num, max 999); pick an --at value or wait for doctor-reflow"
-      fi
-    else
-      local next="${branches[$((ref_idx + 1))]}"
-      [[ "${next##*/}" =~ ^([0-9]+)- ]] || die "internal: next leaf malformed"
-      local hi=$((10#${BASH_REMATCH[1]}))
-      if ! new_num=$(_midpoint_leaf "$lo" "$hi"); then
-        die "new --after $ref_branch: no insertable leaf between $lo and $hi (gap exhausted); pick a different position or wait for doctor-reflow"
-      fi
-    fi
-    predecessor_ref="refs/heads/$ref_branch"
-    predecessor_label="$ref_branch"
+    _resolve_placement "new --after $ref_branch" after "$ref_branch" "$width" "${branches[@]}"
+    new_num="$_PL_LEAF"; predecessor_ref="$_PL_PRED_REF"; predecessor_label="$_PL_PRED_LABEL"
     resolved=1
   fi
 
   if (( ! resolved )) && [[ -n "$opt_at" ]]; then
-    new_num="$opt_at"
-    # Check 999 ceiling.
-    if (( width >= 3 )) && (( new_num > 999 )); then
-      die "new --at: leaf $new_num exceeds 3-digit ceiling (999)"
-    fi
-    # Collision check: refuse if any existing branch occupies this leaf.
-    local b leaf_num
-    for b in "${branches[@]+"${branches[@]}"}"; do
-      [[ "${b##*/}" =~ ^([0-9]+)- ]] || continue
-      leaf_num=$((10#${BASH_REMATCH[1]}))
-      if (( leaf_num == new_num )); then
-        die "new --at: leaf $new_num is already taken by '$b'"
-      fi
-    done
-    # Determine insert position based on new_num vs existing leaves; that
-    # gives us the predecessor.
-    local insert_idx=${#branches[@]}
-    local i
-    for ((i = 0; i < ${#branches[@]}; i++)); do
-      [[ "${branches[$i]##*/}" =~ ^([0-9]+)- ]] || continue
-      if (( 10#${BASH_REMATCH[1]} > new_num )); then
-        insert_idx=$i
-        break
-      fi
-    done
-    if (( insert_idx == 0 )); then
-      local parent_name
-      parent_name=$(_resolve_parent_name) \
-        || die "new: cannot determine parent branch (set stack.base or create main/master)"
-      predecessor_ref=$(_resolve_parent_ref "$parent_name") \
-        || die "new: cannot resolve parent ref for '$parent_name'"
-      predecessor_label="$parent_name"
-    else
-      local prev="${branches[$((insert_idx - 1))]}"
-      predecessor_ref="refs/heads/$prev"
-      predecessor_label="$prev"
-    fi
+    _resolve_placement "new --at" at "$opt_at" "$width" "${branches[@]+"${branches[@]}"}"
+    new_num="$_PL_LEAF"; predecessor_ref="$_PL_PRED_REF"; predecessor_label="$_PL_PRED_LABEL"
     resolved=1
   fi
 
@@ -4920,4 +5010,8 @@ main() {
   esac
 }
 
-main "$@"
+# Only run main when executed directly, not when sourced (e.g. by unit tests
+# that exercise individual functions). Bash 3.2 compatible.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
