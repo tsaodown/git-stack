@@ -205,3 +205,37 @@ pick_position() {
   [[ "$output" == *"LEAF=5 PRED="* ]]
   [[ "$output" != *"PRED=feat"* ]]
 }
+
+# --- reflow engine: position advancement (_engine_next) ---
+# Pure dispatch mapping (num_phases, phase_idx, unit_idx, outcome) to a
+# directive + next position. The phase reports the outcome of advancing one
+# unit; the engine decides where the cursor goes. No git, no state file.
+# Output: "<directive>\t<phase_idx>\t<unit_idx>".
+
+engine_next() {
+  run bash -c "source '$GIT_STACK_BIN'; _engine_next \"\$@\"" _ "$@"
+}
+
+@test "engine next: unit-done advances to the next unit in the same phase" {
+  engine_next 3 0 0 unit-done
+  [ "$status" -eq 0 ]
+  [ "$output" == $'advance\t0\t1' ]
+}
+
+@test "engine next: phase-complete moves to the start of the next phase" {
+  engine_next 3 0 2 phase-complete
+  [ "$status" -eq 0 ]
+  [ "$output" == $'next-phase\t1\t0' ]
+}
+
+@test "engine next: phase-complete on the last phase is done" {
+  engine_next 3 2 0 phase-complete
+  [ "$status" -eq 0 ]
+  [ "$output" == $'done\t2\t0' ]
+}
+
+@test "engine next: paused holds the position unchanged" {
+  engine_next 3 1 2 paused
+  [ "$status" -eq 0 ]
+  [ "$output" == $'paused\t1\t2' ]
+}

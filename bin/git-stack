@@ -55,7 +55,7 @@ color_init() {
 #
 # Globals contract — adding a field requires updating all three of:
 #   (a) the declaration below
-#   (b) save_state's serialization block
+#   (b) save_engine_state's serialization block
 #   (c) load_state's reset list (arrays only; scalars are overwritten by
 #       sourcing the file, but reset arrays in case a stale process left
 #       them populated and the file's assignment doesn't fully clear)
@@ -67,34 +67,36 @@ color_init() {
 #   STACK_PUSH             1 if --push, else 0
 #   STACK_FORCE            1 if --force (allow multi-commit branches), else 0
 #   STACK_FROM_IDX         index of the bottom branch we touch
-#   STACK_CURSOR           index of the next branch to process
 #   STACK_ONTO             resolved SHA of --onto target (if any)
 #   STACK_ONTO_REF         original --onto ref name (for display)
 #   STACK_BRANCHES         full branch names in stack order
 #   STACK_ORIG_SHAS        original tip SHAs at run start
 #   STACK_PUSH_FAILURES    branches whose push failed during this run
 #                          (transient — not historical)
-#   STACK_POST_ACTION      "move-rename" or empty; post-reflow hook
-#   STACK_POST_BRANCHES    post-move ordering for rename batch
-#   STACK_OPT_NO_PUSH      persisted OPT_NO_PUSH from move invocation
-#   STACK_OPT_NO_SYNC      persisted OPT_NO_SYNC from move invocation
-STACK_VERSION=1
+#   STACK_OPT_NO_PUSH      persisted OPT_NO_PUSH (for the remote-sync phase)
+#   STACK_OPT_NO_SYNC      persisted OPT_NO_SYNC (for the remote-sync phase)
+STACK_VERSION=2
 STACK_STARTED_AT=""
 STACK_STARTING_BRANCH=""
 STACK_PREFIX=""
 STACK_PUSH=0
 STACK_FORCE=0
 STACK_FROM_IDX=0
-STACK_CURSOR=0
 STACK_ONTO=""
 STACK_ONTO_REF=""
 STACK_BRANCHES=()
 STACK_ORIG_SHAS=()
 STACK_PUSH_FAILURES=()
-STACK_POST_ACTION=""        # "move-rename" or empty
-STACK_POST_BRANCHES=()      # post-move ordering used to compute rename batch
-STACK_OPT_NO_PUSH=0         # persisted across continue/abort
+STACK_OPT_NO_PUSH=0         # persisted for the remote-sync phase
 STACK_OPT_NO_SYNC=0
+# Reflow-engine state. The engine drives an ordered list of phases by a coarse
+# (phase, unit) cursor; each phase recovers its own fine-grained in-flight
+# state. See "# ---------- reflow engine ----------".
+STACK_PHASES=()             # ordered phase types, e.g. (reflow-pick)
+STACK_PHASE_IDX=0           # index into STACK_PHASES of the current phase
+STACK_UNIT_IDX=0            # phase-relative index of the current unit
+STACK_RENAME_PAIRS=()       # alternating old/new branch names for rename-batch
+_PHASE_OUTCOME=""           # set by a phase op: unit-done|phase-complete|paused
 
 # ---------- helpers ----------
 
@@ -422,30 +424,6 @@ _emit_array() {
   printf ' )\n'
 }
 
-save_state() {
-  local out
-  out=$(state_file)
-  {
-    echo "STACK_VERSION=1"
-    printf 'STACK_STARTED_AT=%q\n'         "$STACK_STARTED_AT"
-    printf 'STACK_STARTING_BRANCH=%q\n'    "$STACK_STARTING_BRANCH"
-    printf 'STACK_PREFIX=%q\n'             "$STACK_PREFIX"
-    printf 'STACK_PUSH=%d\n'               "$STACK_PUSH"
-    printf 'STACK_FORCE=%d\n'              "$STACK_FORCE"
-    printf 'STACK_ONTO=%q\n'               "$STACK_ONTO"
-    printf 'STACK_ONTO_REF=%q\n'           "$STACK_ONTO_REF"
-    printf 'STACK_FROM_IDX=%d\n'           "$STACK_FROM_IDX"
-    printf 'STACK_CURSOR=%d\n'             "$STACK_CURSOR"
-    _emit_array STACK_BRANCHES STACK_BRANCHES
-    _emit_array STACK_ORIG_SHAS STACK_ORIG_SHAS
-    _emit_array STACK_PUSH_FAILURES STACK_PUSH_FAILURES
-    printf 'STACK_POST_ACTION=%q\n' "$STACK_POST_ACTION"
-    printf 'STACK_OPT_NO_PUSH=%d\n' "$STACK_OPT_NO_PUSH"
-    printf 'STACK_OPT_NO_SYNC=%d\n' "$STACK_OPT_NO_SYNC"
-    _emit_array STACK_POST_BRANCHES STACK_POST_BRANCHES
-  } > "$out"
-}
-
 load_state() {
   local f
   f=$(state_file)
@@ -455,11 +433,17 @@ load_state() {
   STACK_BRANCHES=()
   STACK_ORIG_SHAS=()
   STACK_PUSH_FAILURES=()
-  STACK_POST_ACTION=""
-  STACK_POST_BRANCHES=()
+  STACK_PHASES=()
+  STACK_PHASE_IDX=0
+  STACK_UNIT_IDX=0
+  STACK_RENAME_PAIRS=()
   # shellcheck disable=SC1090
   source "$f"
-  [[ "${STACK_VERSION-}" == "1" ]] || die "incompatible state file version: ${STACK_VERSION-?}"
+  case "${STACK_VERSION-}" in
+    2) ;;
+    1) die "this stack operation was started by an older git-stack (state version 1); finish or 'git stack abort' it with that version first, or delete $f" ;;
+    *) die "incompatible state file version: ${STACK_VERSION-?}" ;;
+  esac
 }
 
 clear_state() {
@@ -661,6 +645,371 @@ emit_rename_batch() {
   fi
 }
 
+# ---------- reflow engine ----------
+
+# Pure position-advancement dispatch for the reflow engine. Given the plan's
+# phase count, the current (phase, unit) position, and the outcome of advancing
+# one unit, decide the next position and a directive. No git, no state file —
+# the phase reports its own outcome; the engine only moves the cursor.
+#
+# Outcomes:  unit-done | phase-complete | paused
+# Directives: advance (next unit, same phase) | next-phase | done | paused
+# Usage: _engine_next <num_phases> <phase_idx> <unit_idx> <outcome>
+# Prints: "<directive>\t<phase_idx>\t<unit_idx>"
+_engine_next() {
+  local num_phases="$1" phase_idx="$2" unit_idx="$3" outcome="$4"
+  case "$outcome" in
+    unit-done)
+      printf '%s\t%d\t%d\n' advance "$phase_idx" "$((unit_idx + 1))" ;;
+    phase-complete)
+      if (( phase_idx + 1 < num_phases )); then
+        printf '%s\t%d\t%d\n' next-phase "$((phase_idx + 1))" 0
+      else
+        printf '%s\t%d\t%d\n' done "$phase_idx" "$unit_idx"
+      fi ;;
+    paused)
+      printf '%s\t%d\t%d\n' paused "$phase_idx" "$unit_idx" ;;
+    *)
+      return 2 ;;
+  esac
+}
+
+# Persist engine state (STACK_VERSION=2): the phase list and the coarse
+# (phase, unit) cursor. Written on every step boundary so continue/abort resume.
+save_engine_state() {
+  local out
+  out=$(state_file)
+  {
+    echo "STACK_VERSION=2"
+    printf 'STACK_STARTED_AT=%q\n'      "$STACK_STARTED_AT"
+    printf 'STACK_STARTING_BRANCH=%q\n' "$STACK_STARTING_BRANCH"
+    printf 'STACK_PREFIX=%q\n'          "$STACK_PREFIX"
+    printf 'STACK_PUSH=%d\n'            "$STACK_PUSH"
+    printf 'STACK_FORCE=%d\n'           "$STACK_FORCE"
+    printf 'STACK_ONTO=%q\n'            "$STACK_ONTO"
+    printf 'STACK_ONTO_REF=%q\n'        "$STACK_ONTO_REF"
+    printf 'STACK_FROM_IDX=%d\n'        "$STACK_FROM_IDX"
+    _emit_array STACK_PHASES STACK_PHASES
+    printf 'STACK_PHASE_IDX=%d\n'       "$STACK_PHASE_IDX"
+    printf 'STACK_UNIT_IDX=%d\n'        "$STACK_UNIT_IDX"
+    printf 'STACK_OPT_NO_PUSH=%d\n'     "$STACK_OPT_NO_PUSH"
+    printf 'STACK_OPT_NO_SYNC=%d\n'     "$STACK_OPT_NO_SYNC"
+    _emit_array STACK_BRANCHES STACK_BRANCHES
+    _emit_array STACK_ORIG_SHAS STACK_ORIG_SHAS
+    _emit_array STACK_PUSH_FAILURES STACK_PUSH_FAILURES
+    _emit_array STACK_RENAME_PAIRS STACK_RENAME_PAIRS
+  } > "$out"
+}
+
+# Print the cherry-pick conflict banner (branch + conflicted files + the
+# continue/abort hint) to stderr. Used by the reflow-pick phase on conflict.
+_print_conflict_banner() {
+  local branch="$1"
+  printf '\n%s%s: conflict%s on %s%s%s\n\n' \
+    "$C_RED" "$PROG" "$C_RESET" \
+    "$C_CYAN" "$branch" "$C_RESET" >&2
+  local cf chunks s
+  while IFS= read -r cf; do
+    [[ -z "$cf" ]] && continue
+    chunks=$(grep -c '^<<<<<<< ' "$cf" 2>/dev/null || echo "?")
+    if [[ "$chunks" == "1" ]]; then s="chunk"; else s="chunks"; fi
+    printf '  %s%s%s %s(%s %s)%s\n' \
+      "$C_YELLOW" "$cf" "$C_RESET" \
+      "$C_DIM" "$chunks" "$s" "$C_RESET" >&2
+  done < <(git diff --name-only --diff-filter=U 2>/dev/null)
+  printf '\n' >&2
+  printf '  resolve + resume: %sgit stack continue%s %s[gstkc]%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+  printf '  give up:          %sgit stack abort%s %s[gstka]%s\n'    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+}
+
+# ----- reflow-pick phase -----
+# A unit is one branch. The absolute branch index is STACK_FROM_IDX + unit. The
+# advance/resume ops wrap do_one_step (the cherry-pick is unchanged); abort
+# restores original SHAs. Each op sets _PHASE_OUTCOME.
+
+# Map a phase-relative unit index to its absolute STACK_BRANCHES index.
+_reflow_pick_abs() { echo "$((STACK_FROM_IDX + $1))"; }
+
+# Print the resume/abort footer after a push failure pauses the reflow.
+# push_branch already printed the failure detail and the fetch/force hints.
+_print_push_pause_banner() {
+  local branch="$1"
+  printf '\n%s%s: push paused%s on %s%s%s\n' \
+    "$C_YELLOW" "$PROG" "$C_RESET" "$C_CYAN" "$branch" "$C_RESET" >&2
+  printf '  fetch/rebase, then resume: %sgit stack continue%s %s[gstkc]%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+  printf '  give up:                   %sgit stack abort%s %s[gstka]%s\n'    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+}
+
+# Finish a reflowed unit: push it (if --push) and set the outcome. A push
+# failure pauses (resumable) rather than failing the whole run — the
+# cherry-pick is already done, so 'continue' re-enters resume, skips the
+# cherry-pick, and retries the push.
+_reflow_pick_complete_unit() {
+  local abs="$1"
+  local last=$((${#STACK_BRANCHES[@]} - 1))
+  if (( STACK_PUSH )); then
+    if ! push_branch "${STACK_BRANCHES[$abs]}"; then
+      _print_push_pause_banner "${STACK_BRANCHES[$abs]}"
+      _PHASE_OUTCOME=paused
+      return 0
+    fi
+  fi
+  if (( abs >= last )); then
+    _PHASE_OUTCOME=phase-complete
+  else
+    _PHASE_OUTCOME=unit-done
+  fi
+}
+
+_phase_reflow_pick_advance() {
+  local unit="$1"
+  local abs rc=0
+  abs=$(_reflow_pick_abs "$unit")
+  do_one_step "$abs" || rc=$?
+  if (( rc == 2 )); then
+    _print_conflict_banner "${STACK_BRANCHES[$abs]}"
+    _PHASE_OUTCOME=paused
+    return 0
+  fi
+  _reflow_pick_complete_unit "$abs"
+}
+
+_phase_reflow_pick_resume() {
+  local unit="$1"
+  local abs
+  abs=$(_reflow_pick_abs "$unit")
+
+  local gitdir marker
+  gitdir=$(git rev-parse --git-dir)
+  for marker in MERGE_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+    if [[ -e "$gitdir/$marker" ]]; then
+      die "another git operation is in progress ($marker); resolve it first"
+    fi
+  done
+  if [[ -e "$gitdir/CHERRY_PICK_HEAD" ]]; then
+    if [[ -n $(git ls-files --unmerged) ]]; then
+      die "cherry-pick has unresolved conflicts; fix them and 'git add' the files, then re-run"
+    fi
+    log "${C_DIM}continue${C_RESET} finishing in-progress cherry-pick"
+    GIT_EDITOR=true git cherry-pick --continue \
+      || die "git cherry-pick --continue failed; resolve manually and re-run"
+  fi
+  _reflow_pick_complete_unit "$abs"
+}
+
+_phase_reflow_pick_abort() {
+  local i b sha short
+  for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
+    b="${STACK_BRANCHES[$i]}"
+    sha="${STACK_ORIG_SHAS[$i]}"
+    [[ -n "$sha" ]] || continue
+    short="${sha:0:10}"
+    log "  ${C_DIM}restore${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}-> $short${C_RESET}"
+    git update-ref "refs/heads/$b" "$sha"
+  done
+  if [[ -e "$(git rev-parse --git-dir)/CHERRY_PICK_HEAD" ]]; then
+    git cherry-pick --abort 2>/dev/null || true
+  fi
+  if (( STACK_PUSH )); then
+    local pushed=() j
+    for ((j = STACK_FROM_IDX; j < STACK_FROM_IDX + STACK_UNIT_IDX; j++)); do
+      pushed+=("${STACK_BRANCHES[$j]}")
+    done
+    if (( ${#pushed[@]} > 0 )); then
+      warn "the following branches were already force-pushed; remote not undone:"
+      for b in "${pushed[@]}"; do warn "  $b"; done
+    fi
+  fi
+}
+
+# ----- rename-batch phase -----
+# One atomic local ref rename of STACK_RENAME_PAIRS (old/new alternating).
+# Reads each branch's current SHA at apply time (post-reflow), updates HEAD's
+# symref off any to-be-deleted ref, and renames via an atomic update-ref batch.
+# Atomic, so it never pauses; resume re-applies (idempotent at the ref level).
+
+# Apply an atomic local rename batch. Args: <reflog-msg> <old1> <new1> ...
+# Moves HEAD's symref if it points at a renamed branch (you cannot delete the
+# ref HEAD targets). Dies (restoring HEAD) if the atomic batch fails.
+_apply_local_rename_batch() {
+  local msg="$1"; shift
+  (( $# >= 2 )) || return 0
+  local batch="" old new sha i
+  local pairs=("$@")
+  for ((i = 0; i < ${#pairs[@]}; i += 2)); do
+    old="${pairs[$i]}"
+    new="${pairs[$((i + 1))]}"
+    sha=$(git rev-parse "refs/heads/$old")
+    batch+="create refs/heads/${new} ${sha}"$'\n'
+    batch+="delete refs/heads/${old} ${sha}"$'\n'
+  done
+  local head_before="" head_new=""
+  if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
+    for ((i = 0; i < ${#pairs[@]}; i += 2)); do
+      if [[ "$head_before" == "refs/heads/${pairs[$i]}" ]]; then
+        head_new="refs/heads/${pairs[$((i + 1))]}"
+        git symbolic-ref HEAD "$head_new"
+        break
+      fi
+    done
+  fi
+  if ! printf '%s' "$batch" | git update-ref --stdin -m "$msg"; then
+    [[ -n "$head_new" ]] && git symbolic-ref HEAD "$head_before" 2>/dev/null || true
+    die "git update-ref batch failed; refs unchanged (atomic)"
+  fi
+}
+
+_phase_rename_batch_advance() {
+  local pairs=("${STACK_RENAME_PAIRS[@]+"${STACK_RENAME_PAIRS[@]}"}")
+  if (( ${#pairs[@]} > 0 )); then
+    _apply_local_rename_batch "git-stack move (post-rename)" "${pairs[@]}"
+    log "${C_GREEN}done${C_RESET}    move complete (+$((${#pairs[@]} / 2)) renames)"
+    # Track the user's branch across the rename so _engine_finalize returns to
+    # it under its new name.
+    local i
+    for ((i = 0; i < ${#pairs[@]}; i += 2)); do
+      if [[ "$STACK_STARTING_BRANCH" == "${pairs[$i]}" ]]; then
+        STACK_STARTING_BRANCH="${pairs[$((i + 1))]}"
+        break
+      fi
+    done
+  fi
+  _PHASE_OUTCOME=phase-complete
+}
+
+# Resume == advance: the rename is atomic, so on re-run it either was never
+# applied (re-apply) or fully applied (the renamed refs already exist and the
+# old names are gone, so a re-run would no-op/skip — but in practice a paused
+# state is never persisted mid-rename, so resume just re-applies cleanly).
+_phase_rename_batch_resume() { _phase_rename_batch_advance "$@"; }
+
+# Reverse the local rename (new -> old). Reachable only via crash-recovery
+# (the phase never pauses), so it is best-effort.
+_phase_rename_batch_abort() {
+  local pairs=("${STACK_RENAME_PAIRS[@]+"${STACK_RENAME_PAIRS[@]}"}")
+  (( ${#pairs[@]} > 0 )) || return 0
+  local rev=() i
+  for ((i = 0; i < ${#pairs[@]}; i += 2)); do
+    # Only reverse pairs whose "new" ref actually exists (rename did apply).
+    if git rev-parse --verify --quiet "refs/heads/${pairs[$((i + 1))]}" >/dev/null; then
+      rev+=("${pairs[$((i + 1))]}" "${pairs[$i]}")
+    fi
+  done
+  (( ${#rev[@]} > 0 )) && _apply_local_rename_batch "git-stack abort (undo rename)" "${rev[@]}"
+}
+
+# ----- remote-sync phase -----
+# Remote branch renames (for any pushed pairs) followed by PR sync. Idempotent;
+# gated by --no-push (the phase is only added to the plan when push is enabled).
+# Same code path #2's pr-sync apply and doctor's rename tail reuse.
+
+_phase_remote_sync_advance() {
+  OPT_NO_PUSH="$STACK_OPT_NO_PUSH"
+  OPT_NO_SYNC="$STACK_OPT_NO_SYNC"
+  local pairs=("${STACK_RENAME_PAIRS[@]+"${STACK_RENAME_PAIRS[@]}"}")
+  if (( ! OPT_NO_PUSH )) && (( ${#pairs[@]} > 0 )); then
+    _remote_rename_batch_or_skip "${pairs[@]}"
+  fi
+  if (( ! OPT_NO_PUSH )); then
+    _post_rename_sync "$STACK_PREFIX"
+  fi
+  _PHASE_OUTCOME=phase-complete
+}
+
+# Resume == advance: PR sync is idempotent.
+_phase_remote_sync_resume() { _phase_remote_sync_advance "$@"; }
+
+# Remote effects cannot be safely auto-undone; warn only.
+_phase_remote_sync_abort() {
+  warn "remote rename/PR sync already applied; not undone by abort. Reconcile with 'git stack pr sync' ${C_DIM}[gstkprs]${C_RESET}."
+}
+
+# ----- phase dispatch -----
+
+_phase_advance() {
+  case "$1" in
+    reflow-pick)  _phase_reflow_pick_advance "$2" ;;
+    rename-batch) _phase_rename_batch_advance "$2" ;;
+    remote-sync)  _phase_remote_sync_advance "$2" ;;
+    *) die "internal: unknown phase type '$1'" ;;
+  esac
+}
+
+_phase_resume() {
+  case "$1" in
+    reflow-pick)  _phase_reflow_pick_resume "$2" ;;
+    rename-batch) _phase_rename_batch_resume "$2" ;;
+    remote-sync)  _phase_remote_sync_resume "$2" ;;
+    *) die "internal: unknown phase type '$1'" ;;
+  esac
+}
+
+_phase_abort() {
+  case "$1" in
+    reflow-pick)  _phase_reflow_pick_abort ;;
+    rename-batch) _phase_rename_batch_abort ;;
+    remote-sync)  _phase_remote_sync_abort ;;
+    *) die "internal: unknown phase type '$1'" ;;
+  esac
+}
+
+# ----- engine driver -----
+
+# Drive the plan from the current (STACK_PHASE_IDX, STACK_UNIT_IDX) position to
+# completion or pause, persisting after each step. Pass "resume" to finish an
+# in-flight unit first (continue); the default advances a fresh unit (restack).
+# Exits 2 on a paused conflict (state retained); calls _engine_finalize on done.
+_engine_run() {
+  local mode="${1:-advance}"
+  local num_phases=${#STACK_PHASES[@]}
+  local directive np nu
+  while :; do
+    if [[ "$mode" == resume ]]; then
+      _phase_resume "${STACK_PHASES[$STACK_PHASE_IDX]}" "$STACK_UNIT_IDX"
+      mode=advance
+    else
+      _phase_advance "${STACK_PHASES[$STACK_PHASE_IDX]}" "$STACK_UNIT_IDX"
+    fi
+    IFS=$'\t' read -r directive np nu \
+      < <(_engine_next "$num_phases" "$STACK_PHASE_IDX" "$STACK_UNIT_IDX" "$_PHASE_OUTCOME")
+    STACK_PHASE_IDX="$np"
+    STACK_UNIT_IDX="$nu"
+    case "$directive" in
+      advance|next-phase) save_engine_state ;;
+      paused)             save_engine_state; exit 2 ;;
+      done)               _engine_finalize; return 0 ;;
+    esac
+  done
+}
+
+# Best-effort abort: undo executed phases in reverse order, return to the
+# starting branch, and clear resume state.
+_engine_abort() {
+  log "${C_YELLOW}abort${C_RESET}   restoring branches to original SHAs"
+  local p
+  for ((p = STACK_PHASE_IDX; p >= 0; p--)); do
+    _phase_abort "${STACK_PHASES[$p]}"
+  done
+  if [[ -n "${STACK_STARTING_BRANCH-}" ]] && \
+     git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
+    git checkout --quiet "$STACK_STARTING_BRANCH"
+  fi
+  clear_state
+}
+
+# Finish a fully-completed plan: return to the starting branch and clear resume
+# state. A reflow push failure never reaches here — it pauses the plan instead
+# (see _reflow_pick_complete_unit), so on completion every push has succeeded.
+_engine_finalize() {
+  if [[ -n "$STACK_STARTING_BRANCH" ]] && \
+     git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
+    git checkout --quiet "$STACK_STARTING_BRANCH"
+  fi
+  local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
+  log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
+  clear_state
+}
+
 # ---------- core ----------
 
 # Reflow the branch at index $1.
@@ -762,141 +1111,6 @@ push_branch() {
     "$C_DIM" "$C_RESET" "$b" >&2
   STACK_PUSH_FAILURES+=("$b")
   return 1
-}
-
-# Driven by state-file globals. Saves state on every iteration boundary so
-# `continue` and `abort` can pick up.
-run_reflow_loop() {
-  local cursor=$STACK_CURSOR
-  local last=$((${#STACK_BRANCHES[@]} - 1))
-  while (( cursor <= last )); do
-    STACK_CURSOR=$cursor
-    save_state
-    local rc=0
-    do_one_step "$cursor" || rc=$?
-    if (( rc == 2 )); then
-      printf '\n%s%s: conflict%s on %s%s%s\n\n' \
-        "$C_RED" "$PROG" "$C_RESET" \
-        "$C_CYAN" "${STACK_BRANCHES[$cursor]}" "$C_RESET" >&2
-      local cf chunks s
-      while IFS= read -r cf; do
-        [[ -z "$cf" ]] && continue
-        chunks=$(grep -c '^<<<<<<< ' "$cf" 2>/dev/null || echo "?")
-        if [[ "$chunks" == "1" ]]; then s="chunk"; else s="chunks"; fi
-        printf '  %s%s%s %s(%s %s)%s\n' \
-          "$C_YELLOW" "$cf" "$C_RESET" \
-          "$C_DIM" "$chunks" "$s" "$C_RESET" >&2
-      done < <(git diff --name-only --diff-filter=U 2>/dev/null)
-      printf '\n' >&2
-      printf '  resolve + resume: %sgit stack continue%s %s[gstkc]%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
-      printf '  give up:          %sgit stack abort%s %s[gstka]%s\n'    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
-      exit 2
-    fi
-    if (( STACK_PUSH )); then
-      push_branch "${STACK_BRANCHES[$cursor]}" || true
-    fi
-    cursor=$((cursor + 1))
-  done
-
-  STACK_CURSOR=$cursor
-  save_state
-
-  if [[ -n "$STACK_STARTING_BRANCH" ]] && \
-     git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
-    git checkout --quiet "$STACK_STARTING_BRANCH"
-  fi
-
-  local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
-  if (( ${#STACK_PUSH_FAILURES[@]} > 0 )); then
-    local b_str=""
-    local b
-    for b in "${STACK_PUSH_FAILURES[@]}"; do b_str="${b_str:+$b_str }$b"; done
-    warn "force-with-lease push failed for: $b_str"
-    warn "rerun manually with: git push --force-with-lease origin <branch>"
-    clear_state
-    exit 3
-  fi
-  log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
-  local post_action="$STACK_POST_ACTION"
-  clear_state
-  if [[ "$post_action" == "move-rename" ]]; then
-    _finish_move_rename
-  fi
-}
-
-# Called by run_reflow_loop after Stage A finishes when STACK_POST_ACTION == "move-rename".
-# Reads STACK_POST_BRANCHES + STACK_PREFIX, computes consecutive-leaf cascade,
-# applies an atomic batch, then does remote rename + pr sync (unless --no-push).
-# Honors STACK_OPT_NO_PUSH / STACK_OPT_NO_SYNC from the state file (which mirror
-# OPT_NO_PUSH/OPT_NO_SYNC at the time of the original cmd_move invocation).
-_finish_move_rename() {
-  local prefix="$STACK_PREFIX"
-  local post=("${STACK_POST_BRANCHES[@]+"${STACK_POST_BRANCHES[@]}"}")
-
-  # Restore OPT_NO_PUSH/OPT_NO_SYNC from state for downstream helpers.
-  OPT_NO_PUSH="$STACK_OPT_NO_PUSH"
-  OPT_NO_SYNC="$STACK_OPT_NO_SYNC"
-
-  local width
-  width=$(_leaf_width_for "${post[@]+"${post[@]}"}")
-  # Gap-aware post-move cascade: keep each branch's existing leaf number if it
-  # already sits above the previous (kept or renamed) leaf; otherwise renumber
-  # it to prev_num + 1. Preserves intentional gaps left in the stack.
-  local rename_pairs=()
-  local prev_num=0
-  local i
-  for ((i = 0; i < ${#post[@]}; i++)); do
-    local old="${post[$i]}"
-    local old_leaf="${old##*/}"
-    [[ "$old_leaf" =~ ^([0-9]+)- ]] || die "internal: leaf '$old_leaf' malformed"
-    local old_num=$((10#${BASH_REMATCH[1]}))
-    local old_rest="${old_leaf#*-}"
-    if (( old_num > prev_num )); then
-      prev_num=$old_num
-      continue
-    fi
-    local new_num=$((prev_num + 1))
-    local new_leaf
-    new_leaf=$(_format_leaf "$new_num" "$width")
-    local new_full="${prefix}${new_leaf}-${old_rest}"
-    rename_pairs+=("$old" "$new_full")
-    prev_num=$new_num
-  done
-
-  if (( ${#rename_pairs[@]} > 0 )); then
-    local batch=""
-    local j
-    for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
-      local rp_old="${rename_pairs[$j]}"
-      local rp_new="${rename_pairs[$((j + 1))]}"
-      local sha
-      sha=$(git rev-parse "refs/heads/$rp_old")
-      batch+="create refs/heads/${rp_new} ${sha}"$'\n'
-      batch+="delete refs/heads/${rp_old} ${sha}"$'\n'
-    done
-    local head_before="" head_new=""
-    if head_before=$(git symbolic-ref --quiet HEAD 2>/dev/null); then
-      for ((j = 0; j < ${#rename_pairs[@]}; j+=2)); do
-        if [[ "$head_before" == "refs/heads/${rename_pairs[$j]}" ]]; then
-          head_new="refs/heads/${rename_pairs[$((j + 1))]}"
-          git symbolic-ref HEAD "$head_new"
-          break
-        fi
-      done
-    fi
-    if ! printf '%s' "$batch" | git update-ref --stdin -m "git-stack move (post-rename)"; then
-      [[ -n "$head_new" ]] && git symbolic-ref HEAD "$head_before" 2>/dev/null || true
-      die "git update-ref batch failed; refs unchanged (atomic)"
-    fi
-    log "${C_GREEN}done${C_RESET}    move complete (+$((${#rename_pairs[@]} / 2)) renames)"
-  fi
-
-  if (( ! OPT_NO_PUSH )) && (( ${#rename_pairs[@]} > 0 )); then
-    _remote_rename_batch_or_skip "${rename_pairs[@]}"
-  fi
-  if (( ! OPT_NO_PUSH )); then
-    _post_rename_sync "$prefix"
-  fi
 }
 
 # ---------- PR sync helpers ----------
@@ -1795,11 +2009,20 @@ cmd_status() {
       "$([ -n "${STACK_ONTO_REF-}" ] && [ "$STACK_ONTO_REF" != "$STACK_ONTO" ] && echo " (${STACK_ONTO:0:10})" || echo "")"
   fi
   printf '  %sfrom_idx:%s  %d\n'  "$C_DIM" "$C_RESET" "$STACK_FROM_IDX"
-  printf '  %scursor:%s    %d'    "$C_DIM" "$C_RESET" "$STACK_CURSOR"
-  if (( STACK_CURSOR < ${#STACK_BRANCHES[@]} )); then
-    printf ' (%s%s%s)\n' "$C_CYAN" "${STACK_BRANCHES[$STACK_CURSOR]}" "$C_RESET"
+  local cur_phase=""
+  (( ${#STACK_PHASES[@]} > 0 )) && cur_phase="${STACK_PHASES[$STACK_PHASE_IDX]}"
+  printf '  %sphase:%s     %d/%d %s%s%s\n' "$C_DIM" "$C_RESET" \
+    "$((STACK_PHASE_IDX + 1))" "${#STACK_PHASES[@]}" "$C_CYAN" "${cur_phase:-?}" "$C_RESET"
+  printf '  %sunit:%s      %d'    "$C_DIM" "$C_RESET" "$STACK_UNIT_IDX"
+  if [[ "$cur_phase" == "reflow-pick" ]]; then
+    local _abs=$((STACK_FROM_IDX + STACK_UNIT_IDX))
+    if (( _abs < ${#STACK_BRANCHES[@]} )); then
+      printf ' (%s%s%s)\n' "$C_CYAN" "${STACK_BRANCHES[$_abs]}" "$C_RESET"
+    else
+      printf ' (past end)\n'
+    fi
   else
-    printf ' (past end)\n'
+    printf '\n'
   fi
   printf '  %spush mode:%s %s\n'  "$C_DIM" "$C_RESET" "$([ "$STACK_PUSH" = "1" ] && echo yes || echo no)"
   if (( ${#STACK_PUSH_FAILURES[@]} > 0 )); then
@@ -2972,7 +3195,9 @@ move: no <branch> given and HEAD is detached"
   # Snapshot before mutation.
   snapshot_stack move "$prefix" "${branches[@]}"
 
-  # ----- Stage A: rebase affected branches in the new order onto their new predecessors -----
+  # Plan: reflow-pick (rebase affected branches onto new predecessors) →
+  # rename-batch (gap-aware post-move cascade) → remote-sync (remote rename +
+  # PR sync, unless --no-push).
   STACK_BRANCHES=("${post[@]}")
   STACK_ORIG_SHAS=()
   for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
@@ -2995,10 +3220,7 @@ move: no <branch> given and HEAD is detached"
   STACK_ONTO=""
   STACK_ONTO_REF=""
   STACK_FROM_IDX="$first_affected"
-  STACK_CURSOR="$first_affected"
   STACK_PUSH_FAILURES=()
-  STACK_POST_ACTION="move-rename"
-  STACK_POST_BRANCHES=("${post[@]}")
   STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
   STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
   if (( first_affected == 0 )); then
@@ -3011,8 +3233,19 @@ move: no <branch> given and HEAD is detached"
     STACK_ONTO_REF="$parent_name"
   fi
 
-  save_state
-  run_reflow_loop
+  # Compute the gap-aware post-move rename cascade now. It depends only on the
+  # post-move names/leaves (which the reflow does not change), so it is static
+  # plan data; the rename-batch phase reads each branch's SHA at apply time.
+  _doctor_scan_renames STACK_RENAME_PAIRS "$prefix" "${post[@]}"
+
+  STACK_PHASES=(reflow-pick)
+  (( ${#STACK_RENAME_PAIRS[@]} > 0 )) && STACK_PHASES+=(rename-batch)
+  (( ! OPT_NO_PUSH )) && STACK_PHASES+=(remote-sync)
+  STACK_PHASE_IDX=0
+  STACK_UNIT_IDX=0
+
+  save_engine_state
+  _engine_run
 }
 
 # ---------- doctor helpers ----------
@@ -3371,9 +3604,9 @@ _doctor_print_issue_header() {
     "$C_DIM" "$label" "$C_RESET" >&2
 }
 
-# Drive run_reflow_loop over the (possibly mutated) branch list to re-thread
-# any branches above a squash whose parent SHAs are now stale. Captures
-# CURRENT SHAs (post-squash) so do_one_step's skip checks see the new state.
+# Run the engine over the (possibly mutated) branch list to re-thread any
+# branches above a squash whose parent SHAs are now stale. Captures CURRENT
+# SHAs (post-squash) so do_one_step's skip checks see the new state.
 # Usage: _doctor_reflow_upper <prefix> <parent_ref> <from_idx> <branch>...
 _doctor_reflow_upper() {
   local prefix="$1" parent_ref="$2" from_idx="$3"; shift 3
@@ -3400,12 +3633,15 @@ _doctor_reflow_upper() {
   STACK_ONTO=""
   STACK_ONTO_REF=""
   STACK_FROM_IDX="$from_idx"
-  STACK_CURSOR="$from_idx"
   STACK_PUSH_FAILURES=()
+  # Plan: a single reflow-pick phase over branches [from_idx .. last].
+  STACK_PHASES=(reflow-pick)
+  STACK_PHASE_IDX=0
+  STACK_UNIT_IDX=0
 
   snapshot_stack doctor-reflow "$prefix" "${STACK_BRANCHES[@]}"
-  save_state
-  run_reflow_loop
+  save_engine_state
+  _engine_run
 }
 
 cmd_doctor() {
@@ -3938,74 +4174,27 @@ cmd_restack() {
   STACK_ONTO="$onto_sha"
   STACK_ONTO_REF="$OPT_ONTO"
   STACK_FROM_IDX="$from_idx"
-  STACK_CURSOR="$from_idx"
   STACK_PUSH_FAILURES=()
+  # Plan: a single reflow-pick phase over branches [from_idx .. last].
+  STACK_PHASES=(reflow-pick)
+  STACK_PHASE_IDX=0
+  STACK_UNIT_IDX=0
 
   snapshot_stack restack "$STACK_PREFIX" "${STACK_BRANCHES[@]}"
-  save_state
-  run_reflow_loop
+  save_engine_state
+  _engine_run
 }
 
 cmd_continue() {
   require_in_repo
   load_state
-
-  local gitdir marker
-  gitdir=$(git rev-parse --git-dir)
-  for marker in MERGE_HEAD REVERT_HEAD rebase-merge rebase-apply; do
-    if [[ -e "$gitdir/$marker" ]]; then
-      die "another git operation is in progress ($marker); resolve it first"
-    fi
-  done
-
-  if [[ -e "$gitdir/CHERRY_PICK_HEAD" ]]; then
-    if [[ -n $(git ls-files --unmerged) ]]; then
-      die "cherry-pick has unresolved conflicts; fix them and 'git add' the files, then re-run"
-    fi
-    log "${C_DIM}continue${C_RESET} finishing in-progress cherry-pick"
-    GIT_EDITOR=true git cherry-pick --continue \
-      || die "git cherry-pick --continue failed; resolve manually and re-run"
-  fi
-
-  if (( STACK_PUSH )); then
-    push_branch "${STACK_BRANCHES[$STACK_CURSOR]}" || true
-  fi
-  STACK_CURSOR=$((STACK_CURSOR + 1))
-  save_state
-  run_reflow_loop
+  _engine_run resume
 }
 
 cmd_abort() {
   require_in_repo
   load_state
-  log "${C_YELLOW}abort${C_RESET}   restoring branches to original SHAs"
-  local i b sha short
-  for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
-    b="${STACK_BRANCHES[$i]}"
-    sha="${STACK_ORIG_SHAS[$i]}"
-    [[ -n "$sha" ]] || continue
-    short="${sha:0:10}"
-    log "  ${C_DIM}restore${C_RESET} ${C_CYAN}$b${C_RESET} ${C_DIM}-> $short${C_RESET}"
-    git update-ref "refs/heads/$b" "$sha"
-  done
-  if [[ -e "$(git rev-parse --git-dir)/CHERRY_PICK_HEAD" ]]; then
-    git cherry-pick --abort 2>/dev/null || true
-  fi
-  if (( STACK_PUSH )); then
-    local pushed=()
-    for ((i = STACK_FROM_IDX; i < STACK_CURSOR; i++)); do
-      pushed+=("${STACK_BRANCHES[$i]}")
-    done
-    if (( ${#pushed[@]} > 0 )); then
-      warn "the following branches were already force-pushed; remote not undone:"
-      for b in "${pushed[@]}"; do warn "  $b"; done
-    fi
-  fi
-  if [[ -n "${STACK_STARTING_BRANCH-}" ]] && \
-     git rev-parse --verify --quiet "refs/heads/$STACK_STARTING_BRANCH" >/dev/null; then
-    git checkout --quiet "$STACK_STARTING_BRANCH"
-  fi
-  clear_state
+  _engine_abort
 }
 
 cmd_amend() {

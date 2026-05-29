@@ -98,6 +98,68 @@ teardown() { teardown_repo; }
   [[ "$output" == *"feat/02-b"* ]]
 }
 
+# ---------- restack: conflict / continue / abort ----------
+# Characterization tests pinning the interrupted-reflow contract: a cherry-pick
+# conflict halts with exit 2, `continue` resumes after resolution, and `abort`
+# restores original SHAs and clears resume state.
+
+@test "restack: cherry-pick conflict halts; continue completes reflow" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  printf 'changed-a\n' > file
+  git add file
+  git commit -q --amend -m "01-a changed"
+  local new_a
+  new_a=$(git rev-parse refs/heads/feat/01-a)
+
+  run git stack restack --no-color
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"conflict"* ]]
+
+  printf 'changed-a\n02-b\n' > file
+  git add file
+  run git stack continue --no-color
+  [ "$status" -eq 0 ]
+  assert_branch_parent_is feat/02-b "$new_a"
+}
+
+@test "restack: abort mid-conflict restores original SHAs and clears state" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  printf 'changed-a\n' > file
+  git add file
+  git commit -q --amend -m "01-a changed"
+  local sha_b
+  sha_b=$(git rev-parse refs/heads/feat/02-b)
+
+  run git stack restack --no-color
+  [ "$status" -eq 2 ]
+
+  run git stack abort --no-color
+  [ "$status" -eq 0 ]
+  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_b" ]
+
+  # Resume state gone — continue must refuse.
+  run git stack continue --no-color
+  [ "$status" -ne 0 ]
+}
+
+@test "restack --push: push failure pauses (resumable) instead of exiting 3" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  git commit -q --amend -m "01-a amended"
+  # No origin is configured, so the per-branch force-with-lease push fails. The
+  # failure must pause (exit 2, state retained) so the user can fix the remote
+  # and 'continue' — not the old fatal exit 3 that cleared state.
+  run git stack restack --push --no-color
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"push"* ]]
+  # State retained: abort can still load it (the old exit-3 path cleared it,
+  # so this abort would have failed).
+  run git stack abort --no-color
+  [ "$status" -eq 0 ]
+}
+
 # ---------- amend ----------
 
 @test "amend: amends current and reflows upper branches" {
@@ -1454,6 +1516,54 @@ make_dup_siblings() {
   git ls-tree -r --name-only refs/heads/feat/03-c | grep -qx 'c-file'
   # And it inherits 02-b's diff via the new ancestry (b-file).
   git ls-tree -r --name-only refs/heads/feat/03-c | grep -qx 'b-file'
+}
+
+# Two siblings sharing leaf 02 that edit the SAME file, so renumbering 02-c ->
+# 03-c and re-threading it onto 02-b conflicts on the cherry-pick. Pins doctor's
+# plan-composition-then-pause path (rename applied, then reflow pauses).
+make_conflicting_dups() {
+  git checkout -q -b feat/01-a; printf '01-a\n' >> file; git add file; git commit -q -m '01-a'
+  git checkout -q -b feat/02-b; printf 'B\n' >> file; git add file; git commit -q -m '02-b'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-c; printf 'C\n' >> file; git add file; git commit -q -m '02-c'
+  git checkout -q feat/01-a
+}
+
+@test "doctor --yes: duplicate-resolution reflow conflict halts; continue completes" {
+  make_conflicting_dups
+  run git stack doctor --yes --no-push --no-color
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"conflict"* ]]
+  # Rename already applied before the reflow paused.
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+
+  printf '01-a\nB\nC\n' > file
+  git add file
+  run git stack continue --no-color
+  [ "$status" -eq 0 ]
+  assert_branch_parent_is feat/03-c "$(git rev-parse refs/heads/feat/02-b)"
+}
+
+@test "doctor --yes: abort after duplicate-resolution conflict restores post-rename SHA" {
+  make_conflicting_dups
+  local orig_c
+  orig_c=$(git rev-parse refs/heads/feat/02-c)
+
+  run git stack doctor --yes --no-push --no-color
+  [ "$status" -eq 2 ]
+
+  run git stack abort --no-color
+  [ "$status" -eq 0 ]
+  # Engine abort restores the reflowed branch to its post-rename SHA (the rename
+  # moved the ref, not the commit, so 03-c's captured tip == the original 02-c
+  # tip). The doctor rename itself is not undone by engine abort.
+  git rev-parse --verify --quiet refs/heads/feat/03-c
+  [ "$(git rev-parse refs/heads/feat/03-c)" = "$orig_c" ]
+  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  # Resume state cleared.
+  run git stack continue --no-color
+  [ "$status" -ne 0 ]
 }
 
 @test "doctor --dry-run: lists duplicate leaf group without applying" {
