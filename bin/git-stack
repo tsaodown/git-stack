@@ -4781,7 +4781,8 @@ gstkcl() {
         _prefix="${_cur%/*}/"
       fi
       _b=$(git stack default-branch) || return
-      git checkout "$_b" || return
+      git checkout -q "$_b" || return
+      git pull --ff-only || return
     fi
   fi
   if [[ -n "$_prefix" ]]; then
@@ -4833,7 +4834,8 @@ function gstkcl
         set _prefix (string replace -r '/[^/]+$' '/' -- "$_cur")
       end
       set -l _b (git stack default-branch); or return
-      git checkout "$_b"; or return
+      git checkout -q "$_b"; or return
+      git pull --ff-only; or return
     end
   end
   if test -n "$_prefix"
