@@ -1653,6 +1653,7 @@ cmd_list() {
       (( ${#prefixes[@]} > 0 )) || die "no stacks found; create a branch with a numeric leaf (e.g. feat/01-start)"
       if (( ${#prefixes[@]} == 1 )); then
         prefix="${prefixes[0]}"
+        log "${C_DIM}stack: ${C_RESET}${C_BOLD}${prefix%/}${C_RESET}"
       else
         prefix=$(_pick_one "stack" "${prefixes[@]}") || die "no stack selected"
       fi
@@ -4364,6 +4365,7 @@ cmd_pr_list() {
       (( ${#prefixes[@]} > 0 )) || die "no stacks found; create a branch with a numeric leaf (e.g. feat/01-start)"
       if (( ${#prefixes[@]} == 1 )); then
         prefix="${prefixes[0]}"
+        log "${C_DIM}stack: ${C_RESET}${C_BOLD}${prefix%/}${C_RESET}"
       else
         prefix=$(_pick_one "stack" "${prefixes[@]}") || die "no stack selected"
       fi
@@ -4657,6 +4659,7 @@ cmd_checkout_interactive() {
     (( ${#prefixes[@]} > 0 )) || die "no stack branches found in this repo"
     if (( ${#prefixes[@]} == 1 )); then
       prefix="${prefixes[0]}"
+      log "${C_DIM}stack: ${C_RESET}${C_BOLD}${prefix%/}${C_RESET}"
     else
       local labels=() p
       for p in "${prefixes[@]}"; do
