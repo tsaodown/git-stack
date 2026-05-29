@@ -1642,8 +1642,22 @@ cmd_list() {
   done
   require_in_repo
 
-  local prefix
-  prefix=$(detect_prefix "$OPT_PREFIX")
+  local prefix rc=0
+  prefix=$(_try_detect_prefix "$OPT_PREFIX") || rc=$?
+  case "$rc" in
+    0) ;;
+    1) die "detached HEAD; checkout a branch first or pass --prefix" ;;
+    2)
+      local prefixes=()
+      while IFS= read -r p; do [[ -n "$p" ]] && prefixes+=("$p"); done < <(stack_prefixes)
+      (( ${#prefixes[@]} > 0 )) || die "no stacks found; create a branch with a numeric leaf (e.g. feat/01-start)"
+      if (( ${#prefixes[@]} == 1 )); then
+        prefix="${prefixes[0]}"
+      else
+        prefix=$(_pick_one "stack" "${prefixes[@]}") || die "no stack selected"
+      fi
+      ;;
+  esac
   local current
   current=$(require_branch)
   local branches=()
@@ -4339,8 +4353,22 @@ cmd_pr_list() {
   require_in_repo
   _gh_preflight
 
-  local prefix
-  prefix=$(detect_prefix "$OPT_PREFIX")
+  local prefix rc=0
+  prefix=$(_try_detect_prefix "$OPT_PREFIX") || rc=$?
+  case "$rc" in
+    0) ;;
+    1) die "detached HEAD; checkout a branch first or pass --prefix" ;;
+    2)
+      local prefixes=()
+      while IFS= read -r p; do [[ -n "$p" ]] && prefixes+=("$p"); done < <(stack_prefixes)
+      (( ${#prefixes[@]} > 0 )) || die "no stacks found; create a branch with a numeric leaf (e.g. feat/01-start)"
+      if (( ${#prefixes[@]} == 1 )); then
+        prefix="${prefixes[0]}"
+      else
+        prefix=$(_pick_one "stack" "${prefixes[@]}") || die "no stack selected"
+      fi
+      ;;
+  esac
   local current
   current=$(current_branch || echo "")
   local branches=()
