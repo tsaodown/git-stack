@@ -185,9 +185,11 @@ HOOK
 }
 
 @test "detect_prefix: non-numeric branch message" {
+  # `list` now works from outside a stack (commit 09686fb), so it no longer
+  # surfaces this error. Use a command that requires being on a stack branch.
   make_stack_branches feat 01-a
   git checkout -q -b plain-branch
-  run git stack list --no-fetch --no-color
+  run git stack restack
   [ "$status" -ne 0 ]
   [[ "$output" == *"no numeric leaf"* ]]
 }
