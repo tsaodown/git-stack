@@ -3610,45 +3610,112 @@ _doctor_resolve_duplicate_group() {
   done
 }
 
-# Return 0 (prints "absorbed", "merge", "multi", or "both" to stdout) when
-# <branch> needs a fix relative to <prev_ref>; return 1 (silent) when clean.
-# "absorbed" means the branch's tree already equals the predecessor's tree —
-# it's been fully merged upstream and is now redundant.
-# Usage: _doctor_branch_squash_kind <branch> <prev_ref>
-_doctor_branch_squash_kind() {
-  local b="$1" prev_ref="$2"
-  local b_ref="refs/heads/$b"
+# Pure classification of a branch's squash issue kind from pre-gathered git
+# facts (no git access, no die — safe to unit-test). Returns 0 and prints the
+# kind when a fix is needed; returns 1 (no output) when the branch is clean.
+#   absorbed — tree already equals the predecessor's (fully merged upstream,
+#              now redundant); dominates the other kinds.
+#   merge    — tip is a merge commit.
+#   multi    — more than one commit ahead of the predecessor.
+#   both     — merge tip AND multi-commit.
+# Usage: _doctor_squash_kind_pure <b_tree> <b_count> <prev_tree> <prev_count> <b_has_merge>
+_doctor_squash_kind_pure() {
+  local b_tree="$1" b_count="$2" prev_tree="$3" prev_count="$4" b_has_merge="$5"
 
-  # Tree equality dominates: a branch that's already been merged into its
-  # predecessor (e.g., PR merged upstream, local branch not yet cleaned up)
-  # should be offered for deletion, not squashed.
-  if _doctor_squash_is_empty "$b" "$prev_ref"; then
+  # Tree equality dominates: a branch already merged into its predecessor should
+  # be offered for deletion, not squashed.
+  if [[ "$b_tree" == "$prev_tree" ]]; then
     printf 'absorbed\n'
     return 0
   fi
 
-  local is_merge=0
-  if git rev-parse --verify --quiet "${b_ref}^2" >/dev/null 2>&1; then
-    is_merge=1
-  fi
-
-  # Same heuristic as do_one_step (bin/git-stack:691-694): a positive diff in
-  # reachable-commit counts indicates multi-commit. Sound for linear stacks;
-  # robust enough for the merge-tip case too because either flag suffices.
-  local count_b count_prev n_commits
-  count_b=$(git rev-list --count "$b_ref" 2>/dev/null || echo 0)
-  count_prev=$(git rev-list --count "$prev_ref" 2>/dev/null || echo 0)
-  n_commits=$((count_b - count_prev))
+  # Same heuristic as do_one_step: a positive diff in reachable-commit counts
+  # indicates multi-commit. Sound for linear stacks; robust enough for the
+  # merge-tip case too because either flag suffices.
   local is_multi=0
-  if (( n_commits > 1 )); then
-    is_multi=1
-  fi
+  (( b_count - prev_count > 1 )) && is_multi=1
 
-  if (( is_merge && is_multi )); then printf 'both\n';  return 0
-  elif (( is_merge ));               then printf 'merge\n'; return 0
-  elif (( is_multi ));               then printf 'multi\n'; return 0
+  if   (( b_has_merge && is_multi )); then printf 'both\n';  return 0
+  elif (( b_has_merge ));             then printf 'merge\n'; return 0
+  elif (( is_multi ));                then printf 'multi\n'; return 0
   fi
   return 1
+}
+
+# Pure: map a stack's shape (pre-gathered facts) to an ordered issue list — the
+# same "pure core" role the PR-sync reconciler plays. No git, no TTY. Emits one
+# TSV issue per line, kind tag first so a leading field is never empty (avoids
+# the IFS-strip trap when read back):
+#   squash<TAB><branch_idx><TAB><kind>      (kind: absorbed|merge|multi|both)
+#   dup<TAB><leaf_num><TAB><idx_csv>
+#   rename<TAB><old_branch><TAB><new_branch>
+# Order: all squash issues (branch order), then duplicate groups, then renames.
+# Facts per branch: name, tree SHA, has-merge-tip flag (0|1), commit count.
+# Usage: _doctor_scan <prefix> <base_tree> <base_count> -- <name> <tree> <merge> <count>...
+_doctor_scan() {
+  local prefix="$1" base_tree="$2" base_count="$3"
+  shift 3
+  [[ "${1-}" == "--" ]] || die "internal: _doctor_scan expects -- separator"
+  shift
+  local names=() trees=() merges=() counts=()
+  while (( $# >= 4 )); do
+    names+=("$1"); trees+=("$2"); merges+=("$3"); counts+=("$4")
+    shift 4
+  done
+
+  local n=${#names[@]} i prev_tree prev_count kind
+  # Squash issues: classify each branch against its positional predecessor.
+  for ((i = 0; i < n; i++)); do
+    if (( i == 0 )); then
+      prev_tree="$base_tree"; prev_count="$base_count"
+    else
+      prev_tree="${trees[$((i-1))]}"; prev_count="${counts[$((i-1))]}"
+    fi
+    if kind=$(_doctor_squash_kind_pure \
+                "${trees[$i]}" "${counts[$i]}" "$prev_tree" "$prev_count" "${merges[$i]}"); then
+      printf 'squash\t%d\t%s\n' "$i" "$kind"
+    fi
+  done
+
+  # Duplicate groups (leaf clashes). _doctor_find_duplicate_groups emits
+  # <leaf><TAB><idx_csv>; prefix the kind tag.
+  local dline
+  while IFS= read -r dline; do
+    [[ -n "$dline" ]] && printf 'dup\t%s\n' "$dline"
+  done < <(_doctor_find_duplicate_groups "${names[@]+"${names[@]}"}")
+
+  # Rename cascade (leaves out of order).
+  local pairs=()
+  _doctor_scan_renames pairs "$prefix" "${names[@]+"${names[@]}"}"
+  for ((i = 0; i < ${#pairs[@]}; i += 2)); do
+    printf 'rename\t%s\t%s\n' "${pairs[$i]}" "${pairs[$((i+1))]}"
+  done
+}
+
+# Effectful: gather the git facts _doctor_scan needs into a caller-named array,
+# laid out in _doctor_scan's argument order from <base_tree> onward —
+#   base_tree base_count -- <name> <tree> <merge> <count> ...
+# so the caller runs: _doctor_scan "$prefix" "${facts[@]}". This is the only
+# git-reading step of the scan; the classification itself stays pure.
+# Usage: _doctor_gather <out_array> <base_ref> <branch>...
+_doctor_gather() {
+  local out_name="$1" base_ref="$2"; shift 2
+  local branches=("$@")
+  local base_tree base_count
+  base_tree=$(git rev-parse "${base_ref}^{tree}")
+  base_count=$(git rev-list --count "$base_ref" 2>/dev/null || echo 0)
+  eval "$out_name=($(printf '%q ' "$base_tree" "$base_count" "--"))"
+  local b b_ref tree count merge
+  for b in "${branches[@]+"${branches[@]}"}"; do
+    b_ref="refs/heads/$b"
+    tree=$(git rev-parse "${b_ref}^{tree}")
+    count=$(git rev-list --count "$b_ref" 2>/dev/null || echo 0)
+    merge=0
+    if git rev-parse --verify --quiet "${b_ref}^2" >/dev/null 2>&1; then
+      merge=1
+    fi
+    eval "$out_name+=($(printf '%q ' "$b" "$tree" "$merge" "$count"))"
+  done
 }
 
 # Concatenated commit messages from prev..tip (oldest first, blank-line
@@ -3847,38 +3914,25 @@ cmd_doctor() {
     || die "doctor: cannot resolve parent ref for '$parent_name'"
 
   # ----- Scan -----
+  #
+  # Gather git facts once, then map shape -> issue list with the pure scanner,
+  # and bucket the issues into the arrays the dry-run / apply stages consume.
+  # --no-squash / --no-rename drop their issue kinds here.
 
-  local squash_idx=() squash_kind=()
-  if (( ! opt_no_squash )); then
-    local i b prev_ref kind
-    for ((i = 0; i < ${#branches[@]}; i++)); do
-      b="${branches[$i]}"
-      if (( i == 0 )); then
-        prev_ref="$parent_ref"
-      else
-        prev_ref="refs/heads/${branches[$((i-1))]}"
-      fi
-      if kind=$(_doctor_branch_squash_kind "$b" "$prev_ref"); then
-        squash_idx+=("$i")
-        squash_kind+=("$kind")
-      fi
-    done
-  fi
+  local _facts=()
+  _doctor_gather _facts "$parent_ref" "${branches[@]}"
+  local squash_idx=() squash_kind=() rename_pairs=() dup_groups=()
+  local _tag _f1 _f2
+  while IFS=$'\t' read -r _tag _f1 _f2; do
+    case "$_tag" in
+      squash) (( opt_no_squash )) || { squash_idx+=("$_f1"); squash_kind+=("$_f2"); } ;;
+      dup)    (( opt_no_rename )) || dup_groups+=("${_f1}"$'\t'"${_f2}") ;;
+      rename) (( opt_no_rename )) || rename_pairs+=("$_f1" "$_f2") ;;
+    esac
+  done < <(_doctor_scan "$prefix" "${_facts[@]}")
 
-  local rename_pairs=()
-  if (( ! opt_no_rename )); then
-    _doctor_scan_renames rename_pairs "$prefix" "${branches[@]}"
-    if (( ${#rename_pairs[@]} > 0 )); then
-      _doctor_check_rename_collisions "${rename_pairs[@]}"
-    fi
-  fi
-
-  local dup_groups=()
-  if (( ! opt_no_rename )); then
-    local _dline
-    while IFS= read -r _dline; do
-      [[ -n "$_dline" ]] && dup_groups+=("$_dline")
-    done < <(_doctor_find_duplicate_groups "${branches[@]}")
+  if (( ${#rename_pairs[@]} > 0 )); then
+    _doctor_check_rename_collisions "${rename_pairs[@]}"
   fi
 
   local total_issues=$(( ${#squash_idx[@]} + ${#rename_pairs[@]} / 2 ))

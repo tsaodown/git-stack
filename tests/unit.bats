@@ -354,3 +354,83 @@ normalize() {
   [ "$status" -eq 0 ]
   [ "$output" == $'a\n\n    b' ]
 }
+
+# --- doctor scan: pure squash-kind classification ---
+#
+# Maps a branch's git facts (vs its predecessor) to a squash issue kind, with
+# no git access. Args:
+#   <b_tree> <b_count> <prev_tree> <prev_count> <b_has_merge>
+# Prints absorbed|merge|multi|both and returns 0 when a fix is needed; returns 1
+# (no output) when the branch is clean.
+squash_kind() {
+  run bash -c "source '$GIT_STACK_BIN'; _doctor_squash_kind_pure \"\$@\"" _ "$@"
+}
+
+@test "squash kind: multi-commit (count diff > 1, distinct trees, no merge) -> multi" {
+  squash_kind treeB 5 treeA 3 0
+  [ "$status" -eq 0 ]
+  [ "$output" == "multi" ]
+}
+
+@test "squash kind: equal trees dominate -> absorbed (even with merge + multi)" {
+  squash_kind same 9 same 3 1
+  [ "$status" -eq 0 ]
+  [ "$output" == "absorbed" ]
+}
+
+@test "squash kind: merge tip, single commit ahead -> merge" {
+  squash_kind treeB 4 treeA 3 1
+  [ "$status" -eq 0 ]
+  [ "$output" == "merge" ]
+}
+
+@test "squash kind: merge tip AND multi-commit -> both" {
+  squash_kind treeB 6 treeA 3 1
+  [ "$status" -eq 0 ]
+  [ "$output" == "both" ]
+}
+
+@test "squash kind: single commit, distinct trees, no merge -> clean (rc 1, no output)" {
+  squash_kind treeB 4 treeA 3 0
+  [ "$status" -eq 1 ]
+  [ "$output" == "" ]
+}
+
+# --- doctor scan: stack shape -> ordered issue list (pure) ---
+#
+# Composes squash + duplicate + rename issues from pre-gathered facts, no git.
+# Args: <prefix> <base_tree> <base_count> -- <name> <tree> <merge> <count> ...
+# Emits one TSV issue per line, kind tag first:
+#   squash<TAB><branch_idx><TAB><kind>
+#   dup<TAB><leaf_num><TAB><idx_csv>
+#   rename<TAB><old_branch><TAB><new_branch>
+scan() {
+  run bash -c "source '$GIT_STACK_BIN'; _doctor_scan \"\$@\"" _ "$@"
+}
+
+@test "scan: multi-commit + duplicate leaf yields squash, dup, and rename issues" {
+  # feat/01-a clean; feat/02-b multi (5-3>1); feat/02-c dup leaf 2 (clean squash).
+  scan feat/ t0 2 -- \
+    feat/01-a t1 0 3 \
+    feat/02-b t2 0 5 \
+    feat/02-c t3 0 6
+  [ "$status" -eq 0 ]
+  [ "$output" == $'squash\t1\tmulti\ndup\t2\t1,2\nrename\tfeat/02-c\tfeat/03-c' ]
+}
+
+@test "scan: clean linear stack yields no issues" {
+  scan feat/ t0 2 -- \
+    feat/010-a t1 0 3 \
+    feat/020-b t2 0 4
+  [ "$status" -eq 0 ]
+  [ "$output" == "" ]
+}
+
+@test "scan: absorbed branch (tree equals predecessor) is a squash/absorbed issue" {
+  # feat/020-b's tree equals feat/010-a's tree -> absorbed.
+  scan feat/ t0 2 -- \
+    feat/010-a t1 0 3 \
+    feat/020-b t1 0 4
+  [ "$status" -eq 0 ]
+  [ "$output" == $'squash\t1\tabsorbed' ]
+}

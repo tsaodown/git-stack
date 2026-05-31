@@ -98,3 +98,69 @@ assert_branch_parent_is() {
     return 1
   }
 }
+
+# ---------- fail-fast assertion helpers ----------
+#
+# bats-core 1.13 only fails a test on its LAST command's status, so a bare
+# intermediate `[ ... ]` / `[[ ... ]]` that evaluates false is silently
+# skipped. These helpers each `return 1` (failing the test wherever they sit)
+# and print context, so an assertion in non-final position actually fires.
+# Use them instead of bare test brackets in any test with multiple checks.
+
+# assert <cmd...> : the command must succeed (exit 0).
+assert() {
+  if ! "$@"; then echo "assert failed: $*" >&2; return 1; fi
+}
+
+# refute <cmd...> : the command must fail (non-zero exit).
+refute() {
+  if "$@"; then echo "refute failed (expected non-zero): $*" >&2; return 1; fi
+}
+
+# assert_eq <actual> <expected> [label] : string equality.
+assert_eq() {
+  if [[ "$1" != "$2" ]]; then
+    echo "assert_eq failed${3:+ ($3)}: got '$1', want '$2'" >&2
+    return 1
+  fi
+}
+
+# assert_status <expected> : check the bats `run` status variable.
+assert_status() {
+  if [[ "${status-}" != "$1" ]]; then
+    echo "assert_status failed: got '${status-}', want '$1'" >&2
+    echo "--- output ---" >&2
+    echo "${output-}" >&2
+    return 1
+  fi
+}
+
+# assert_output_contains <substr> : check the bats `run` output variable.
+assert_output_contains() {
+  if [[ "${output-}" != *"$1"* ]]; then
+    echo "assert_output_contains failed: '$1' not found in:" >&2
+    echo "${output-}" >&2
+    return 1
+  fi
+}
+
+# assert_branch_exists / assert_branch_absent : local ref presence.
+assert_branch_exists() {
+  if ! git rev-parse --verify --quiet "refs/heads/$1" >/dev/null; then
+    echo "expected branch to exist: $1" >&2
+    return 1
+  fi
+}
+assert_branch_absent() {
+  if git rev-parse --verify --quiet "refs/heads/$1" >/dev/null; then
+    echo "expected branch to be absent: $1" >&2
+    return 1
+  fi
+}
+
+# assert_sha_eq <rev> <expected_sha> [label] : resolve <rev> and compare.
+assert_sha_eq() {
+  local actual
+  actual=$(git rev-parse "$1")
+  assert_eq "$actual" "$2" "${3:-$1}"
+}

@@ -1359,13 +1359,13 @@ $old_footer"
   sha_11=$(git rev-parse refs/heads/feat/11-c)
   sha_12=$(git rev-parse refs/heads/feat/12-d)
   run git stack doctor --yes --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/01-a
-  ! git rev-parse --verify --quiet refs/heads/feat/00-a
+  assert_status 0
+  assert_branch_exists feat/01-a
+  assert_branch_absent feat/00-a
   # The 10/11/12 branches must not have been renamed.
-  [ "$(git rev-parse refs/heads/feat/10-b)" = "$sha_10" ]
-  [ "$(git rev-parse refs/heads/feat/11-c)" = "$sha_11" ]
-  [ "$(git rev-parse refs/heads/feat/12-d)" = "$sha_12" ]
+  assert_sha_eq refs/heads/feat/10-b "$sha_10"
+  assert_sha_eq refs/heads/feat/11-c "$sha_11"
+  assert_sha_eq refs/heads/feat/12-d "$sha_12"
 }
 
 @test "doctor: cascades when fixing 00 closes the gap with 01" {
@@ -1374,10 +1374,10 @@ $old_footer"
   git checkout -q -b feat/01-b
   printf '01-b\n' >> file && git add file && git commit -q -m '01-b'
   run git stack doctor --yes --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/01-a
-  git rev-parse --verify --quiet refs/heads/feat/02-b
-  ! git rev-parse --verify --quiet refs/heads/feat/00-a
+  assert_status 0
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/02-b
+  assert_branch_absent feat/00-a
 }
 
 @test "doctor: no-op on already-valid stack" {
@@ -1386,10 +1386,10 @@ $old_footer"
   sha_01=$(git rev-parse refs/heads/feat/01-a)
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   run git stack doctor --yes --no-color
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"already valid"* ]]
-  [ "$(git rev-parse refs/heads/feat/01-a)" = "$sha_01" ]
-  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+  assert_status 0
+  assert_output_contains "already valid"
+  assert_sha_eq refs/heads/feat/01-a "$sha_01"
+  assert_sha_eq refs/heads/feat/02-b "$sha_02"
 }
 
 @test "doctor --dry-run: prints plan without renaming" {
@@ -1401,13 +1401,13 @@ $old_footer"
   sha_00=$(git rev-parse refs/heads/feat/00-a)
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   run git stack doctor --dry-run --no-color
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"feat/00-a"* ]]
-  [[ "$output" == *"feat/01-a"* ]]
+  assert_status 0
+  assert_output_contains "feat/00-a"
+  assert_output_contains "feat/01-a"
   # No actual rename — original refs unchanged.
-  [ "$(git rev-parse refs/heads/feat/00-a)" = "$sha_00" ]
-  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
-  ! git rev-parse --verify --quiet refs/heads/feat/01-a
+  assert_sha_eq refs/heads/feat/00-a "$sha_00"
+  assert_sha_eq refs/heads/feat/02-b "$sha_02"
+  assert_branch_absent feat/01-a
 }
 
 # ---------- doctor squash ----------
@@ -1419,13 +1419,13 @@ $old_footer"
   local sha_01
   sha_01=$(git rev-parse refs/heads/feat/01-a)
   run git stack doctor --yes --no-rename --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # 02-b is now a single commit on top of feat/01-a.
   assert_branch_parent_is feat/02-b "$sha_01"
   # Combined commit message picks up both original subjects.
   run git log -1 --format=%B refs/heads/feat/02-b
-  [[ "$output" == *"02-b"* ]]
-  [[ "$output" == *"02-b second"* ]]
+  assert_output_contains "02-b"
+  assert_output_contains "02-b second"
 }
 
 @test "doctor --yes: squashes merge-tip and deletes upper branch absorbed by squash" {
@@ -1438,12 +1438,12 @@ $old_footer"
   local sha_01
   sha_01=$(git rev-parse refs/heads/feat/01-a)
   run git stack doctor --yes --no-rename --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # 02-b becomes a single commit on top of feat/01-a — no longer a merge.
   assert_branch_parent_is feat/02-b "$sha_01"
-  ! git rev-parse --verify --quiet refs/heads/feat/02-b^2
+  refute git rev-parse --verify --quiet refs/heads/feat/02-b^2
   # 03-c was absorbed by the squash — doctor deleted it.
-  ! git rev-parse --verify --quiet refs/heads/feat/03-c
+  assert_branch_absent feat/03-c
 }
 
 @test "doctor --yes: reflows non-absorbed upper branch after squash" {
@@ -1460,14 +1460,37 @@ $old_footer"
   old_03=$(git rev-parse refs/heads/feat/03-c)
   git checkout -q feat/01-a
   run git stack doctor --yes --no-rename --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   assert_branch_parent_is feat/02-b "$sha_01"
   # 03-c still exists, re-threaded onto the new 02-b.
-  git rev-parse --verify --quiet refs/heads/feat/03-c
+  assert_branch_exists feat/03-c
   local new_02
   new_02=$(git rev-parse refs/heads/feat/02-b)
   assert_branch_parent_is feat/03-c "$new_02"
-  [ "$(git rev-parse refs/heads/feat/03-c)" != "$old_03" ]
+  refute test "$(git rev-parse refs/heads/feat/03-c)" = "$old_03"
+}
+
+@test "doctor --yes: absorbed branch deleted, surviving upper branch reflows past it" {
+  # 01-a, 02-b, 03-c built linearly; merge 03-c into 02-b so squashing 02-b
+  # absorbs 03-c. 04-d sits above 03-c with an independent diff, so it is NOT
+  # absorbed — it must reflow onto the squashed 02-b, skipping the deleted 03-c.
+  make_stack_branches feat 01-a 02-b 03-c
+  git checkout -q feat/02-b
+  git merge --no-ff -q -m "merge 03-c into 02-b" feat/03-c
+  git checkout -q feat/03-c
+  git checkout -q -b feat/04-d
+  printf 'd\n' > d-file && git add d-file && git commit -q -m 04-d
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-rename --no-push --no-color
+  assert_status 0
+  # 02-b squashed to a single (non-merge) commit; 03-c absorbed and deleted.
+  refute git rev-parse --verify --quiet refs/heads/feat/02-b^2
+  assert_branch_absent feat/03-c
+  # 04-d survives, re-threaded onto the squashed 02-b (not the deleted 03-c).
+  assert_branch_exists feat/04-d
+  assert_branch_parent_is feat/04-d "$(git rev-parse refs/heads/feat/02-b)"
+  run git ls-tree -r --name-only refs/heads/feat/04-d
+  assert_output_contains 'd-file'
 }
 
 @test "doctor --yes: empty-squash branch is deleted" {
@@ -1479,13 +1502,14 @@ $old_footer"
   git add file
   git commit -q -m "02-b absorbed back to 01-a state"
   # Sanity: trees are now equal.
-  [ "$(git rev-parse refs/heads/feat/01-a^{tree})" = "$(git rev-parse refs/heads/feat/02-b^{tree})" ]
+  assert_eq "$(git rev-parse refs/heads/feat/01-a^{tree})" \
+            "$(git rev-parse refs/heads/feat/02-b^{tree})" "trees equal"
   git checkout -q feat/01-a
   run git stack doctor --yes --no-rename --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # 02-b is deleted, 01-a still present.
-  ! git rev-parse --verify --quiet refs/heads/feat/02-b
-  git rev-parse --verify --quiet refs/heads/feat/01-a
+  assert_branch_absent feat/02-b
+  assert_branch_exists feat/01-a
 }
 
 @test "doctor --dry-run: lists squash issues without applying" {
@@ -1495,11 +1519,11 @@ $old_footer"
   local sha_02
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   run git stack doctor --dry-run --no-color
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"squash"* ]]
-  [[ "$output" == *"feat/02-b"* ]]
+  assert_status 0
+  assert_output_contains "squash"
+  assert_output_contains "feat/02-b"
   # Branch is unchanged.
-  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+  assert_sha_eq refs/heads/feat/02-b "$sha_02"
 }
 
 @test "doctor --no-squash: rename applies, multi-commit branch untouched" {
@@ -1512,12 +1536,12 @@ $old_footer"
   local sha_02
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   run git stack doctor --yes --no-squash --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # The 00-a leaf was renamed to 01-a (gap above is preserved).
-  git rev-parse --verify --quiet refs/heads/feat/01-a
-  ! git rev-parse --verify --quiet refs/heads/feat/00-a
+  assert_branch_exists feat/01-a
+  assert_branch_absent feat/00-a
   # feat/02-b is unchanged — --no-squash skipped the multi-commit fix.
-  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_02" ]
+  assert_sha_eq refs/heads/feat/02-b "$sha_02"
 }
 
 @test "doctor without --yes on non-tty refuses with a hint" {
@@ -1526,8 +1550,8 @@ $old_footer"
   printf 'extra\n' >> file && git add file && git commit -q -m "02-b second"
   # bats runs commands with stdin/stdout piped, so the tty check fires.
   run git stack doctor --no-color
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"--yes"* ]]
+  refute test "$status" -eq 0
+  assert_output_contains "--yes"
 }
 
 # ---------- doctor duplicate leaves ----------
@@ -1550,19 +1574,19 @@ make_dup_siblings() {
   sha_01=$(git rev-parse refs/heads/feat/01-a)
   git checkout -q feat/01-a
   run git stack doctor --yes --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # 02-b kept (sort-V order: b before c), 02-c renumbered to 03-c.
-  git rev-parse --verify --quiet refs/heads/feat/02-b
-  git rev-parse --verify --quiet refs/heads/feat/03-c
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+  assert_branch_absent feat/02-c
   # 03-c's tip must sit on top of 02-b (reflow re-threaded it from 01-a → 02-b).
   local sha_02
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   assert_branch_parent_is feat/03-c "$sha_02"
-  # 03-c still carries its diff (c-file).
-  git ls-tree -r --name-only refs/heads/feat/03-c | grep -qx 'c-file'
-  # And it inherits 02-b's diff via the new ancestry (b-file).
-  git ls-tree -r --name-only refs/heads/feat/03-c | grep -qx 'b-file'
+  # 03-c carries its own diff (c-file) and inherits 02-b's (b-file).
+  run git ls-tree -r --name-only refs/heads/feat/03-c
+  assert_output_contains 'c-file'
+  assert_output_contains 'b-file'
 }
 
 # Two siblings sharing leaf 02 that edit the SAME file, so renumbering 02-c ->
@@ -1579,16 +1603,16 @@ make_conflicting_dups() {
 @test "doctor --yes: duplicate-resolution reflow conflict halts; continue completes" {
   make_conflicting_dups
   run git stack doctor --yes --no-push --no-color
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"conflict"* ]]
+  assert_status 2
+  assert_output_contains "conflict"
   # Rename already applied before the reflow paused.
-  git rev-parse --verify --quiet refs/heads/feat/03-c
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  assert_branch_exists feat/03-c
+  assert_branch_absent feat/02-c
 
   printf '01-a\nB\nC\n' > file
   git add file
   run git stack continue --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   assert_branch_parent_is feat/03-c "$(git rev-parse refs/heads/feat/02-b)"
 }
 
@@ -1598,19 +1622,19 @@ make_conflicting_dups() {
   orig_c=$(git rev-parse refs/heads/feat/02-c)
 
   run git stack doctor --yes --no-push --no-color
-  [ "$status" -eq 2 ]
+  assert_status 2
 
   run git stack abort --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # Engine abort restores the reflowed branch to its post-rename SHA (the rename
   # moved the ref, not the commit, so 03-c's captured tip == the original 02-c
   # tip). The doctor rename itself is not undone by engine abort.
-  git rev-parse --verify --quiet refs/heads/feat/03-c
-  [ "$(git rev-parse refs/heads/feat/03-c)" = "$orig_c" ]
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  assert_branch_exists feat/03-c
+  assert_sha_eq refs/heads/feat/03-c "$orig_c"
+  assert_branch_absent feat/02-c
   # Resume state cleared.
   run git stack continue --no-color
-  [ "$status" -ne 0 ]
+  refute test "$status" -eq 0
 }
 
 # Doctor's remote tail (remote rename + pr sync for renumbered branches) now
@@ -1623,16 +1647,16 @@ make_conflicting_dups() {
   export GH_STUB_FAIL_RENAME="feat/02-c"
   git checkout -q feat/01-a
   run git stack doctor --yes --no-color
-  [ "$status" -ne 0 ]
+  refute test "$status" -eq 0
   # Local renumber + reflow already applied before the remote tail ran.
-  git rev-parse --verify --quiet refs/heads/feat/03-c || return 1
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c || return 1
+  assert_branch_exists feat/03-c
+  assert_branch_absent feat/02-c
   # State retained at the remote-sync phase → resumable.
-  [ -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  assert test -f "$(git rev-parse --git-dir)/stack-rebase-state"
   unset GH_STUB_FAIL_RENAME
   run git stack continue --no-color
-  [ "$status" -eq 0 ]
-  [ ! -f "$(git rev-parse --git-dir)/stack-rebase-state" ]
+  assert_status 0
+  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
 }
 
 # Aborting the combined (reflow-pick, remote-sync) plan at the remote-sync pause
@@ -1649,15 +1673,15 @@ make_conflicting_dups() {
   export GH_STUB_FAIL_RENAME="feat/02-c"
   git checkout -q feat/01-a
   run git stack doctor --yes --no-color
-  [ "$status" -ne 0 ]
-  [ -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  refute test "$status" -eq 0
+  assert test -f "$(git rev-parse --git-dir)/stack-rebase-state"
   run git stack abort --no-color
-  [ "$status" -eq 0 ]
-  [ ! -f "$(git rev-parse --git-dir)/stack-rebase-state" ] || return 1
+  assert_status 0
+  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
   # Rename kept (applied outside the engine); reflow unwound to the captured SHA.
-  git rev-parse --verify --quiet refs/heads/feat/03-c || return 1
-  [ "$(git rev-parse refs/heads/feat/03-c)" = "$orig_c" ] || return 1
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c
+  assert_branch_exists feat/03-c
+  assert_sha_eq refs/heads/feat/03-c "$orig_c"
+  assert_branch_absent feat/02-c
 }
 
 @test "doctor --dry-run: lists duplicate leaf group without applying" {
@@ -1666,13 +1690,13 @@ make_conflicting_dups() {
   sha_b=$(git rev-parse refs/heads/feat/02-b)
   sha_c=$(git rev-parse refs/heads/feat/02-c)
   run git stack doctor --dry-run --no-color
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"duplicate leaf 2"* ]]
-  [[ "$output" == *"feat/02-b"* ]]
-  [[ "$output" == *"feat/02-c"* ]]
+  assert_status 0
+  assert_output_contains "duplicate leaf 2"
+  assert_output_contains "feat/02-b"
+  assert_output_contains "feat/02-c"
   # Refs unchanged.
-  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_b" ]
-  [ "$(git rev-parse refs/heads/feat/02-c)" = "$sha_c" ]
+  assert_sha_eq refs/heads/feat/02-b "$sha_b"
+  assert_sha_eq refs/heads/feat/02-c "$sha_c"
 }
 
 @test "doctor --yes --no-rename: duplicates left untouched" {
@@ -1682,10 +1706,10 @@ make_conflicting_dups() {
   sha_c=$(git rev-parse refs/heads/feat/02-c)
   git checkout -q feat/01-a
   run git stack doctor --yes --no-rename --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # Both 02 leaves still exist with original SHAs.
-  [ "$(git rev-parse refs/heads/feat/02-b)" = "$sha_b" ]
-  [ "$(git rev-parse refs/heads/feat/02-c)" = "$sha_c" ]
+  assert_sha_eq refs/heads/feat/02-b "$sha_b"
+  assert_sha_eq refs/heads/feat/02-c "$sha_c"
 }
 
 @test "doctor --yes: three-way duplicate cascades correctly" {
@@ -1701,13 +1725,13 @@ make_conflicting_dups() {
   printf 'd\n' > d-file && git add d-file && git commit -q -m '02-d'
   git checkout -q feat/01-a
   run git stack doctor --yes --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
   # Sort-V order: 02-b stays, 02-c → 03-c, 02-d → 04-d.
-  git rev-parse --verify --quiet refs/heads/feat/02-b
-  git rev-parse --verify --quiet refs/heads/feat/03-c
-  git rev-parse --verify --quiet refs/heads/feat/04-d
-  ! git rev-parse --verify --quiet refs/heads/feat/02-c
-  ! git rev-parse --verify --quiet refs/heads/feat/02-d
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+  assert_branch_exists feat/04-d
+  assert_branch_absent feat/02-c
+  assert_branch_absent feat/02-d
   local sha_02 sha_03
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   sha_03=$(git rev-parse refs/heads/feat/03-c)
@@ -1729,19 +1753,20 @@ make_conflicting_dups() {
   printf 'c\n' > c-file && git add c-file && git commit -q -m '02-c'
   git checkout -q feat/01-a
   run git stack doctor --yes --no-push --no-color
-  [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/02-b
-  git rev-parse --verify --quiet refs/heads/feat/03-c
-  git rev-parse --verify --quiet refs/heads/feat/04-d
+  assert_status 0
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+  assert_branch_exists feat/04-d
   local sha_02 sha_03
   sha_02=$(git rev-parse refs/heads/feat/02-b)
   sha_03=$(git rev-parse refs/heads/feat/03-c)
   assert_branch_parent_is feat/03-c "$sha_02"
   assert_branch_parent_is feat/04-d "$sha_03"
   # All files reachable from the tip.
-  git ls-tree -r --name-only refs/heads/feat/04-d | grep -qx 'b-file'
-  git ls-tree -r --name-only refs/heads/feat/04-d | grep -qx 'c-file'
-  git ls-tree -r --name-only refs/heads/feat/04-d | grep -qx 'd-file'
+  run git ls-tree -r --name-only refs/heads/feat/04-d
+  assert_output_contains 'b-file'
+  assert_output_contains 'c-file'
+  assert_output_contains 'd-file'
 }
 
 # ---------- rename (remote stages) ----------

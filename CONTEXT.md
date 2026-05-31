@@ -108,9 +108,19 @@ _Avoid_: fold, collapse, combine.
 
 **Absorbed branch / Absorption**:
 A branch a **squash** made redundant — its tree now matches its new
-**predecessor**, so a reflow cherry-pick would be empty. Only knowable *after*
-squashing. Today the post-squash sweep deletes these.
+**predecessor**, so a reflow cherry-pick would be empty.
 _Avoid_: redundant branch, empty branch, collapsed branch.
+
+In practice an absorbed branch is detected and deleted (with a prompt) during
+the **squash** phase, where the scan already classifies it as a `squash`
+issue of kind `absorbed` (tree equality against its predecessor). The separate
+"post-squash absorbed-branch sweep" in `cmd_doctor` is **provably dead code**
+(verified 2026-05-30): every doctor mutation between scan and sweep is
+tree-preserving (squash = reset-soft+commit, same tree; both deletes remove
+tree-redundant branches), so a branch tree-equal to its effective predecessor
+at sweep time was already tree-equal at scan time and thus already handled.
+The sweep fires 0 times across the whole test suite. So absorption is *not*
+"only knowable after squashing" — the scan catches it.
 
 **Duplicate group**:
 Two or more branches sharing a **leaf** number, which doctor resolves by
@@ -118,10 +128,13 @@ renumbering.
 _Avoid_: collision, conflict (reserve "conflict" for a merge/cherry-pick
 conflict).
 
-## Proposed architecture (not yet built)
+## Proposed architecture
 
-Design vocabulary from the 2026-05-29 review. These name the deepened modules
-four proposed refactors would introduce. **None exist in the code yet.**
+Design vocabulary from the 2026-05-29 review naming the modules four refactors
+would introduce. Build status is noted per entry: refactors **#1 (reflow
+engine)**, **#2 (PR-sync reconciler)**, **#3 (placement)**, and **#4's pure
+scan** are built; #4's **absorbed-policy** was abandoned (see that entry). Names
+without a status note still describe code that exists after those refactors.
 
 ### Placement (refactor #3)
 
@@ -169,10 +182,11 @@ on full-plan completion or explicit `abort` — every other exit is paused and
 resumable.
 _Avoid_: stopped, suspended, blocked.
 
-**Absorbed-policy**:
+**Absorbed-policy** (DISCARDED — see "Doctor scan (refactor #4)"):
 Per-**plan** data telling **reflow-pick** what to do on an **absorbed** branch:
-`skip`/`error` for `restack`, `prompt-then-delete` for doctor. Keeps the shared
-phase generic — the doctor-specific delete behavior is plan data, not hardcoded.
+`skip`/`error` for `restack`, `prompt-then-delete` for doctor. Not built: the
+post-squash sweep this would have served is dead code, and `prompt-then-delete`
+can't run inside the engine anyway (a paused/resumed reflow has no TTY).
 
 ### PR-sync reconciler (refactor #2)
 
@@ -206,20 +220,32 @@ _Avoid_: diff, changeset.
 The proposed effectful write step that executes an **edit plan** (create / edit
 PRs). Same code path as the **engine**'s remote-sync **phase**.
 
-### Doctor scan (refactor #4)
+### Doctor scan (refactor #4) — BUILT (scan), absorbed-policy ABANDONED
 
-**Scan**:
-A proposed pure module mapping a **stack**'s shape to an **issue** list — the same
-"pure core" role the **reconciler** plays for PR sync. Idempotent and gh-free, so
-it's unit-testable without a TTY or fixture repo, and re-runnable on a mutated
-stack. Extracts the scanners currently interleaved with prompts in `cmd_doctor`.
+**Scan** (built 2026-05-30):
+A pure function `_doctor_scan` mapping a **stack**'s shape to an **issue** list —
+the same "pure core" role the **reconciler** plays for PR sync. Idempotent and
+gh-free: it takes pre-gathered git facts from the effectful `_doctor_gather`
+(per branch: tree SHA, commit count, merge-tip flag) and emits issues, so it's
+unit-testable without a TTY or fixture repo. `cmd_doctor` runs
+`gather → scan → bucket → dry-run/prompt/apply`. The squash-kind classification
+is itself a pure helper, `_doctor_squash_kind_pure`.
 _Avoid_: check, lint, diagnose.
 
-**Issue**:
-A data record the **scan** emits: a kind (**squash**, stale rename, **duplicate
-group**) plus affected branches and proposed fix. Drives both the interactive
-prompt and the **plan** doctor hands the **engine**.
+**Issue** (built):
+A data record `_doctor_scan` emits, one TSV line, kind tag first:
+`squash<TAB><idx><TAB><kind>`, `dup<TAB><leaf><TAB><idx_csv>`,
+`rename<TAB><old><TAB><new>`. Drives the interactive prompt and the **plan**
+doctor hands the **engine**.
 _Avoid_: problem, finding, warning.
+
+**Absorbed-policy — abandoned.** The planned #4 follow-up (fold the post-squash
+sweep into a `reflow-pick` **absorbed** outcome gated by a per-**plan**
+absorbed-policy) was **not built**: the sweep is dead code (see **Absorbed
+branch** above), so there is nothing to move into the engine. The reachable
+absorbed handling already lives in the squash phase (detect + prompt + delete at
+scan time). The **Absorbed-policy** entry under "Reflow engine" below is a
+discarded proposal, not a target.
 
 ## Flagged ambiguities
 
