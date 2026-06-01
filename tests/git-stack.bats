@@ -534,9 +534,9 @@ HOOK
   [ "$status" -eq 0 ]
   local body
   body=$(jq -r .body "$GH_STUB_DIR/by-num/101.json")
-  [[ "$body" == *"git-stack:nav-start"* ]]
-  [[ "$body" == *"#101 01-solo ← this PR"* ]]
-  [[ "$body" == *"git-stack:nav-end"* ]]
+  assert grep -qF "git-stack:nav-start" <<<"$body"
+  assert grep -qF "#101 [1/1] 01-solo ← this PR" <<<"$body"
+  assert grep -qF "git-stack:nav-end" <<<"$body"
 }
 
 @test "pr sync: empty-diff branch in middle is skipped and chain bridges over it" {
@@ -712,12 +712,13 @@ $old_footer"
   export GH_PR_feat_02_bar__BASE=feat/01-foo
   run git stack pr list --no-fetch --no-color
   [ "$status" -eq 0 ]
-  # The draft branch's line has [draft]; the non-draft does not.
-  local draft_line ready_line
-  draft_line=$(printf '%s\n' "$output" | grep 'feat/01-foo')
-  ready_line=$(printf '%s\n' "$output" | grep 'feat/02-bar')
-  [[ "$draft_line" == *"[draft]"* ]]
-  [[ "$ready_line" != *"[draft]"* ]]
+  # The draft branch's block has [draft] (on its flags line, below the branch
+  # name); the non-draft does not.
+  local draft_block ready_block
+  draft_block=$(printf '%s\n' "$output" | grep -A1 'feat/01-foo')
+  ready_block=$(printf '%s\n' "$output" | grep -A1 'feat/02-bar')
+  assert grep -qF "[draft]" <<<"$draft_block"
+  refute grep -qF "[draft]" <<<"$ready_block"
 }
 
 @test "pr list: [closed] and [merged] flags for non-open PRs" {
@@ -910,13 +911,14 @@ $old_footer"
 
 @test "init fish: emits abbr-based snippet for fish" {
   run git stack init fish
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"abbr -a -g gstk git stack"* ]]
-  [[ "$output" == *"abbr -a -g gstkrom"* ]]
-  [[ "$output" == *"abbr -a -g gstkromp"* ]]
-  [[ "$output" == *"abbr -a -g gstkcl"* ]]
+  assert_status 0
+  assert_output_contains "abbr -a -g gstk git stack"
+  assert_output_contains "abbr -a -g gstkrom"
+  assert_output_contains "abbr -a -g gstkromp"
+  # gstkcl carries multi-step close logic, so it's a fish function, not an abbr.
+  assert_output_contains "function gstkcl"
   # No bash-style function definitions.
-  [[ "$output" != *"gstkrom()"* ]]
+  refute grep -qF "gstkrom()" <<<"$output"
 }
 
 @test "init: errors with no argument" {
