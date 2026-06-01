@@ -163,23 +163,33 @@ run `git stack continue`, or back out with `git stack abort`. See
 built on the old `main` and you want it rebased onto the new tip.
 
 ```sh
-git fetch origin
-git stack restack --onto origin/main
+git stack clean      # fetch, prune any merged branches, reflow the stack onto origin/<default>
+git stack sync       # republish the rewritten branches
 ```
 
 ```
+fetching all remotes...
+reflowing 2 survivor(s) onto origin/main...
 restack feat/010-auth onto origin/main
 restack feat/020-login onto feat/010-auth
 done    reflow complete (2 branches restacked)
 ```
 
-**What happened.** `restack --onto origin/main` rebased the bottom branch onto the
-new base, then reflowed the rest of the stack up the chain. If you also want to
-prune merged branches and clean up the remote in the same pass, `git stack clean`
-does the fetch → prune → reflow-onto-`origin/<default>` sequence in one verb (see
-[§7](#7-the-bottom-pr-merged)).
+**What happened.** `clean` is the one-verb catch-up — the successor to the old
+`gstkrom`/`gstkromp` shortcuts. It fetches, prunes any stack branch whose PR has
+already merged (`[gone]`), offers to delete leftover remote branches under the
+prefix (decline to skip), then reflows the survivors onto the advanced
+`origin/<default>`. `sync` then force-with-lease-pushes the rewritten branches.
 
-**See also:** [partial reflow](#9-push-or-reflow-only-part-of-the-stack) · [aliases](reference.md#shell-integration--aliases)
+If you want *only* the rebase — no pruning, no remote tidy — reach for the
+surgical verb instead (`--push` republishes each branch as it lands):
+
+```sh
+git fetch origin
+git stack restack --onto origin/main --push
+```
+
+**See also:** [the merge/teardown flow](#7-the-bottom-pr-merged) · [partial reflow](#9-push-or-reflow-only-part-of-the-stack)
 
 ---
 
