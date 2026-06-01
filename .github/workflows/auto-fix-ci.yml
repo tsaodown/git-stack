@@ -1,0 +1,78 @@
+name: auto-fix-ci
+
+# When the `test` workflow fails on a PR, dispatch Claude Code to reproduce the
+# failure, root-cause it, and push a fix onto the PR branch. Fully automated —
+# no @claude mention needed.
+#
+# Setup (one-time, see docs/agents or the PR that added this):
+#   1. Install the Claude GitHub App on tsaodown/git-stack.
+#   2. Add an ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN) repo secret.
+#   3. This file must live on the default branch to fire (workflow_run always
+#      runs the default-branch copy).
+
+on:
+  workflow_run:
+    workflows: ["test"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  fix:
+    # Only on failure, only for PRs, and never for a fix PR we ourselves opened
+    # (claude-code-action pushes to `claude/*` branches) — this stops a fix PR
+    # whose CI still fails from re-dispatching the fixer in a loop.
+    if: >
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0] &&
+      !startsWith(github.event.workflow_run.head_branch, 'claude/') &&
+      github.event.workflow_run.actor.login != 'claude[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats parallel
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@test.invalid"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Investigate and fix
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            The `test` workflow failed on PR #${{ github.event.workflow_run.pull_requests[0].number }}
+            (branch `${{ github.event.workflow_run.head_branch }}`).
+
+            Failed run: ${{ github.event.workflow_run.html_url }}
+
+            Do this:
+            1. Read the failing logs:
+               `gh run view ${{ github.event.workflow_run.id }} --log-failed`
+            2. Reproduce locally with `make test JOBS=4` (bats is installed).
+            3. Root-cause and fix it — fix the real bug in bin/git-stack or the
+               test, don't just silence the failure. If it looks like a flaky
+               test, say so and explain why instead of forcing a change.
+            4. Re-run `make test JOBS=4` to confirm it passes.
+            5. Commit the fix and open a PR targeting `${{ github.event.workflow_run.head_branch }}`
+               with a short explanation of the root cause.
+
+            Note: this runner is Linux. If the failure is macOS-only you may not
+            be able to reproduce it — in that case, diagnose from the logs and
+            the code, and say clearly in the PR that you couldn't reproduce.
+          claude_args: |
+            --allowedTools "Edit,Read,Write,Bash(git:*),Bash(make:*),Bash(bats:*),Bash(gh:*)"
+            --max-turns 15
+            --model claude-opus-4-8
