@@ -5,10 +5,11 @@ are ordered by a numeric **leaf**. This file fixes the vocabulary for the
 stacking domain so refactors and reviews use one set of words.
 
 It has two parts. **Language** is the established domain — concepts that exist in
-today's code, README, and usage. **Proposed architecture** is design vocabulary
-from an architecture review (2026-05-29): names for modules and mechanisms a set
-of refactors *would* introduce. Nothing in that second section exists in the
-code yet — don't go looking for an `engine` or a `reconciler` in `bin/git-stack`.
+today's code, README, and usage. **Architecture** names the modules and mechanisms
+introduced by an architecture review (2026-05-29). Those refactors are now built:
+the `engine`, the PR-sync `reconciler`, `placement`, and the doctor `scan` all
+exist in `bin/git-stack` today. One proposal — the absorbed-policy — was
+deliberately abandoned; see that entry.
 
 ## Language
 
@@ -59,7 +60,7 @@ _Avoid_: space, room, slot.
 Re-threading a stack: replaying each branch onto its (possibly changed)
 **predecessor** so the stack stays linear after an amend, a rebase onto a new
 **base**, a move, or a doctor repair. The core operation `restack`, `move`,
-`continue`, and `doctor` all share (today: `run_reflow_loop` + `do_one_step`).
+`continue`, and `doctor` all share (the **engine**'s **reflow-pick** phase).
 _Avoid_: rebase (reserve for the underlying git op), re-stack, restacking.
 
 **Conflict**:
@@ -128,42 +129,42 @@ renumbering.
 _Avoid_: collision, conflict (reserve "conflict" for a merge/cherry-pick
 conflict).
 
-## Proposed architecture
+## Architecture
 
-Design vocabulary from the 2026-05-29 review naming the modules four refactors
-would introduce. Build status is noted per entry: refactors **#1 (reflow
-engine)**, **#2 (PR-sync reconciler)**, **#3 (placement)**, and **#4's pure
-scan** are built; #4's **absorbed-policy** was abandoned (see that entry). Names
-without a status note still describe code that exists after those refactors.
+Vocabulary from the 2026-05-29 review naming the modules four refactors
+introduced. All four are built — **#1 (reflow engine)**, **#2 (PR-sync
+reconciler)**, **#3 (placement)**, and **#4's pure scan** — and these entries
+describe code that exists in `bin/git-stack` today. The one exception is #4's
+**absorbed-policy**, which was abandoned (see that entry).
 
 ### Placement (refactor #3)
 
 **Placement**:
-A proposed pure module deciding, for a new or relocated branch, which **leaf** it
-takes and which branch becomes its **predecessor** — given the stack's leaves, a
-target intent (before / after / at / last), and the **width**. No git reads, no
-`die`: returns a status plus `(leaf, predecessor-or-base-sentinel)`. Replaces the
-placement arithmetic currently copy-pasted across `cmd_new`, `cmd_move`, and
-`_pick_position_for_new`.
+The pure module (`_placement_resolve`) deciding, for a new or relocated branch,
+which **leaf** it takes and which branch becomes its **predecessor** — given the
+stack's leaves, a target intent (before / after / at / last), and the **width**.
+No git reads, no `die`: returns a status plus `(leaf, predecessor-or-base-sentinel)`.
+Replaced the placement arithmetic formerly copy-pasted across `cmd_new`,
+`cmd_move`, and `_pick_position_for_new`.
 
 ### Reflow engine (refactor #1)
 
 **Engine**:
-A proposed single module that executes a **plan** — owning the on-disk resume
+A single module that executes a **plan** — owning the on-disk resume
 state, the `(phase, unit)` position, and `continue`/`abort` dispatch. Callers
-would hand it a plan instead of hand-populating `STACK_*` globals. Replaces
-today's `run_reflow_loop` + scattered state machinery.
+hand it a plan instead of hand-populating `STACK_*` globals. Replaced the former
+`run_reflow_loop` + scattered state machinery.
 
 **Plan**:
 What a caller hands the **engine**: an ordered list of **phases** plus the branch
-set and original SHAs. Each command (`restack`, `move`, `doctor`, `rename`) would
-compose its own plan from shared phase types.
+set and original SHAs. Each command (`restack`, `move`, `doctor`, `rename`)
+composes its own plan from shared phase types.
 
 **Phase**:
 One adapter in a **plan**, satisfying a three-operation contract — `advance`
 (do one unit; report `unit-done` / `paused` / `phase-complete`), `resume`
 (finish an in-flight unit, then advance), `abort` (undo this phase's effects as
-far as it can). Proposed phase types: **reflow-pick** (cherry-pick one branch;
+far as it can). Phase types: **reflow-pick** (cherry-pick one branch;
 can pause on **conflict**; carries an **absorbed-policy**), **rename-batch**
 (atomic local ref rename), **remote-sync** (remote rename + PR sync; idempotent).
 _Avoid_: step, stage, pass.
@@ -191,7 +192,7 @@ can't run inside the engine anyway (a paused/resumed reflow has no TTY).
 ### PR-sync reconciler (refactor #2)
 
 **Gather**:
-The proposed effectful read step producing **chain state**: per **active
+The effectful read step producing **chain state**: per **active
 branch**, its PR number/title/base/body, plus merged-status and titles for
 **merged predecessor** candidates (selected by a pure lineage-guard helper so the
 **reconciler** never touches gh).
@@ -202,7 +203,7 @@ of the **PR chain**. (Named to avoid colliding with **Snapshot**, the ref backup
 _Avoid_: snapshot, state dump, cache.
 
 **Reconciler**:
-A proposed pure module mapping **chain state** + stack structure to an **edit
+The pure module mapping **chain state** + stack structure to an **edit
 plan**. Owns every PR-presentation rule: the `[N/M]` position prefix,
 strikethrough on position change, **nav footer** rendering, **merged
 predecessor** weaving, and change detection (normalized so a GitHub body
@@ -217,7 +218,7 @@ prints it.
 _Avoid_: diff, changeset.
 
 **Apply**:
-The proposed effectful write step that executes an **edit plan** (create / edit
+The effectful write step that executes an **edit plan** (create / edit
 PRs). Same code path as the **engine**'s remote-sync **phase**.
 
 ### Doctor scan (refactor #4) — BUILT (scan), absorbed-policy ABANDONED

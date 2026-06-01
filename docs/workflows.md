@@ -1,0 +1,541 @@
+# Workflows
+
+Real development situations and how to navigate them with `git stack`. Each
+scenario stands on its own — skim for the one you're in. New to the vocabulary
+(*stack*, *leaf*, *reflow*, *predecessor*)? Start with [concepts.md](concepts.md).
+
+The examples use a three-branch stack on the `feat/` prefix:
+
+```
+feat/010-auth → feat/020-login → feat/030-profile
+```
+
+Output blocks are captured from real runs; commit SHAs will differ for you.
+
+| # | Scenario |
+|---|----------|
+| [1](#1-start-a-new-stack) | Start a new stack |
+| [2](#2-review-feedback-lands-on-the-bottom-branch) | Review feedback lands on the bottom branch |
+| [3](#3-main-moved-underneath-you) | `main` moved underneath you |
+| [4](#4-you-need-a-branch-in-the-middle) | You need a branch in the middle |
+| [5](#5-the-branches-are-in-the-wrong-order) | The branches are in the wrong order |
+| [6](#6-publish-and-refresh-the-pr-chain) | Publish and refresh the PR chain |
+| [7](#7-the-bottom-pr-merged) | The bottom PR merged |
+| [8](#8-rename-the-stacks-prefix) | Rename the stack's prefix |
+| [9](#9-push-or-reflow-only-part-of-the-stack) | Push or reflow only part of the stack *(advanced)* |
+| [10](#10-a-branch-grew-a-second-commit) | A branch grew a second commit *(advanced)* |
+| [11](#11-pull-a-branch-out-of-the-middle) | Pull a branch out of the middle *(advanced)* |
+| [12](#12-sharing-a-stack-with-someone-else) | Sharing a stack with someone else *(advanced)* |
+
+---
+
+## 1. Start a new stack
+
+**Situation.** You're starting a feature that's too big for one PR. Build it as a
+stack from the start so each piece reviews independently.
+
+Create branches the normal git way — `git stack` adopts any branch whose final
+path segment looks like `<number>-<slug>`:
+
+```sh
+git checkout -b feat/010-auth       # bottom of the stack
+# ...write code, commit...
+git checkout -b feat/020-login      # branches off feat/010-auth
+# ...write code, commit...
+git checkout -b feat/030-profile    # branches off feat/020-login
+# ...write code, commit...
+
+git stack list
+```
+
+```
+parent: main  [up to date]
+
+  feat/010-auth  [unpushed]
+    af95ef5  add auth
+  feat/020-login  [unpushed]
+    fd25cd4  add login
+* feat/030-profile  [unpushed]
+    e617449  add profile
+```
+
+**What happened.** `git stack list` infers the stack from the `feat/` prefix,
+orders the branches by their leaf, marks the one you're on with `*`, and shows
+each branch's sync state against its remote — here `[unpushed]`, since nothing's
+been pushed yet.
+
+Use **leaf numbers** to move around the stack instead of typing full branch
+names:
+
+```sh
+git stack checkout 10      # checks out feat/010-auth (numeric match)
+git stack checkout         # no number → interactive picker (fzf if installed)
+```
+
+**See also:** [concepts: stack & leaf](concepts.md#stack) · [publish the chain](#6-publish-and-refresh-the-pr-chain)
+
+---
+
+## 2. Review feedback lands on the bottom branch
+
+**Situation.** Your stack is pushed and the PR chain is open. A reviewer asks for
+a change on the *lowest* branch (`feat/010-auth`). Fixing it rewrites that
+branch's commit — so every branch above it now sits on a stale parent and must be
+replayed.
+
+```sh
+git stack list
+```
+
+```
+parent: origin/main  [up to date]
+
+  feat/010-auth  [synced]
+    52b6644  add auth
+  feat/020-login  [synced]
+    436ae30  add login
+* feat/030-profile  [synced]
+    0a94f56  add profile
+```
+
+Jump to the bottom branch by its leaf number, make the fix, and amend. `amend`
+does **not** auto-stage tracked edits — stage them yourself, or hand the paths to
+`amend` directly:
+
+```sh
+git stack checkout 10          # checks out feat/010-auth by leaf number
+# ...edit auth.txt to address the feedback...
+git stack amend -m "add auth (with validation)" -- auth.txt
+```
+
+```
+[feat/010-auth e537cbe] add auth (with validation)
+restack feat/020-login onto feat/010-auth
+restack feat/030-profile onto feat/020-login
+done    reflow complete (2 branches restacked)
+```
+
+**What happened.** `amend` amended the bottom branch, then **reflowed** the rest:
+it cherry-picked `feat/020-login` onto the new `feat/010-auth`, then
+`feat/030-profile` onto the new `feat/020-login`. Every branch above the one you
+touched gets a new tip SHA and now sits ahead of *and* behind its remote — the
+divergence grows as you climb, since each branch carries every rewritten commit
+below it:
+
+```sh
+git stack list
+```
+
+```
+parent: origin/main  [up to date]
+
+* feat/010-auth  [+1/-1]
+    e537cbe  add auth (with validation)
+  feat/020-login  [+2/-2]
+    bea3500  add login
+  feat/030-profile  [+3/-3]
+    4816a60  add profile
+```
+
+Publish the rewritten stack with `git stack push --all` (force-with-lease) —
+every branch returns to `[synced]` — then re-run `git stack pr sync` to refresh
+the PR chain.
+
+If a cherry-pick hits a conflict mid-reflow, the reflow pauses — resolve it and
+run `git stack continue`, or back out with `git stack abort`. See
+[doctor.md](doctor.md#recovering-from-a-conflict).
+
+**See also:** [push & the PR chain](pr-sync.md) · [concepts: reflow](concepts.md#reflow)
+
+---
+
+## 3. `main` moved underneath you
+
+**Situation.** A teammate merged to `main` while you were working. Your stack is
+built on the old `main` and you want it rebased onto the new tip.
+
+```sh
+git fetch origin
+git stack restack --onto origin/main
+```
+
+```
+restack feat/010-auth onto origin/main
+restack feat/020-login onto feat/010-auth
+done    reflow complete (2 branches restacked)
+```
+
+**What happened.** `restack --onto origin/main` rebased the bottom branch onto the
+new base, then reflowed the rest of the stack up the chain. The shell integration
+bundles the fetch-and-restack into one alias:
+
+```sh
+gstkrom        # = git fetch origin <default> && git stack restack --onto origin/<default>
+gstkromp       # ...and push each branch as it finishes (--push)
+```
+
+`<default>` resolves to your `stack.base` / `init.defaultBranch` / `main`. See
+[reference.md](reference.md#shell-integration--aliases).
+
+**See also:** [partial reflow](#9-push-or-reflow-only-part-of-the-stack) · [aliases](reference.md#shell-integration--aliases)
+
+---
+
+## 4. You need a branch in the middle
+
+**Situation.** Mid-stack you realize a piece of work belongs *between* two
+existing branches — a cache layer between `auth` and `login`, and some prep below
+`auth`.
+
+```sh
+git stack new cache --after feat/010-auth     # insert just above auth
+git stack new prep  --before feat/010-auth    # insert just below auth
+git stack list
+```
+
+```
+new     feat/015-cache (from feat/010-auth)
+new     feat/005-prep (from main)
+parent: main  [up to date]
+
+* feat/005-prep  [unpushed]
+    ca31a04  init
+  feat/010-auth  [unpushed]
+    9c21fbc  add auth
+  feat/015-cache  [unpushed]
+    9c21fbc  add auth
+  feat/020-login  [unpushed]
+    0810293  add login
+  feat/030-profile  [unpushed]
+    281d1f9  add profile
+```
+
+**What happened.** Each insert picks the **midpoint** of the [gap](concepts.md#gap):
+`--after feat/010-auth` lands at `015` (between `010` and `020`); `--before
+feat/010-auth` lands at `005` (between the base and `010`), so its predecessor is
+`main`. No existing branch is renumbered.
+
+`new` is **never destructive** — it creates one empty branch (its tip equals its
+predecessor's, which is why `015-cache` shows the same SHA as `010-auth` until you
+commit) and never touches anything else. Other placements:
+
+```sh
+git stack new fix --at 7      # explicit leaf → feat/007-fix
+git stack new                 # interactive picker (ref, before/after, leaf)
+```
+
+If the gap is too tight to fit a whole number, the insert is **refused** rather
+than cascading a renumber:
+
+```
+git-stack: error: new --before feat/02-b: no insertable leaf between 1 and 2 (gap exhausted); pick a different position or wait for doctor-reflow
+```
+
+Pick another spot, or re-space the stack with [`doctor`](doctor.md).
+
+**See also:** [concepts: gap](concepts.md#gap) · [reorder branches](#5-the-branches-are-in-the-wrong-order)
+
+---
+
+## 5. The branches are in the wrong order
+
+**Situation.** You built `auth → login → profile` but realize `profile` should
+come *before* `login`.
+
+```sh
+git stack move feat/030-profile --before feat/020-login
+git stack list
+```
+
+```
+restack feat/020-login onto feat/030-profile
+done    move complete (+1 renames)
+done    reflow complete (2 branches restacked)
+parent: main  [up to date]
+
+  feat/010-auth  [unpushed]
+    bb660f6  add auth
+* feat/030-profile  [unpushed]
+    a889a38  add profile
+  feat/031-login  [unpushed]
+    c0ff08d  add login
+```
+
+**What happened.** `move` relocated `feat/030-profile` below `login`, then
+reflowed: `login` was cherry-picked onto its new predecessor and **renumbered** to
+`031` to keep the leaf order consistent (`+1 renames`). Moving a branch changes
+branch names and tip SHAs by definition.
+
+> **Heads up — open PRs.** Because `move` renames branches, it **refuses by
+> default if any affected branch has an open head PR**: GitHub auto-closes a PR
+> when its head branch is renamed, and there's no API to reattach it. Pass
+> `--allow-pr-rebuild` to accept that the old PRs close and fresh ones open on the
+> next `pr sync`. Use `--no-push` / `--no-sync` for local-only moves.
+
+**See also:** [insert a branch](#4-you-need-a-branch-in-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
+
+---
+
+## 6. Publish and refresh the PR chain
+
+**Situation.** The stack is ready for review, or you've changed it and the PRs are
+now stale.
+
+```sh
+git stack pr sync
+```
+
+`pr sync` pushes any unpushed branches, opens a **draft PR per branch** (each
+based on the branch below it, the bottom on `stack.base`), and keeps every PR's
+`[N/M]` title prefix and stack-navigation footer in sync. Re-run it after *any*
+structural change — new branch, removed branch, reorder — to bring the PRs back
+into alignment. It's idempotent: PRs already matching aren't touched.
+
+```sh
+git stack pr sync --ready       # open as ready-for-review instead of drafts
+git stack pr sync --dry-run     # show planned actions, make no remote calls
+git stack pr list               # inspect the chain
+```
+
+Inspecting the chain with `pr list` shows a three-line block per branch —
+branch + PR number, then status badges, then the title:
+
+```
+* feat/010-auth   #41  (2c)
+    [synced] [draft] [approved: alice]
+    add auth
+
+  feat/020-login  #42
+    [synced] [draft] [changes: bob]
+    add login
+
+  feat/030-profile
+    (no PR)
+```
+
+> The `[approved]` / `[changes]` / `[checks: …]` badges and the comment count
+> depend on live review state, so the block above is illustrative. The full badge
+> legend and the mechanics of how the chain is built live in
+> [pr-sync.md](pr-sync.md).
+
+Requires [`gh`](https://cli.github.com/) authenticated for github.com.
+
+**See also:** [pr-sync.md](pr-sync.md) · [bottom PR merged](#7-the-bottom-pr-merged)
+
+---
+
+## 7. The bottom PR merged
+
+**Situation.** The bottom PR (`feat/010-auth`) merged and GitHub deleted its
+branch. You want to drop the merged branch locally and rebase the rest onto the
+updated base.
+
+After a fetch, the merged branch shows `[gone]` — its upstream no longer exists:
+
+```sh
+git stack list
+```
+
+```
+parent: origin/main  [up to date]
+
+  feat/010-auth  [gone]
+    63aeaec  add auth
+* feat/020-login  [synced]
+    0ea1619  add login
+  feat/030-profile  [synced]
+    45b2df8  add profile
+```
+
+Preview, then delete the gone branches:
+
+```sh
+git stack close --dry-run
+```
+
+```
+close   1 branch(es) with gone upstream:
+  delete  feat/010-auth (63aeaec)
+  (no matching backup refs)
+
+dry run: rerun without --dry-run to apply
+```
+
+```sh
+git stack close                       # actually delete the [gone] branches
+git stack restack --onto origin/main  # rebase what's left onto the new base
+git stack pr sync                     # re-point the chain
+```
+
+**What happened.** `close` runs `git fetch --prune` and deletes every stack branch
+whose upstream is `[gone]`, along with their snapshot refs (pass `--keep-history`
+to preserve backups). Then `restack --onto origin/main` rebases the surviving
+branches onto the now-advanced base, and `pr sync` repoints the remaining PRs. The
+`gstkcl` alias bundles the fetch+prune into `close`.
+
+**See also:** [main moved](#3-main-moved-underneath-you) · [rolling back](doctor.md#rolling-back-with-history)
+
+---
+
+## 8. Rename the stack's prefix
+
+**Situation.** You started on `feat/` but the work is really a `fix/`. Rename the
+whole stack at once.
+
+```sh
+git stack rename fix/ --dry-run    # preview the old→new mapping
+git stack rename fix/              # feat/010-auth → fix/010-auth, etc.
+```
+
+**What happened.** `rename` atomically renames every branch from `<old>/<leaf>` to
+`<new>/<leaf>`, carrying backup refs along. It refuses if a reflow is in progress,
+a branch is checked out elsewhere, or any target name already exists.
+
+> **Heads up — open PRs.** Like [`move`](#5-the-branches-are-in-the-wrong-order),
+> `rename` changes head branch names, so it **refuses if any branch has an open
+> head PR**. Pass `--allow-pr-rebuild` to let those PRs close and reopen on the
+> next sync. Use `--no-history` to skip carrying backup refs.
+
+**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order)
+
+---
+
+## 9. Push or reflow only part of the stack
+
+*(advanced)*
+
+**Situation.** The bottom branches are settled and pushed; you've only been
+editing the top. You want to reflow or push *from* a given branch up, not the
+whole stack.
+
+```sh
+git stack restack --from feat/020-login    # reflow the branches ABOVE feat/020-login
+git stack push --from feat/020-login       # push feat/020-login AND everything above it
+git stack push --all                       # (for contrast) push the whole stack
+```
+
+**What happened.** `--from <branch>` scopes the operation and leaves the lower
+branches untouched — but note the two commands treat `<branch>` itself
+differently. `restack --from X` is **exclusive**: it reflows the branches *above*
+X, with X as the fixed base they replay onto (it defaults to the current branch's
+child). `push --from X` is **inclusive**: it pushes X *and* everything above it
+(it defaults to the current branch upward). Both are handy after a localized edit,
+or when the lower branches are already merged and you don't want to re-touch them.
+
+**See also:** [main moved](#3-main-moved-underneath-you)
+
+---
+
+## 10. A branch grew a second commit
+
+*(advanced)*
+
+**Situation.** `git stack` treats each branch as **one commit** on top of its
+predecessor (mirroring `git reset --hard <prev> && git cherry-pick <tip>`). If a
+branch accumulates more than one commit, a plain `restack` refuses rather than
+silently dropping work:
+
+```
+git-stack: error: branch 'feat/030-profile' has 2 commits beyond its predecessor; restack would drop all but the tip. Pass --force to proceed (cherry-picks tip only) or rebase the branch manually first.
+```
+
+**How to navigate it.** You have three options:
+
+- **Prefer `amend`** for changes to an existing branch — it captures the pre-amend
+  SHA up front, so the single-commit model holds and the reflow stays clean. This
+  is the normal path (see [scenario 2](#2-review-feedback-lands-on-the-bottom-branch)).
+- **Squash first**, then restack — collapse the branch to one commit yourself
+  (`git rebase -i`), or let [`doctor`](doctor.md#squashing-and-repairing-a-stack)
+  detect and squash multi-commit branches for you.
+- **`restack --force`** *only* if you genuinely want just the tip commit kept;
+  intermediate commits on that branch are dropped.
+
+**See also:** [doctor.md](doctor.md#squashing-and-repairing-a-stack) · [concepts: reflow](concepts.md#reflow)
+
+---
+
+## 11. Pull a branch out of the middle
+
+*(advanced — recipe, not a single command)*
+
+**Situation.** A middle branch (`feat/020-login`) turned out to be unnecessary and
+you want it gone, with its changes removed from the branches above it.
+
+> **Don't just `git branch -D` it.** Deleting the ref leaves the branch's commit
+> sitting in the history of every branch above it — `feat/030-profile` would still
+> contain login's changes, and `restack` would refuse it as a multi-commit branch
+> (see [scenario 10](#10-a-branch-grew-a-second-commit)).
+
+The reliable recipe is to **move the unwanted branch to the top, then delete it** —
+the move reflows the branches that were above it down onto its old predecessor,
+cleanly extracting its changes:
+
+```sh
+git stack move feat/020-login --last --no-push --no-sync
+git stack list
+```
+
+```
+restack feat/020-login onto feat/030-profile
+done    move complete (+1 renames)
+done    reflow complete (2 branches restacked)
+parent: main  [up to date]
+
+  feat/010-auth  [unpushed]
+    27a69b6  add auth
+* feat/030-profile  [unpushed]
+    a8e8c48  add profile
+  feat/031-login  [unpushed]
+    973b9c9  add login
+```
+
+`feat/020-login` is now at the top, renumbered to `031-login`, and
+`feat/030-profile` has been reflowed straight onto `feat/010-auth` — its changes
+no longer carry login. Now delete the top branch:
+
+```sh
+git checkout feat/010-auth
+git branch -D feat/031-login
+```
+
+`feat/030-profile` now contains only `auth` + `profile`; login is gone entirely.
+If the branch you're removing has an open PR, pass `--allow-pr-rebuild` to the
+`move`, and after the remote branch is deleted let [`close`](#7-the-bottom-pr-merged)
+clean it up instead of `git branch -D`.
+
+**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order) · [multi-commit branches](#10-a-branch-grew-a-second-commit)
+
+---
+
+## 12. Sharing a stack with someone else
+
+*(advanced — hazards, not a supported workflow)*
+
+**Situation.** A teammate wants to pick up or contribute to your stack.
+
+`git stack` is a **single-owner, rebasing** tool. Every reflow rewrites the
+commits of every branch above the one you touched, and `push` uses
+`--force-with-lease`. That's safe when one person owns the stack — but it's
+actively hostile to shared editing:
+
+- If a collaborator commits on top of a branch you then reflow, their work is
+  stranded on an orphaned commit — the branch tip moves out from under them.
+- If they push to a branch between your fetch and your push, your
+  `--force-with-lease` push is *rejected* (the lease is stale) — which is the
+  safety net working, not a bug. You'll need to fetch and reconcile by hand.
+
+There's no command that coordinates multi-owner editing. If you must share:
+
+- **Hand off cleanly.** Agree that only one person mutates the stack at a time.
+  The other works in their own branches and opens separate PRs, or waits until the
+  stack lands.
+- **To review someone's stack read-only**, fetch and check out their branches —
+  but don't commit onto them if they're still reflowing.
+- **If your push is rejected** after someone else pushed, `git fetch` and inspect
+  with `git stack list`; you may need to `git stack abort` your in-progress reflow
+  or reconcile the branches manually before retrying.
+
+When a shared stack gets tangled, [`doctor`](doctor.md) and
+[`history`](doctor.md#rolling-back-with-history) are your recovery tools.
+
+**See also:** [doctor.md](doctor.md) · [rolling back](doctor.md#rolling-back-with-history)
