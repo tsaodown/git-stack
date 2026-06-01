@@ -1,2 +1,11 @@
 .DS_Store
 *.swp
+
+# Claude Code: track only shareable config; ignore per-session/local state
+# (locks, caches, local overrides). Default-deny so new state never leaks.
+.claude/*
+!.claude/CLAUDE.md
+!.claude/settings.json
+!.claude/commands/
+!.claude/agents/
+!.claude/hooks/
