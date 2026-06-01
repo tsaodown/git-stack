@@ -34,15 +34,17 @@ Output blocks are captured from real runs; commit SHAs will differ for you.
 **Situation.** You're starting a feature that's too big for one PR. Build it as a
 stack from the start so each piece reviews independently.
 
-Create branches the normal git way — `git stack` adopts any branch whose final
-path segment looks like `<number>-<slug>`:
+`git stack new` builds the stack for you. From `main` (or anywhere outside a
+stack) the first `new` bootstraps the stack — it creates the bottom branch, picks
+a sparse leaf, and checks it out. Each subsequent `new` infers the prefix and
+appends the next branch:
 
 ```sh
-git checkout -b feat/010-auth       # bottom of the stack
+git stack new auth --prefix feat/   # bootstrap: creates & checks out feat/010-auth
 # ...write code, commit...
-git checkout -b feat/020-login      # branches off feat/010-auth
+git stack new login                 # appends feat/020-login, checks it out
 # ...write code, commit...
-git checkout -b feat/030-profile    # branches off feat/020-login
+git stack new profile               # appends feat/030-profile
 # ...write code, commit...
 
 git stack list
@@ -59,10 +61,15 @@ parent: main  [up to date]
     e617449  add profile
 ```
 
-**What happened.** `git stack list` infers the stack from the `feat/` prefix,
-orders the branches by their leaf, marks the one you're on with `*`, and shows
-each branch's sync state against its remote — here `[unpushed]`, since nothing's
-been pushed yet.
+**What happened.** Each `new` created an empty branch and checked it out; after
+you commit into it, the branch carries your work. `git stack list` infers the
+stack from the `feat/` prefix, orders the branches by their leaf, marks the one
+you're on with `*`, and shows each branch's sync state against its remote — here
+`[unpushed]`, since nothing's been pushed yet.
+
+You don't have to use `new` — `git stack` adopts any branch whose final path
+segment looks like `<number>-<slug>`, so building the stack the plain-git way
+(`git checkout -b feat/010-auth`, commit, repeat) works just as well.
 
 Use **leaf numbers** to move around the stack instead of typing full branch
 names:
@@ -494,7 +501,7 @@ parent: main  [up to date]
 no longer carry login. Now delete the top branch:
 
 ```sh
-git checkout feat/010-auth
+git stack checkout 10        # switch off the branch we're about to delete
 git branch -D feat/031-login
 ```
 

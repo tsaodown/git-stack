@@ -70,9 +70,9 @@ See the [full alias list](docs/reference.md#shell-integration--aliases) in the r
 ## Quick start
 
 ```sh
-git checkout -b feat/010-auth      # start a stack
+git stack new auth --prefix feat/  # bootstrap a stack: creates feat/010-auth
 # ...write code, commit...
-git checkout -b feat/020-login     # next branch in the stack
+git stack new login                # append feat/020-login
 # ...write code, commit...
 
 git stack list                     # see the stack and its sync state
