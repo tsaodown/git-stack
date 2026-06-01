@@ -15,8 +15,26 @@ feat/020-login     ← sits on feat/010-auth
 feat/030-profile   ← top, sits on feat/020-login
 ```
 
-`git stack` infers the current stack from the branch you're on. You can override
-detection with `git config stack.prefix feat/` or `--prefix`.
+The **current stack is HEAD-derived** — it's just the prefix of the branch you
+have checked out. There's no persistent "active stack" pointer to set or forget;
+switch stacks by checking out a branch in another one (`git stack pick` jumps to
+a stack's tip in one step). You can override detection with
+`git config stack.prefix feat/` or `--prefix`.
+
+## Stack-level vs branch-level commands
+
+The verbs split along what they operate on:
+
+- **Stack-level** — act on a whole stack: `list` (overview of every stack),
+  `view` (one stack's contents), `pick` (hop to a stack's tip), `create` (start
+  a new stack), `sync` (push the whole stack), `clean` (prune + reflow).
+- **Branch-level** — act on a single branch within the current stack: `add`,
+  `checkout`, `restack`, `amend`, `move`, `rename`.
+
+`create <prefix> <slug>` starts a brand-new stack off the base; `add <slug>`
+inserts into the stack you're already on (it errors outside one — no silent
+bootstrap). See the command vocabulary in
+[CONTEXT.md → Commands](../CONTEXT.md#commands).
 
 ## Prefix
 
@@ -40,7 +58,7 @@ width. A stack has one width, derived from its lowest leaf.
 ## Gap
 
 The unused leaf interval between two adjacent branches. Inserting a branch picks
-the **midpoint** of a gap — `new --after feat/010-auth` on a `010`/`020` stack
+the **midpoint** of a gap — `add --after feat/010-auth` on a `010`/`020` stack
 lands at `015`.
 
 **Gap exhausted:** when no whole number fits between two neighbors (e.g. trying

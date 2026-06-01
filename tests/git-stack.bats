@@ -5,11 +5,38 @@ load helpers
 setup() { setup_repo; }
 teardown() { teardown_repo; }
 
-# ---------- list ----------
+# ---------- list (all-stacks overview) ----------
 
-@test "list: orders branches numerically and marks current with *" {
+@test "list: overview shows every stack, branch count, tip, and current marker" {
   make_stack_branches feat 01-a 02-b 03-c
-  run git stack list --no-fetch --no-color
+  git checkout -q main
+  make_stack_branches bug 01-x
+  git checkout -q feat/03-c
+  run git stack list --no-color
+  [ "$status" -eq 0 ]
+  # Both stacks appear, by prefix name (not per-branch).
+  echo "$output" | grep -q "feat"
+  echo "$output" | grep -q "bug"
+  # Current stack (feat) carries the * marker; counts are shown.
+  echo "$output" | grep -q "\* feat"
+  [[ "$output" == *"3 branches"* ]]
+  [[ "$output" == *"1 branch"* ]]
+  # Tip leaf of feat is shown; individual middle branches are not listed.
+  [[ "$output" == *"tip 03-c"* ]]
+}
+
+@test "list: errors with a create hint when there are no stacks" {
+  run git stack list --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no stacks found"* ]]
+  [[ "$output" == *"create"* ]]
+}
+
+# ---------- view (one stack's contents) ----------
+
+@test "view: orders branches numerically and marks current with *" {
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack view --no-fetch --no-color
   [ "$status" -eq 0 ]
   echo "$output" | grep -q "feat/01-a"
   echo "$output" | grep -q "feat/02-b"
@@ -22,11 +49,20 @@ teardown() { teardown_repo; }
   [ "$pos2" -lt "$pos3" ]
 }
 
-@test "list: shows [unpushed] for branches with no upstream" {
+@test "view: shows [unpushed] for branches with no upstream" {
   make_stack_branches feat 01-a
-  run git stack list --no-fetch --no-color
+  run git stack view --no-fetch --no-color
   [ "$status" -eq 0 ]
   [[ "$output" == *"[unpushed]"* ]]
+}
+
+@test "view: accepts a named stack (trailing slash optional) from outside" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q main
+  run git stack view feat --no-fetch --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"feat/01-a"* ]]
+  [[ "$output" == *"feat/02-b"* ]]
 }
 
 # ---------- restack ----------
@@ -241,7 +277,7 @@ HOOK
 @test "detect_prefix: detached HEAD message" {
   make_stack_branches feat 01-a
   git checkout -q --detach
-  run git stack list --no-fetch --no-color
+  run git stack view --no-fetch --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"detached HEAD"* ]]
 }
@@ -262,30 +298,30 @@ HOOK
   make_stack_branches feat 01-a 02-b
   git checkout -q main
   # Each command should accept --prefix without error.
-  run git stack list --prefix feat/ --no-fetch --no-color
+  run git stack view --prefix feat/ --no-fetch --no-color
   [ "$status" -eq 0 ]
-  run git stack push --prefix feat/ --no-color
-  # push will fail (no remote), but --prefix should parse.
+  run git stack sync --prefix feat/ --no-color
+  # sync will fail (no remote), but --prefix should parse.
   [[ "$output" != *"unknown"* ]]
 }
 
-# ---------- push ----------
+# ---------- sync ----------
 
-@test "push: sets upstream so a freshly-pushed branch reports [synced]" {
+@test "sync: sets upstream so a freshly-pushed branch reports [synced]" {
   make_stack_branches feat 01-a
   make_remote_origin
   # New branch created after origin was set up — no upstream yet.
   make_stack_branches feat 02-b
   [ -z "$(git for-each-ref --format='%(upstream:short)' refs/heads/feat/02-b)" ]
 
-  run git stack push --all --no-color
+  run git stack sync --no-color
   [ "$status" -eq 0 ]
 
   # Upstream must be configured to origin/feat/02-b after push.
   [ "$(git for-each-ref --format='%(upstream:short)' refs/heads/feat/02-b)" = "origin/feat/02-b" ]
 
-  # And `list` must reflect that — no [unpushed] for feat/02-b.
-  run git stack list --no-fetch --no-color
+  # And `view` must reflect that — no [unpushed] for feat/02-b.
+  run git stack view --no-fetch --no-color
   [ "$status" -eq 0 ]
   local line
   line=$(echo "$output" | grep "feat/02-b")
@@ -293,19 +329,73 @@ HOOK
   [[ "$line" == *"[synced]"* ]]
 }
 
-# ---------- close ----------
+@test "sync: pushes the whole stack additively (no --from / --all needed)" {
+  make_stack_branches feat 01-a 02-b 03-c
+  make_remote_origin
+  # Detach upstream tracking to force a re-push of all three.
+  git push -q origin --delete feat/01-a feat/02-b feat/03-c
+  git fetch -q --prune
+  git checkout -q feat/03-c
+  run git stack sync --no-color
+  [ "$status" -eq 0 ]
+  # All three branches are on origin again.
+  git ls-remote --exit-code origin refs/heads/feat/01-a
+  git ls-remote --exit-code origin refs/heads/feat/02-b
+  git ls-remote --exit-code origin refs/heads/feat/03-c
+}
 
-@test "close: deletes only branches with [gone] upstream" {
+# ---------- clean ----------
+
+@test "clean: prunes only local branches with [gone] upstream" {
   make_stack_branches feat 01-a 02-b
   make_remote_origin
   git push -q origin --delete feat/02-b
   git fetch -q --prune
   git checkout -q main
-  run git stack close --prefix feat/ --no-color
+  run git stack clean --prefix feat/ --no-color
   [ "$status" -eq 0 ]
   run git rev-parse --verify --quiet refs/heads/feat/02-b
   [ "$status" -ne 0 ]
   git rev-parse --verify --quiet refs/heads/feat/01-a
+}
+
+@test "clean --dry-run: previews local prune, remote orphans, and reflow" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  # 01-a's upstream goes away (gone); a remote-only orphan appears under prefix.
+  git push -q origin --delete feat/01-a
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  run git stack clean --dry-run --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"feat/01-a"* ]]
+  [[ "$output" == *"feat/099-orphan"* ]]
+  [[ "$output" == *"dry run"* ]]
+  [[ "$output" == *"reflow"* ]]
+  # Dry run mutates nothing.
+  git rev-parse --verify --quiet refs/heads/feat/01-a
+  git ls-remote --exit-code origin refs/heads/feat/099-orphan
+}
+
+@test "clean: non-TTY declines remote deletion but still reflows survivors" {
+  # NOTE: the accept branch (_confirm -> y -> `git push origin --delete`) is
+  # intentionally uncovered here — _confirm reads from /dev/tty, which the bats
+  # harness has no controlling terminal for, so it always returns 1 (decline).
+  # This test pins the decline-continues contract; the deletion itself is
+  # verified by inspection.
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  # No tty in the test harness -> _confirm returns 1 -> remote deletion skipped.
+  run git stack clean --no-color
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skipped remote deletion"* ]]
+  # Orphan survives on origin; survivors still got reflowed.
+  git ls-remote --exit-code origin refs/heads/feat/099-orphan
+  [[ "$output" == *"reflow"* ]]
 }
 
 # ---------- pr sync ----------
@@ -894,10 +984,13 @@ $old_footer"
   [ "$status" -eq 0 ]
   [[ "$output" == *"alias gstk='git stack'"* ]]
   [[ "$output" == *"alias gstkl='git stack list'"* ]]
+  [[ "$output" == *"alias gstkv='git stack view'"* ]]
   [[ "$output" == *"alias gstkam='git stack amend'"* ]]
-  [[ "$output" == *"gstkrom()"* ]]
-  [[ "$output" == *"gstkromp()"* ]]
-  [[ "$output" == *"gstkcl()"* ]]
+  [[ "$output" == *"alias gstkcl='git stack clean'"* ]]
+  # gstkcl is now a plain alias (the clean verb), no longer a shell function.
+  [[ "$output" != *"gstkrom()"* ]]
+  [[ "$output" != *"gstkromp()"* ]]
+  [[ "$output" != *"gstkcl()"* ]]
   # Result must parse as valid bash.
   bash -n <(printf '%s\n' "$output")
 }
@@ -906,18 +999,18 @@ $old_footer"
   run git stack init zsh
   [ "$status" -eq 0 ]
   [[ "$output" == *"alias gstk='git stack'"* ]]
-  [[ "$output" == *"gstkrom()"* ]]
+  [[ "$output" == *"alias gstkcr='git stack create'"* ]]
 }
 
 @test "init fish: emits abbr-based snippet for fish" {
   run git stack init fish
   assert_status 0
   assert_output_contains "abbr -a -g gstk git stack"
-  assert_output_contains "abbr -a -g gstkrom"
-  assert_output_contains "abbr -a -g gstkromp"
-  # gstkcl carries multi-step close logic, so it's a fish function, not an abbr.
-  assert_output_contains "function gstkcl"
-  # No bash-style function definitions.
+  assert_output_contains "abbr -a -g gstkcl git stack clean"
+  assert_output_contains "abbr -a -g gstkcr git stack create"
+  # No removed helpers and no bash-style function definitions.
+  refute grep -qF "gstkrom" <<<"$output"
+  refute grep -qF "function gstkcl" <<<"$output"
   refute grep -qF "gstkrom()" <<<"$output"
 }
 
@@ -933,37 +1026,44 @@ $old_footer"
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches simple-abbreviation count (21)" {
-  # 21 simple aliases (gstk + 20 others, including gstkd), 3 compound functions.
+@test "init bash: alias count matches the verb map (23, no shell functions)" {
+  # 23 simple aliases; no compound shell functions after the redesign.
   run git stack init bash
   [ "$status" -eq 0 ]
-  local alias_count
-  alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk')
-  [ "$alias_count" -eq 21 ]
+  local alias_count func_count
+  alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk' || true)
+  func_count=$(printf '%s\n' "$output" | grep -c '^gstk.*()' || true)
+  [ "$alias_count" -eq 23 ]
+  [ "$func_count" -eq 0 ]
 }
 
-@test "init bash: emits gstkn, gstkmv (move), gstkrn" {
+@test "init bash: emits gstkcr (create), gstkad (add), gstkmv (move), gstkrn" {
   run git stack init bash
   [ "$status" -eq 0 ]
-  [[ "$output" == *"alias gstkn="* ]]
+  [[ "$output" == *"alias gstkcr='git stack create'"* ]]
+  [[ "$output" == *"alias gstkad='git stack add'"* ]]
   [[ "$output" == *"alias gstkmv='git stack move'"* ]]
   [[ "$output" == *"alias gstkrn='git stack rename'"* ]]
+  # Removed: gstkn (new), gstkpa (push --all).
+  [[ "$output" != *"alias gstkn="* ]]
+  [[ "$output" != *"alias gstkpa="* ]]
 }
 
-@test "init fish: emits gstkn, gstkmv (move), gstkrn" {
+@test "init fish: emits gstkcr (create), gstkad (add), gstkmv (move), gstkrn" {
   run git stack init fish
   [ "$status" -eq 0 ]
-  [[ "$output" == *"gstkn git stack new"* ]]
+  [[ "$output" == *"gstkcr git stack create"* ]]
+  [[ "$output" == *"gstkad git stack add"* ]]
   [[ "$output" == *"gstkmv git stack move"* ]]
   [[ "$output" == *"gstkrn git stack rename"* ]]
 }
 
 # ---------- decimal leaves (rejected) ----------
 
-@test "decimals: branches with decimal leaves are ignored by list" {
+@test "decimals: branches with decimal leaves are ignored by view" {
   make_stack_branches feat 01-a 02-b
   git branch feat/02.5-skip feat/02-b
-  run git stack list --no-fetch --no-color
+  run git stack view --no-fetch --no-color
   [ "$status" -eq 0 ]
   echo "$output" | grep -q "feat/01-a"
   echo "$output" | grep -q "feat/02-b"
@@ -978,44 +1078,44 @@ $old_footer"
   [[ "$output" == *"not a number"* ]] || [[ "$output" == *"no stack branch"* ]]
 }
 
-# ---------- new ----------
+# ---------- add ----------
 
-@test "new: creates branch at top of stack with next leaf number" {
+@test "add: creates branch at top of stack with next leaf number" {
   make_stack_branches feat 01-a 02-b
   git checkout -q feat/02-b
-  run git stack new auth --no-color
+  run git stack add auth --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/03-auth
   [ "$(git symbolic-ref --short HEAD)" = "feat/03-auth" ]
   [ "$(git rev-parse feat/03-auth)" = "$(git rev-parse feat/02-b)" ]
 }
 
-@test "new: refuses invalid slug" {
+@test "add: refuses invalid slug" {
   make_stack_branches feat 01-a
-  run git stack new 'has space' --no-color
+  run git stack add 'has space' --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"slug"* ]]
 }
 
-@test "new: refuses slug collision in same stack" {
+@test "add: refuses slug collision in same stack" {
   make_stack_branches feat 01-auth 02-other
   git checkout -q feat/02-other
-  run git stack new auth --no-color
+  run git stack add auth --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"collides"* ]] || [[ "$output" == *"feat/01-auth"* ]]
 }
 
-@test "new: refuses slug starting with a digit" {
+@test "add: refuses slug starting with a digit" {
   make_stack_branches feat 01-a
-  run git stack new 1foo --no-color
+  run git stack add 1foo --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"slug"* ]]
 }
 
-@test "new --after: midpoint between named ref and successor (sparse stack)" {
+@test "add --after: midpoint between named ref and successor (sparse stack)" {
   # Sparse stack (3-digit width) has gaps for inserts.
   make_stack_branches feat 010-a 020-b 030-c
-  run git stack new mid --after feat/010-a --no-color
+  run git stack add mid --after feat/010-a --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/015-mid
   # Other branches untouched.
@@ -1023,11 +1123,11 @@ $old_footer"
   git rev-parse --verify --quiet refs/heads/feat/030-c
 }
 
-@test "new --after: refuses on tightly-packed legacy stack (no gap)" {
+@test "add --after: refuses on tightly-packed legacy stack (no gap)" {
   # Legacy 2-digit stack with step-1 leaves: --after feat/01-a has no room
   # for a midpoint between 01 and 02.
   make_stack_branches feat 01-a 02-b 03-c
-  run git stack new mid --after feat/01-a --no-color
+  run git stack add mid --after feat/01-a --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"gap exhausted"* ]] || [[ "$output" == *"no insertable leaf"* ]]
   # 02-b and 03-c must be untouched.
@@ -1035,17 +1135,17 @@ $old_footer"
   git rev-parse --verify --quiet refs/heads/feat/03-c
 }
 
-@test "new --after: accepts numeric leaf (sparse)" {
+@test "add --after: accepts numeric leaf (sparse)" {
   make_stack_branches feat 010-a 020-b
-  run git stack new mid --after 10 --no-color
+  run git stack add mid --after 10 --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/015-mid
   git rev-parse --verify --quiet refs/heads/feat/020-b
 }
 
-@test "new --at: places at exact unused leaf" {
+@test "add --at: places at exact unused leaf" {
   make_stack_branches feat 010-a 020-b 030-c
-  run git stack new newone --at 25 --no-color
+  run git stack add newone --at 25 --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/025-newone
   # No existing branches were touched.
@@ -1054,9 +1154,9 @@ $old_footer"
   git rev-parse --verify --quiet refs/heads/feat/030-c
 }
 
-@test "new --at: refuses if leaf is already taken" {
+@test "add --at: refuses if leaf is already taken" {
   make_stack_branches feat 010-a 020-b 030-c
-  run git stack new newone --at 20 --no-color
+  run git stack add newone --at 20 --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"already taken"* ]] || [[ "$output" == *"--at"* ]]
   # Stack unchanged.
@@ -1064,23 +1164,23 @@ $old_footer"
   ! git rev-parse --verify --quiet refs/heads/feat/020-newone
 }
 
-@test "new --at: refuses non-integer arg" {
+@test "add --at: refuses non-integer arg" {
   make_stack_branches feat 010-a 020-b
-  run git stack new mid --at feat/010-a --no-color
+  run git stack add mid --at feat/010-a --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"non-negative integer"* ]] || [[ "$output" == *"--at"* ]]
 }
 
-@test "new --after: fails on unknown ref" {
+@test "add --after: fails on unknown ref" {
   make_stack_branches feat 010-a 020-b
-  run git stack new mid --after 99 --no-color
+  run git stack add mid --after 99 --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"99"* ]]
 }
 
-@test "new --before: midpoint between predecessor and named ref" {
+@test "add --before: midpoint between predecessor and named ref" {
   make_stack_branches feat 010-a 020-b 030-c
-  run git stack new prep --before feat/020-b --no-color
+  run git stack add prep --before feat/020-b --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/015-prep
   # Other branches untouched.
@@ -1089,93 +1189,148 @@ $old_footer"
   git rev-parse --verify --quiet refs/heads/feat/030-c
 }
 
-@test "new --before: lowest branch picks midpoint of (0, lowest.leaf)" {
+@test "add --before: lowest branch picks midpoint of (0, lowest.leaf)" {
   make_stack_branches feat 010-a 020-b
-  run git stack new prep --before feat/010-a --no-color
+  run git stack add prep --before feat/010-a --no-color
   [ "$status" -eq 0 ]
   # midpoint(0, 10) = 5
   git rev-parse --verify --quiet refs/heads/feat/005-prep
   [ "$(git rev-parse feat/005-prep)" = "$(git rev-parse main)" ]
 }
 
-@test "new --before: refuses when gap is exhausted" {
+@test "add --before: refuses when gap is exhausted" {
   make_stack_branches feat 001-a 002-b
-  run git stack new prep --before feat/001-a --no-color
+  run git stack add prep --before feat/001-a --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"gap exhausted"* ]] || [[ "$output" == *"no insertable leaf"* ]]
   git rev-parse --verify --quiet refs/heads/feat/001-a
   git rev-parse --verify --quiet refs/heads/feat/002-b
 }
 
-@test "new --first: removed — errors with migration hint" {
+@test "add --first: removed — errors with migration hint" {
   make_stack_branches feat 010-a 020-b
-  run git stack new prep --first --no-color
+  run git stack add prep --first --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"--first"* ]] && [[ "$output" == *"--before"* ]]
 }
 
-@test "new: refuses on stack with leaf 00 and hints at doctor" {
+@test "add: refuses on stack with leaf 00 and hints at doctor" {
   # Build a stack manually with a 00-leaf — make_stack_branches would also
   # accept this, but be explicit about the malformed state.
   git checkout -q -b feat/00-a
   printf '00-a\n' >> file && git add file && git commit -q -m '00-a'
   git checkout -q -b feat/02-b
   printf '02-b\n' >> file && git add file && git commit -q -m '02-b'
-  run git stack new prep --before feat/00-a --no-color
+  run git stack add prep --before feat/00-a --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"doctor"* ]]
 }
 
-@test "new (no flag, non-TTY): defaults to --last" {
+@test "add (no flag, non-TTY): defaults to --last" {
   make_stack_branches feat 01-a 02-b
-  run git stack new tail --no-color </dev/null
+  run git stack add tail --no-color </dev/null
   [ "$status" -eq 0 ]
   # Legacy 2-digit stack: step 1 from highest = 03.
   git rev-parse --verify --quiet refs/heads/feat/03-tail
 }
 
-@test "new --last: sparse stack rounds up to next multiple of 10" {
+@test "add --last: sparse stack rounds up to next multiple of 10" {
   make_stack_branches feat 010-a 015-b
-  run git stack new tail --last --no-color
+  run git stack add tail --last --no-color
   [ "$status" -eq 0 ]
   # Next multiple of 10 above 15 is 20.
   git rev-parse --verify --quiet refs/heads/feat/020-tail
 }
 
-@test "new: no remote work (cmd_new is local-only by design)" {
-  # cmd_new no longer touches origin or PRs; it just creates one local ref.
+@test "add: no remote work (cmd_add is local-only by design)" {
+  # cmd_add no longer touches origin or PRs; it just creates one local ref.
   # Existing PRs must not be affected.
   make_stack_branches feat 010-a 020-b
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  run git stack new mid --after feat/010-a --no-color
+  run git stack add mid --after feat/010-a --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -eq 0 ]
   [ "$(gh_log_count 'pr')" -eq 0 ]
 }
 
-@test "new (bootstrap, --prefix): creates first branch with sparse 010 default" {
-  # Already on main from setup. No stack exists. Sparse default = 3-digit
-  # width, first leaf = 010.
-  run git stack new auth --prefix feat --no-color </dev/null
+# ---------- create ----------
+
+@test "create: starts a new stack with the sparse 010 first leaf off base" {
+  # Already on main from setup. No stack exists.
+  run git stack create feat auth --no-color
   [ "$status" -eq 0 ]
   git rev-parse --verify --quiet refs/heads/feat/010-auth
   [ "$(git symbolic-ref --short HEAD)" = "feat/010-auth" ]
   [ "$(git rev-parse feat/010-auth)" = "$(git rev-parse main)" ]
 }
 
-@test "new (bootstrap, non-TTY, no --prefix): errors with hint" {
-  run git stack new auth --no-color </dev/null
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"prefix"* ]]
+@test "create: trailing slash on the prefix is tolerated" {
+  run git stack create feat/ auth --no-color
+  [ "$status" -eq 0 ]
+  git rev-parse --verify --quiet refs/heads/feat/010-auth
 }
 
-@test "new (bootstrap, --prefix, --at): explicit leaf placement on empty stack" {
-  # Under sparse semantics, --at <num> works on an empty stack — places at
-  # exactly that leaf with no collision possible.
-  run git stack new auth --prefix feat --at 100 --no-color </dev/null
+@test "create: errors (and points at add) when the prefix already has branches" {
+  make_stack_branches feat 010-a
+  git checkout -q main
+  run git stack create feat other --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already has"* ]]
+  [[ "$output" == *"add"* ]]
+}
+
+@test "create: requires both a prefix and a slug" {
+  run git stack create feat --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"slug"* ]]
+}
+
+@test "create --onto: roots the first branch on the given ref" {
+  git commit -q --allow-empty -m extra
+  local onto
+  onto=$(git rev-parse HEAD)
+  git checkout -q main
+  run git stack create exp e1 --onto "$onto" --no-color
   [ "$status" -eq 0 ]
-  git rev-parse --verify --quiet refs/heads/feat/100-auth
+  git rev-parse --verify --quiet refs/heads/exp/010-e1
+  [ "$(git rev-parse exp/010-e1)" = "$onto" ]
+}
+
+# ---------- add (no-stack guard) ----------
+
+@test "add: errors (pointing at create/pick) when not in a stack" {
+  run git stack add auth --no-color </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not in a stack"* ]]
+  [[ "$output" == *"create"* ]]
+}
+
+# ---------- pick ----------
+
+@test "pick: lands on the tip of the (only) stack" {
+  make_stack_branches feat 010-a 020-b 030-c
+  git checkout -q main
+  run git stack pick --no-color
+  [ "$status" -eq 0 ]
+  [ "$(git symbolic-ref --short HEAD)" = "feat/030-c" ]
+}
+
+# ---------- removed verbs ----------
+
+@test "removed verbs: new/close/push/status error with a rename hint" {
+  run git stack new foo --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"create"* ]] && [[ "$output" == *"add"* ]]
+  run git stack close --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"clean"* ]]
+  run git stack push --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"sync"* ]]
+  run git stack status --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"view"* ]]
 }
 
 # ---------- move ----------
@@ -1864,13 +2019,13 @@ make_conflicting_dups() {
 
 # ---------- new/move history interop ----------
 
-@test "history: 'new' produces a restorable snapshot" {
+@test "history: 'add' produces a restorable snapshot" {
   # Use a sparse stack so --after has a gap to insert into.
   make_stack_branches feat 010-a 020-b
-  git stack new mid --after 10 --no-color </dev/null
+  git stack add mid --after 10 --no-color </dev/null
   run git stack history --no-color
   [ "$status" -eq 0 ]
-  [[ "$output" == *"new"* ]]
+  [[ "$output" == *"add"* ]]
 }
 
 @test "history: 'move' produces a restorable snapshot" {
@@ -1885,9 +2040,13 @@ make_conflicting_dups() {
 
 # ---------- help ----------
 
-@test "help: documents 'new' and 'move'" {
+@test "help: documents the core verbs" {
   run git stack help --no-color
   [ "$status" -eq 0 ]
-  [[ "$output" == *"git stack new"* ]] || [[ "$output" == *" new "* ]]
+  [[ "$output" == *"create"* ]]
+  [[ "$output" == *"add"* ]]
+  [[ "$output" == *"view"* ]]
+  [[ "$output" == *"clean"* ]]
+  [[ "$output" == *"sync"* ]]
   [[ "$output" == *"move"* ]]
 }

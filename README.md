@@ -43,9 +43,9 @@ Either path puts a single executable on your `PATH`.
 
 ## Shell integration
 
-`git stack` ships short aliases (`gstk`, `gstkr`, `gstkam`, …) and dynamic helpers
-that resolve the default branch at expansion time (`gstkrom`, `gstkromp`,
-`gstkcl`). To install them, add the line for your shell and reload:
+`git stack` ships short aliases — one per verb (`gstkcr` create, `gstkad` add,
+`gstkv` view, `gstks` sync, `gstkcl` clean, `gstkr` restack, `gstkam` amend, …).
+To install them, add the line for your shell and reload:
 
 **bash** — append to `~/.bashrc`:
 
@@ -70,14 +70,15 @@ See the [full alias list](docs/reference.md#shell-integration--aliases) in the r
 ## Quick start
 
 ```sh
-git stack new auth --prefix feat/  # bootstrap a stack: creates feat/010-auth
+git stack create feat auth         # start a stack: creates feat/010-auth
 # ...write code, commit...
-git stack new login                # append feat/020-login
+git stack add login                # append feat/020-login
 # ...write code, commit...
 
-git stack list                     # see the stack and its sync state
+git stack list                     # overview of every stack in the repo
+git stack view                     # the current stack's branches and sync state
 git stack amend -m "fix typo"      # amend the current branch, reflow the rest
-git stack push --all               # push every branch with --force-with-lease
+git stack sync                     # push every branch with --force-with-lease
 git stack pr sync                  # open or update the GitHub PR chain
 ```
 

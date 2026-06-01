@@ -34,20 +34,20 @@ Output blocks are captured from real runs; commit SHAs will differ for you.
 **Situation.** You're starting a feature that's too big for one PR. Build it as a
 stack from the start so each piece reviews independently.
 
-`git stack new` builds the stack for you. From `main` (or anywhere outside a
-stack) the first `new` bootstraps the stack — it creates the bottom branch, picks
-a sparse leaf, and checks it out. Each subsequent `new` infers the prefix and
-appends the next branch:
+`create` and `add` build the stack for you. From `main` (or anywhere outside a
+stack), `create <prefix> <slug>` starts the stack — it creates the bottom branch
+off the base, picks a sparse leaf, and checks it out. From then on `add <slug>`
+infers the prefix and appends the next branch:
 
 ```sh
-git stack new auth --prefix feat/   # bootstrap: creates & checks out feat/010-auth
+git stack create feat auth          # start: creates & checks out feat/010-auth
 # ...write code, commit...
-git stack new login                 # appends feat/020-login, checks it out
+git stack add login                 # appends feat/020-login, checks it out
 # ...write code, commit...
-git stack new profile               # appends feat/030-profile
+git stack add profile               # appends feat/030-profile
 # ...write code, commit...
 
-git stack list
+git stack view
 ```
 
 ```
@@ -61,15 +61,16 @@ parent: main  [up to date]
     e617449  add profile
 ```
 
-**What happened.** Each `new` created an empty branch and checked it out; after
-you commit into it, the branch carries your work. `git stack list` infers the
-stack from the `feat/` prefix, orders the branches by their leaf, marks the one
-you're on with `*`, and shows each branch's sync state against its remote — here
-`[unpushed]`, since nothing's been pushed yet.
+**What happened.** `create`/`add` each made an empty branch and checked it out;
+after you commit into it, the branch carries your work. `git stack view` infers
+the stack from the `feat/` prefix, orders the branches by their leaf, marks the
+one you're on with `*`, and shows each branch's sync state against its remote —
+here `[unpushed]`, since nothing's been pushed yet. (`git stack list` gives the
+zoomed-out view: one line per stack across the whole repo.)
 
-You don't have to use `new` — `git stack` adopts any branch whose final path
-segment looks like `<number>-<slug>`, so building the stack the plain-git way
-(`git checkout -b feat/010-auth`, commit, repeat) works just as well.
+You don't have to use `create`/`add` — `git stack` adopts any branch whose final
+path segment looks like `<number>-<slug>`, so building the stack the plain-git
+way (`git checkout -b feat/010-auth`, commit, repeat) works just as well.
 
 Use **leaf numbers** to move around the stack instead of typing full branch
 names:
@@ -91,7 +92,7 @@ branch's commit — so every branch above it now sits on a stale parent and must
 replayed.
 
 ```sh
-git stack list
+git stack view
 ```
 
 ```
@@ -130,7 +131,7 @@ divergence grows as you climb, since each branch carries every rewritten commit
 below it:
 
 ```sh
-git stack list
+git stack view
 ```
 
 ```
@@ -144,8 +145,8 @@ parent: origin/main  [up to date]
     4816a60  add profile
 ```
 
-Publish the rewritten stack with `git stack push --all` (force-with-lease) —
-every branch returns to `[synced]` — then re-run `git stack pr sync` to refresh
+Publish the rewritten stack with `git stack sync` (force-with-lease on every
+branch) — each returns to `[synced]` — then re-run `git stack pr sync` to refresh
 the PR chain.
 
 If a cherry-pick hits a conflict mid-reflow, the reflow pauses — resolve it and
@@ -173,16 +174,10 @@ done    reflow complete (2 branches restacked)
 ```
 
 **What happened.** `restack --onto origin/main` rebased the bottom branch onto the
-new base, then reflowed the rest of the stack up the chain. The shell integration
-bundles the fetch-and-restack into one alias:
-
-```sh
-gstkrom        # = git fetch origin <default> && git stack restack --onto origin/<default>
-gstkromp       # ...and push each branch as it finishes (--push)
-```
-
-`<default>` resolves to your `stack.base` / `init.defaultBranch` / `main`. See
-[reference.md](reference.md#shell-integration--aliases).
+new base, then reflowed the rest of the stack up the chain. If you also want to
+prune merged branches and clean up the remote in the same pass, `git stack clean`
+does the fetch → prune → reflow-onto-`origin/<default>` sequence in one verb (see
+[§7](#7-the-bottom-pr-merged)).
 
 **See also:** [partial reflow](#9-push-or-reflow-only-part-of-the-stack) · [aliases](reference.md#shell-integration--aliases)
 
@@ -195,14 +190,14 @@ existing branches — a cache layer between `auth` and `login`, and some prep be
 `auth`.
 
 ```sh
-git stack new cache --after feat/010-auth     # insert just above auth
-git stack new prep  --before feat/010-auth    # insert just below auth
-git stack list
+git stack add cache --after feat/010-auth     # insert just above auth
+git stack add prep  --before feat/010-auth    # insert just below auth
+git stack view
 ```
 
 ```
-new     feat/015-cache (from feat/010-auth)
-new     feat/005-prep (from main)
+add     feat/015-cache (from feat/010-auth)
+add     feat/005-prep (from main)
 parent: main  [up to date]
 
 * feat/005-prep  [unpushed]
@@ -222,20 +217,20 @@ parent: main  [up to date]
 feat/010-auth` lands at `005` (between the base and `010`), so its predecessor is
 `main`. No existing branch is renumbered.
 
-`new` is **never destructive** — it creates one empty branch (its tip equals its
+`add` is **never destructive** — it creates one empty branch (its tip equals its
 predecessor's, which is why `015-cache` shows the same SHA as `010-auth` until you
 commit) and never touches anything else. Other placements:
 
 ```sh
-git stack new fix --at 7      # explicit leaf → feat/007-fix
-git stack new                 # interactive picker (ref, before/after, leaf)
+git stack add fix --at 7      # explicit leaf → feat/007-fix
+git stack add                 # interactive picker (ref, before/after, leaf)
 ```
 
 If the gap is too tight to fit a whole number, the insert is **refused** rather
 than cascading a renumber:
 
 ```
-git-stack: error: new --before feat/02-b: no insertable leaf between 1 and 2 (gap exhausted); pick a different position or wait for doctor-reflow
+git-stack: error: add --before feat/02-b: no insertable leaf between 1 and 2 (gap exhausted); pick a different position or wait for doctor-reflow
 ```
 
 Pick another spot, or re-space the stack with [`doctor`](doctor.md).
@@ -251,7 +246,7 @@ come *before* `login`.
 
 ```sh
 git stack move feat/030-profile --before feat/020-login
-git stack list
+git stack view
 ```
 
 ```
@@ -340,7 +335,7 @@ updated base.
 After a fetch, the merged branch shows `[gone]` — its upstream no longer exists:
 
 ```sh
-git stack list
+git stack view
 ```
 
 ```
@@ -354,31 +349,32 @@ parent: origin/main  [up to date]
     45b2df8  add profile
 ```
 
-Preview, then delete the gone branches:
+Preview, then tidy the stack:
 
 ```sh
-git stack close --dry-run
+git stack clean --dry-run
 ```
 
 ```
-close   1 branch(es) with gone upstream:
+prune   1 local branch(es) with gone upstream:
   delete  feat/010-auth (63aeaec)
   (no matching backup refs)
 
-dry run: rerun without --dry-run to apply
+dry run: would reflow 2 survivor(s) onto origin/main; rerun without --dry-run to apply
 ```
 
 ```sh
-git stack close                       # actually delete the [gone] branches
-git stack restack --onto origin/main  # rebase what's left onto the new base
-git stack pr sync                     # re-point the chain
+git stack clean       # prune [gone] branches, tidy the remote, reflow onto origin/main
+git stack pr sync     # re-point the chain
 ```
 
-**What happened.** `close` runs `git fetch --prune` and deletes every stack branch
-whose upstream is `[gone]`, along with their snapshot refs (pass `--keep-history`
-to preserve backups). Then `restack --onto origin/main` rebases the surviving
-branches onto the now-advanced base, and `pr sync` repoints the remaining PRs. The
-`gstkcl` alias bundles the fetch+prune into `close`.
+**What happened.** `clean` does the whole teardown in one pass: it fetches and
+prunes, deletes every stack branch whose upstream is `[gone]` (along with their
+snapshot refs — pass `--keep-history` to keep backups), offers to delete any
+remote branches under the prefix with no local counterpart (a confirmation you
+can decline — it skips only that step), then reflows the surviving branches onto
+the now-advanced `origin/main`. `pr sync` repoints the remaining PRs. `clean`
+replaces the old `close` verb and the `gstkrom`/`gstkcl` shell helpers.
 
 **See also:** [main moved](#3-main-moved-underneath-you) · [rolling back](doctor.md#rolling-back-with-history)
 
@@ -412,22 +408,23 @@ a branch is checked out elsewhere, or any target name already exists.
 *(advanced)*
 
 **Situation.** The bottom branches are settled and pushed; you've only been
-editing the top. You want to reflow or push *from* a given branch up, not the
-whole stack.
+editing the top. You want to reflow *from* a given branch up, not the whole
+stack — and push only what changed.
 
 ```sh
-git stack restack --from feat/020-login    # reflow the branches ABOVE feat/020-login
-git stack push --from feat/020-login       # push feat/020-login AND everything above it
-git stack push --all                       # (for contrast) push the whole stack
+git stack restack --from feat/020-login           # reflow the branches ABOVE feat/020-login
+git stack restack --from feat/020-login --push     # ...and push each as it reflows
+git stack sync                                      # (for contrast) push the whole stack
 ```
 
-**What happened.** `--from <branch>` scopes the operation and leaves the lower
-branches untouched — but note the two commands treat `<branch>` itself
-differently. `restack --from X` is **exclusive**: it reflows the branches *above*
-X, with X as the fixed base they replay onto (it defaults to the current branch's
-child). `push --from X` is **inclusive**: it pushes X *and* everything above it
-(it defaults to the current branch upward). Both are handy after a localized edit,
-or when the lower branches are already merged and you don't want to re-touch them.
+**What happened.** `restack --from X` is **exclusive**: it reflows the branches
+*above* X, with X as the fixed base they replay onto (it defaults to the current
+branch's child), leaving the lower branches untouched. Adding `--push`
+force-with-leases each reflowed branch as it finishes — so you push only the part
+that moved. `sync` is the all-or-nothing counterpart: it pushes every branch in
+the stack additively, no per-branch selection. (The old `push --from`/`push
+--all` per-branch push paths are gone — use `restack --push` for partial, `sync`
+for whole-stack.)
 
 **See also:** [main moved](#3-main-moved-underneath-you)
 
@@ -479,7 +476,7 @@ cleanly extracting its changes:
 
 ```sh
 git stack move feat/020-login --last --no-push --no-sync
-git stack list
+git stack view
 ```
 
 ```
@@ -507,8 +504,8 @@ git branch -D feat/031-login
 
 `feat/030-profile` now contains only `auth` + `profile`; login is gone entirely.
 If the branch you're removing has an open PR, pass `--allow-pr-rebuild` to the
-`move`, and after the remote branch is deleted let [`close`](#7-the-bottom-pr-merged)
-clean it up instead of `git branch -D`.
+`move`, and after the remote branch is deleted let [`clean`](#7-the-bottom-pr-merged)
+tidy it up instead of `git branch -D`.
 
 **See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order) · [multi-commit branches](#10-a-branch-grew-a-second-commit)
 
@@ -521,7 +518,7 @@ clean it up instead of `git branch -D`.
 **Situation.** A teammate wants to pick up or contribute to your stack.
 
 `git stack` is a **single-owner, rebasing** tool. Every reflow rewrites the
-commits of every branch above the one you touched, and `push` uses
+commits of every branch above the one you touched, and `sync` uses
 `--force-with-lease`. That's safe when one person owns the stack — but it's
 actively hostile to shared editing:
 
@@ -539,7 +536,7 @@ There's no command that coordinates multi-owner editing. If you must share:
 - **To review someone's stack read-only**, fetch and check out their branches —
   but don't commit onto them if they're still reflowing.
 - **If your push is rejected** after someone else pushed, `git fetch` and inspect
-  with `git stack list`; you may need to `git stack abort` your in-progress reflow
+  with `git stack view`; you may need to `git stack abort` your in-progress reflow
   or reconcile the branches manually before retrying.
 
 When a shared stack gets tangled, [`doctor`](doctor.md) and

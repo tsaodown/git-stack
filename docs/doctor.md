@@ -40,8 +40,8 @@ you'll re-push (force-with-lease) to bring origin back in line.
 A reflow's resume state is cleared **only** on full completion or an explicit
 `abort` — any other exit leaves it paused and resumable.
 
-> `git stack status` dumps the in-progress state file when a reflow is paused,
-> which is useful for understanding exactly where it stopped.
+> `git stack view` shows a one-line paused banner when a reflow is mid-flight,
+> so you can see at a glance that the stack is waiting on `continue`/`abort`.
 
 ## Squashing and repairing a stack
 
@@ -126,7 +126,7 @@ it). Note that a single command can produce more than one snapshot — an `amend
 above writes both an `amend` and the `restack` it triggers.
 
 Snapshots are auto-pruned by `git config stack.historyKeep` (default 100; `0`
-disables pruning). [`close`](workflows.md#7-the-bottom-pr-merged) also removes a
-deleted branch's snapshots unless you pass `--keep-history`.
+disables pruning). [`clean`](workflows.md#7-the-bottom-pr-merged) also removes a
+pruned branch's snapshots unless you pass `--keep-history`.
 
 **See also:** [concepts: reflow & snapshot](concepts.md#reflow) · [workflows §10: multi-commit branches](workflows.md#10-a-branch-grew-a-second-commit)

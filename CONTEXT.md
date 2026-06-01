@@ -4,12 +4,18 @@
 are ordered by a numeric **leaf**. This file fixes the vocabulary for the
 stacking domain so refactors and reviews use one set of words.
 
-It has two parts. **Language** is the established domain — concepts that exist in
-today's code, README, and usage. **Architecture** names the modules and mechanisms
-introduced by an architecture review (2026-05-29). Those refactors are now built:
-the `engine`, the PR-sync `reconciler`, `placement`, and the doctor `scan` all
-exist in `bin/git-stack` today. One proposal — the absorbed-policy — was
-deliberately abandoned; see that entry.
+It has three parts. **Language** is the established domain — concepts that exist in
+today's code, README, and usage. **Commands** names the user-facing verb surface.
+**Architecture** names the modules and mechanisms introduced by an architecture
+review (2026-05-29). Those refactors are now built: the `engine`, the PR-sync
+`reconciler`, `placement`, and the doctor `scan` all exist in `bin/git-stack`
+today. One proposal — the absorbed-policy — was deliberately abandoned; see that
+entry.
+
+The **Commands** section reflects the command-vocabulary redesign (2026-06-01),
+now shipped: `new` split into `create`/`add`, `close`→`clean`, `push`→`sync`,
+`status` folded into `view`, plus new `pick`/`list` semantics. See
+[docs/adr/0001-command-vocabulary-redesign.md](docs/adr/0001-command-vocabulary-redesign.md).
 
 ## Language
 
@@ -128,6 +134,92 @@ Two or more branches sharing a **leaf** number, which doctor resolves by
 renumbering.
 _Avoid_: collision, conflict (reserve "conflict" for a merge/cherry-pick
 conflict).
+
+## Commands
+
+The verb surface splits into **stack-level** commands (act on whole stacks) and
+**branch-level** commands (act within one stack). The **current stack** is always
+**derived from HEAD** — the prefix of the checked-out branch — never a stored
+pointer. (`stack.prefix` remains a manual override, not tool-managed state.)
+
+Shipped 2026-06-01 per
+[docs/adr/0001-command-vocabulary-redesign.md](docs/adr/0001-command-vocabulary-redesign.md).
+The removed verbs (`new`/`close`/`push`/`status`) now error with a "renamed to X"
+hint.
+
+### Stack-level
+
+**create** `<prefix> <slug>`:
+Start a new stack — its first branch `prefix/<first-leaf>-slug` rooted on the
+**base** (`--onto <ref>` to root elsewhere). Refuses if the prefix already has
+branches (directs to **add**). Checks out the new branch. Replaces the bootstrap
+path of the old `new`.
+
+**add** `<slug>`:
+Add a branch to the **current** stack (placement via flag or picker, as the old
+`new` did inside a stack). Errors outside a stack, pointing at **create**/**pick**.
+_Avoid_: "new" — the word that conflated create-a-stack with add-a-branch.
+
+**pick**:
+Choose a stack from the **list** selector and check out its **tip**. Works from
+inside a stack too — this is how you hop *between* stacks. Lands on the tip; for a
+specific branch, use **checkout**.
+
+**list**:
+Overview of *every* stack: branch count, tip, current-stack marker, **base** +
+ahead/behind. Local and fast (no `gh`). Replaces the old per-stack `list` (whose
+job moved to **view**). The selector **pick** and outside-a-stack **checkout**
+present these same rows.
+_Avoid_: reusing "list" for a single stack's branches (that is **view**).
+
+**view** `[stack]`:
+Show one stack's contents *without checking out* — the current stack, or a named
+one (trailing slash optional; falls to the picker on an unknown/ambiguous name;
+no current stack + no arg → picker). Folds in the old **status**: per-branch
+local↔origin sync state, a one-line paused-operation banner, and the last
+**snapshot**. Drops `status`'s verbose phase/unit/from-idx dump. Replaces the old
+per-stack `list` and `status`.
+
+**clean**:
+Janitorial teardown of the current stack, in order: prune local `[gone]`
+branches; delete extraneous **remote** branches under the prefix
+(confirmation-gated — on decline, skip *only* the remote deletion and continue);
+then fetch and **reflow** survivors onto `origin/<default>`. A reflow, so it can
+pause on **conflict** and resume via `continue`. Replaces `close` and the
+`gstkcl`/`gstkrom`/`gstkromp` shell helpers.
+_Avoid_: "close" (the prune-only predecessor).
+
+### Branch-level
+
+**checkout** `[N]`:
+Move within the current stack — leaf `N`, or a branch picker with no arg. From
+outside a stack, runs the **list** selector first, then a branch picker — vs
+**pick**, which lands on the tip. Unchanged from today apart from the extracted
+selector.
+
+**sync**:
+Push the whole stack to remote so remote matches local — **additive only**, never
+deletes remote refs (that is **clean**'s job). No PR work, no per-branch `--from`
+selection. Replaces `push` / `push --all`.
+_Avoid_: "push" — the per-branch, network-detail framing.
+
+`move`, `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
+and `pr sync` / `pr list` keep their current meanings.
+
+### Removed verbs
+
+`new` → **create** (new stack) or **add** (branch in the current stack).
+`close` → **clean**. `push` / `push --all` → **sync**. `status` → folded into
+**view**. Each removed verb errors with a one-line "renamed to X" hint rather
+than a bare unknown-subcommand.
+
+### Aliases
+
+`gstkcr` create · `gstkad` add · `gstkp` pick · `gstkl` list · `gstkv` view ·
+`gstkco` checkout · `gstks` sync · `gstkcl` clean · `gstkab` abort ·
+`gstkcon` continue. Dropped: `gstkn` (was new), `gstkpa` (push --all),
+`gstkrom`/`gstkromp`, and the `gstkcl` *shell function* (now the `clean` verb).
+`gstkp` moves from push to pick; `gstks` moves from status to sync.
 
 ## Architecture
 
@@ -259,7 +351,7 @@ smell to be replaced when touching the code.
 
 ## Example dialogue
 
-> **Dev:** For `git stack new fix --before feat/020-login`, what leaf does it get?
+> **Dev:** For `git stack add fix --before feat/020-login`, what leaf does it get?
 >
 > **Expert:** It looks at the gap below `020` — say the predecessor is
 > `010-auth`. The open gap is 11–19, so it picks the midpoint, `015`. The
