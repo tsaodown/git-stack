@@ -204,7 +204,9 @@ selection. Replaces `push` / `push --all`.
 _Avoid_: "push" — the per-branch, network-detail framing.
 
 `move`, `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
-and `pr sync` / `pr list` keep their current meanings.
+and `pr sync` / `pr list` keep their current meanings. **move** additionally
+**renumbers in place** when the chosen position is the branch's current slot —
+a pure leaf rename, no reflow (ADR 0002).
 
 ### Removed verbs
 

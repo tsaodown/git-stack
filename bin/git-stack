@@ -1779,6 +1779,13 @@ ${b}Branch-level subcommands:${r}
                                     rebuild — the old PRs close and fresh ones
                                     open via \`pr sync\`. ${fl}--first${r} removed; use
                                     ${fl}--before${r} instead.
+                                    When the chosen position is the branch's
+                                    current slot (e.g. ${fl}--before${r} the branch it
+                                    already sits below, or ${fl}--at${r} a free leaf in
+                                    the same gap), it ${b}renumbers in place${r}: a
+                                    pure rename of the leaf, no reflow. With a
+                                    TTY and no ${fl}--at${r}, a leaf picker offers the
+                                    free numbers in the gap.
   ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}] [${fl}--allow-pr-rebuild${r}]
                                     Atomically rename every branch in the stack
                                     from <old>/<leaf> to <new>/<leaf>, carrying
@@ -3025,6 +3032,33 @@ _placement_candidates() {
   return 0
 }
 
+# Candidate leaves for a *renumber-in-place* (move's no-op-position path): the
+# branch is not moving, so its valid leaves are the open interval between its
+# fixed predecessor and successor. Unlike _placement_candidates (tuned to insert
+# a NEW branch near a gap's midpoint), this centers on the branch's CURRENT leaf
+# and expands outward, so "nudge 10 to ~12" surfaces 12 right away. Excludes the
+# current leaf itself (picking it would be a no-op). hi == -1 means an open upper
+# bound (renumbering the last branch). Prints space-separated leaves ascending,
+# or nothing when the gap has no room.
+# Usage: _renumber_candidates <cur-leaf> <lo> <hi>
+_renumber_candidates() {
+  local cur="$1" lo="$2" hi="$3"
+  local out=() d=1 max=7
+  while (( ${#out[@]} < max )); do
+    local added=0 lower=$((cur - d))
+    if (( lower > lo )); then out+=("$lower"); added=1; fi
+    if (( ${#out[@]} < max )) && (( hi == -1 || cur + d < hi )); then
+      out+=("$((cur + d))"); added=1
+    fi
+    (( added )) || break
+    (( d++ ))
+  done
+  (( ${#out[@]} > 0 )) || return 0
+  local sorted
+  sorted=$(printf '%s\n' "${out[@]}" | sort -n)
+  printf '%s\n' "${sorted//$'\n'/ }"
+}
+
 # Three-step interactive position picker for `cmd_add` and `cmd_move`. Drives
 # the user through:
 #   1. pick a reference branch from the stack
@@ -3492,9 +3526,109 @@ move: no <branch> given and HEAD is detached"
     dst_idx=$seen
   fi
 
-  # Refuse if destination == source position.
+  # Destination == source position: the branch isn't moving. Rather than error,
+  # treat this as a renumber-in-place request — change the leaf number without
+  # reordering. A pure rename: no commits move, so no reflow. (See ADR 0002.)
   if (( dst_idx == src_idx )); then
-    die "move: '$src_branch' is already at position $((src_idx + 1))"
+    [[ "${src_branch##*/}" =~ ^([0-9]+)- ]] \
+      || die "internal: source leaf '${src_branch##*/}' malformed"
+    local cur_leaf=$((10#${BASH_REMATCH[1]}))
+    local src_rest="${src_branch##*/}"; src_rest="${src_rest#*-}"
+
+    # Resolve the target leaf number.
+    local new_num=""
+    if [[ -n "$opt_at" ]]; then
+      new_num="$opt_at"
+    elif [[ -n "$opt_before" || -n "$opt_after" ]]; then
+      # --before/--after (or the interactive position picker) resolved to the
+      # branch's current slot. The branch isn't moving, so its valid leaves are
+      # the open gap between its fixed predecessor and successor. Offer a leaf
+      # picker; with no TTY there is nothing to pick, so point the user at --at.
+      # Lower bound = predecessor's leaf (base => 0); upper = successor's leaf
+      # (last branch => -1, open-ended).
+      local _lo _hi
+      if (( src_idx == 0 )); then
+        _lo=0
+      else
+        [[ "${branches[$((src_idx - 1))]##*/}" =~ ^([0-9]+)- ]] \
+          || die "internal: predecessor leaf malformed"
+        _lo=$((10#${BASH_REMATCH[1]}))
+      fi
+      if (( src_idx == ${#branches[@]} - 1 )); then
+        _hi=-1
+      else
+        [[ "${branches[$((src_idx + 1))]##*/}" =~ ^([0-9]+)- ]] \
+          || die "internal: successor leaf malformed"
+        _hi=$((10#${BASH_REMATCH[1]}))
+      fi
+      if [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
+        local _cands=($(_renumber_candidates "$cur_leaf" "$_lo" "$_hi"))
+        (( ${#_cands[@]} > 0 )) \
+          || die "move: no free leaf to renumber '$src_branch' into here; pass --at <num>"
+        new_num=$(_pick_one "renumber ${src_branch} to leaf:" "${_cands[@]}") \
+          || die "move: no leaf selected"
+      else
+        local _rel="before" _ref="$before_branch"
+        [[ -n "$opt_after" ]] && { _rel="after"; _ref="$after_branch"; }
+        die "move: '$src_branch' is already directly $_rel '$_ref'; pass --at <num> to renumber it in place (no TTY for the leaf picker)"
+      fi
+    else
+      # --last on a branch already at the end: a genuine no-op.
+      die "move: '$src_branch' is already at position $((src_idx + 1))"
+    fi
+
+    # No leaf change requested -> graceful no-op.
+    if (( new_num == cur_leaf )); then
+      log "${C_GREEN}move${C_RESET}    '${src_branch}' already at leaf ${cur_leaf}; nothing to do"
+      return 0
+    fi
+
+    local width new_leaf new_full
+    width=$(_leaf_width_for "${branches[@]}")
+    new_leaf=$(_format_leaf "$new_num" "$width")
+    new_full="${prefix}${new_leaf}-${src_rest}"
+
+    # Defensive: the --at path already rejected leaves taken by other branches,
+    # and the picker draws only from the free gap, but guard anyway.
+    if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
+      die "move --at: leaf $new_num is already taken by '$new_full'"
+    fi
+
+    require_branch_not_in_worktree "$src_branch"
+
+    # PR-orphan guard: renaming the branch invalidates any open head-PR for it.
+    if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
+      if _check_no_open_prs "$src_branch"; then
+        die "move would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated."
+      fi
+    fi
+
+    snapshot_stack move "$prefix" "${branches[@]}"
+
+    # Pure rename: local rename batch, then (unless --no-push) remote rename +
+    # pr sync. No reflow-pick phase — the commit graph is untouched.
+    STACK_BRANCHES=("${branches[@]}")
+    STACK_ORIG_SHAS=()
+    STACK_STARTED_AT=$(date +%s)
+    STACK_STARTING_BRANCH=$(current_branch || echo "")
+    STACK_PREFIX="$prefix"
+    STACK_PUSH=0
+    STACK_FORCE=0
+    STACK_ONTO=""
+    STACK_ONTO_REF=""
+    STACK_FROM_IDX=0
+    STACK_PUSH_FAILURES=()
+    STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
+    STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
+    STACK_RENAME_PAIRS=("$src_branch" "$new_full")
+    STACK_PHASES=(rename-batch)
+    (( ! OPT_NO_PUSH )) && STACK_PHASES+=(remote-sync)
+    STACK_PHASE_IDX=0
+    STACK_UNIT_IDX=0
+
+    save_engine_state
+    _engine_run
+    return
   fi
 
   # Build the post-move ordering: branches minus src, with src spliced at dst_idx.

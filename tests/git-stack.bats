@@ -1500,6 +1500,92 @@ $old_footer"
   ! git rev-parse --verify --quiet refs/heads/feat/03-a
 }
 
+# ---------- move (renumber in place) ----------
+
+@test "move --at: renumbers a branch in place without moving commits" {
+  # Stack 010-a, 015-b, 020-c. Renumber the first branch 010 -> 012, still
+  # below 015, so its position is unchanged. A pure rename: no reflow, so every
+  # branch's SHA (including the renamed one) is preserved.
+  make_stack_branches feat 010-a 015-b 020-c
+  local sha_a sha_b sha_c
+  sha_a=$(git rev-parse refs/heads/feat/010-a)
+  sha_b=$(git rev-parse refs/heads/feat/015-b)
+  sha_c=$(git rev-parse refs/heads/feat/020-c)
+
+  run git stack move feat/010-a --at 12 --no-push --no-color
+  assert_status 0
+  assert_branch_exists feat/012-a
+  assert_branch_absent feat/010-a
+  # Pure rename: the renamed ref keeps 010-a's exact SHA; others untouched.
+  assert_sha_eq refs/heads/feat/012-a "$sha_a"
+  assert_sha_eq refs/heads/feat/015-b "$sha_b"
+  assert_sha_eq refs/heads/feat/020-c "$sha_c"
+}
+
+@test "move --at: renumbers a middle branch in place" {
+  # Any branch, not just the first: move 015-b down to 012, still between
+  # 010 and 020, so its position (index 1) is unchanged.
+  make_stack_branches feat 010-a 015-b 020-c
+  local sha_b
+  sha_b=$(git rev-parse refs/heads/feat/015-b)
+
+  run git stack move feat/015-b --at 12 --no-push --no-color
+  assert_status 0
+  assert_branch_exists feat/012-b
+  assert_branch_absent feat/015-b
+  assert_sha_eq refs/heads/feat/012-b "$sha_b"
+}
+
+@test "move --at: leaf equal to current leaf is a graceful no-op" {
+  make_stack_branches feat 010-a 015-b 020-c
+  run git stack move feat/010-a --at 10 --no-push --no-color
+  assert_status 0
+  assert_output_contains "already at leaf"
+  assert_branch_exists feat/010-a
+}
+
+@test "move --at: leaf taken by another branch still errors" {
+  make_stack_branches feat 010-a 015-b 020-c
+  run git stack move feat/010-a --at 15 --no-push --no-color
+  assert_status 1
+  assert_output_contains "already taken"
+  assert_branch_exists feat/010-a
+}
+
+@test "move --before: no-op position non-interactively errors pointing at --at" {
+  # 010-a is already directly below 015-b, so the position does not change.
+  # Without a TTY there's no leaf picker, so it must point the user at --at.
+  make_stack_branches feat 010-a 015-b 020-c
+  run git stack move feat/010-a --before feat/015-b --no-push --no-color
+  assert_status 1
+  assert_output_contains "--at"
+  assert_branch_exists feat/010-a
+}
+
+@test "move --at: in-place renumber refuses to orphan an open PR" {
+  make_stack_branches feat 010-a 015-b 020-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_010_a__NUM=42
+  run git stack move feat/010-a --at 12 --no-color
+  assert_status 1
+  assert_output_contains "allow-pr-rebuild"
+  assert_branch_exists feat/010-a
+}
+
+@test "move --at: in-place renumber renames remote + syncs with --allow-pr-rebuild" {
+  make_stack_branches feat 010-a 015-b 020-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack move feat/010-a --at 12 --allow-pr-rebuild --no-color
+  assert_status 0
+  assert_branch_exists feat/012-a
+  assert_branch_absent feat/010-a
+  # Remote rename happened and pr sync ran.
+  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
+  [ "$(gh_log_count 'pr')" -ge 1 ]
+}
+
 # ---------- doctor ----------
 
 @test "doctor: fixes 00 leaf to 01, preserves higher branches" {

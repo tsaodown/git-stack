@@ -165,6 +165,39 @@ candidates() {
   [ "$output" == $'gap-exhausted\t10\t11' ]
 }
 
+# --- renumber-in-place candidates (leaf picker for move's no-op position) ---
+# Output: space-separated leaves near <cur>, within open gap (lo,hi), excluding
+# <cur>. hi == -1 means an open upper bound (renumbering the last branch).
+
+renumber_cands() {
+  run bash -c "source '$GIT_STACK_BIN'; _renumber_candidates \"\$@\"" _ "$@"
+}
+
+@test "renumber candidates: centered on current leaf, current excluded" {
+  # First branch 010 with gap (0,15): offers leaves near 10 (incl. 12), not 10.
+  renumber_cands 10 0 15
+  [ "$status" -eq 0 ]
+  [ "$output" == "6 7 8 9 11 12 13" ]
+}
+
+@test "renumber candidates: asymmetric gap fills the open side" {
+  renumber_cands 10 9 15
+  [ "$status" -eq 0 ]
+  [ "$output" == "11 12 13 14" ]
+}
+
+@test "renumber candidates: open upper bound (last branch)" {
+  renumber_cands 20 15 -1
+  [ "$status" -eq 0 ]
+  [ "$output" == "16 17 18 19 21 22 23" ]
+}
+
+@test "renumber candidates: no room yields empty" {
+  renumber_cands 11 10 12
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 # --- picker wiring (_pick_position_for_new) ---
 # Stubs _pick_one with canned selections to exercise the wiring end-to-end:
 # prompt dispatch, "<pred>\t<candidates>" parsing, the empty-predecessor (base)

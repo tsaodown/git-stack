@@ -284,6 +284,20 @@ branch names and tip SHAs by definition.
 > `--allow-pr-rebuild` to accept that the old PRs close and fresh ones open on the
 > next `pr sync`. Use `--no-push` / `--no-sync` for local-only moves.
 
+**Renumber a branch without moving it.** Sometimes you don't want to reorder —
+you just want to change a branch's leaf number (e.g. your stack is `010, 015, 020`
+and you want the bottom branch at `012` to open room below it). Point `move` at
+the branch's *current* slot and it renumbers in place instead of erroring:
+
+```sh
+git stack move feat/010-auth --at 12              # exact leaf
+git stack move feat/010-auth --before feat/015-b  # TTY: pick a leaf in the gap
+```
+
+This is a **pure rename** — no commits move, no reflow, every other branch
+untouched. It's still a branch rename, so the same open-PR rule applies: pass
+`--allow-pr-rebuild` (or `--no-push`) if the branch has an open head PR.
+
 **See also:** [insert a branch](#4-you-need-a-branch-in-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
 
 ---
