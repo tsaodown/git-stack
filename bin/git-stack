@@ -3517,10 +3517,10 @@ move: no <branch> given and HEAD is detached"
     local seen=0 i
     for ((i = 0; i < ${#branches[@]}; i++)); do
       [[ "${branches[$i]}" == "$src_branch" ]] && continue
-      [[ "${branches[$i]##*/}" =~ ^([0-9]+)- ]] || { (( seen++ )); continue; }
+      [[ "${branches[$i]##*/}" =~ ^([0-9]+)- ]] || { seen=$((seen + 1)); continue; }
       leaf_num=$((10#${BASH_REMATCH[1]}))
       if (( leaf_num < at_num )); then
-        (( seen++ ))
+        seen=$((seen + 1))
       fi
     done
     dst_idx=$seen
