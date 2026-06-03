@@ -1297,6 +1297,94 @@ $old_footer"
   [ "$(git rev-parse exp/010-e1)" = "$onto" ]
 }
 
+# ---------- add / create: carry a dirty tree onto the new branch ----------
+
+@test "add: dirty tree on the top branch is carried onto the new branch (at-HEAD, no stash)" {
+  make_stack_branches feat 010-a 020-b
+  git checkout -q feat/020-b
+  echo WIP >> file               # dirty tracked change atop HEAD
+  run git stack add auth --no-color
+  assert_status 0
+  assert_branch_exists feat/030-auth
+  assert_eq "$(git symbolic-ref --short HEAD)" feat/030-auth
+  assert_sha_eq feat/030-auth "$(git rev-parse feat/020-b)"
+  assert grep -q WIP file        # change carried over
+  assert_eq "$(git stash list)" ""   # at-HEAD path never stashes
+}
+
+@test "add --after <current top>: dirty tree carried (at-HEAD, no stash)" {
+  make_stack_branches feat 010-a 020-b
+  git checkout -q feat/020-b
+  echo WIP >> file
+  run git stack add auth --after feat/020-b --no-color
+  assert_status 0
+  assert_eq "$(git symbolic-ref --short HEAD)" feat/030-auth
+  assert grep -q WIP file
+  assert_eq "$(git stash list)" ""
+}
+
+@test "add --before lowest: dirty tree relocated onto the new branch (stash path, clean)" {
+  # `shared` is identical on main and every feat branch, so the carried diff
+  # applies cleanly when relocated onto main (the --before-lowest predecessor).
+  echo base > shared; git add shared; git commit -q -m shared
+  make_stack_branches feat 010-a 020-b
+  git checkout -q feat/020-b
+  echo WIP >> shared             # dirty atop feat/020-b
+  run git stack add relo --before feat/010-a --no-color
+  assert_status 0
+  assert_branch_exists feat/005-relo
+  assert_eq "$(git symbolic-ref --short HEAD)" feat/005-relo
+  assert_sha_eq feat/005-relo "$(git rev-parse main)"   # rooted at the parent
+  assert grep -q WIP shared      # work relocated onto the new branch
+  assert_eq "$(git stash list)" ""   # stash consumed on a clean pop
+}
+
+@test "add --before lowest: conflicting relocation lands on the new branch, retains the stash, warns" {
+  # `file` differs between feat/020-b and main, so relocating the working-tree
+  # diff onto main can't apply cleanly -> conflict on pop.
+  make_stack_branches feat 010-a 020-b
+  git checkout -q feat/020-b
+  printf 'conflicting-edit\n' >> file
+  run git stack add relo --before feat/010-a --no-color
+  assert_status 0
+  assert_branch_exists feat/005-relo
+  assert_eq "$(git symbolic-ref --short HEAD)" feat/005-relo
+  assert_output_contains "conflict"
+  assert test -n "$(git stash list)"   # stash retained for recovery
+}
+
+@test "create: dirty tree without --stash errors non-interactively" {
+  echo WIP >> file
+  run git stack create feat auth --no-color </dev/null
+  assert_status 1
+  assert_output_contains "uncommitted changes"
+  assert_branch_absent feat/010-auth
+}
+
+@test "create --stash: dirty tree carried into the new stack" {
+  echo WIP >> file
+  run git stack create feat auth --stash --no-color
+  assert_status 0
+  assert_branch_exists feat/010-auth
+  assert_eq "$(git symbolic-ref --short HEAD)" feat/010-auth
+  assert grep -q WIP file
+}
+
+@test "create --onto --stash: dirty tree relocated onto the base (stash path, clean)" {
+  # Base (T1) carries `shared`; HEAD advances to T2 with `shared` unchanged, so
+  # relocating the working-tree diff onto T1 applies cleanly.
+  echo base > shared; git add shared; git commit -q -m shared
+  local t1; t1=$(git rev-parse HEAD)
+  git commit -q --allow-empty -m more     # HEAD = T2 != T1
+  echo WIP >> shared
+  run git stack create exp e1 --onto "$t1" --stash --no-color
+  assert_status 0
+  assert_branch_exists exp/010-e1
+  assert_sha_eq exp/010-e1 "$t1"
+  assert grep -q WIP shared
+  assert_eq "$(git stash list)" ""
+}
+
 # ---------- add (no-stack guard) ----------
 
 @test "add: errors (pointing at create/pick) when not in a stack" {

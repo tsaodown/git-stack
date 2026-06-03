@@ -115,6 +115,67 @@ require_clean_tree() {
   fi
 }
 
+# ---- transient handling of a dirty tree for branch-creating commands ----
+#
+# `add`/`create` build the new branch at <predecessor_sha> then check it out.
+# When the tree is dirty we want the uncommitted work to land on the new
+# branch instead of erroring. Two regimes:
+#   * predecessor == HEAD  -> the checkout itself carries the changes (git
+#     never touches the tree when the target commit == HEAD), staged-ness and
+#     all. No stash needed.
+#   * predecessor != HEAD  -> stash first, then pop after the checkout so the
+#     diff is relocated onto the new branch. The pop may conflict.
+# Untracked files are out of scope: they never tripped require_clean_tree
+# (--untracked-files=no) and travel across checkout regardless.
+#
+# Plain `git stash pop` (no --index) is used, so in the relocate regime staged
+# changes return unstaged (matches `rebase --autostash` and dodges a class of
+# index-apply failures). In the at-HEAD regime staged-ness is preserved.
+
+_CARRY_STASH=0  # 1 while a carry stash is outstanding
+
+_tree_is_dirty() { [[ -n $(git status --porcelain --untracked-files=no) ]]; }
+
+# _carry_begin <predecessor_sha> <stash-message>
+# Sets _CARRY_STASH=1 only when it actually stashes (predecessor != HEAD).
+_carry_begin() {
+  local pred="$1" msg="$2"
+  _CARRY_STASH=0
+  _tree_is_dirty || return 0
+  [[ "$pred" != "$(git rev-parse HEAD)" ]] || return 0
+  git stash push --quiet --message "$msg" || die "failed to stash uncommitted changes"
+  _CARRY_STASH=1
+}
+
+# Best-effort restore to the ORIGINAL branch after a failed create/checkout,
+# before the caller dies (we never moved off the original branch yet).
+_carry_unwind() {
+  (( _CARRY_STASH )) || return 0
+  _CARRY_STASH=0
+  git stash pop --quiet 2>/dev/null || true
+}
+
+# Pop the stash onto the freshly checked-out NEW branch. On conflict git leaves
+# markers AND retains the stash entry (non-zero exit) — warn, don't die.
+_carry_finish() {
+  (( _CARRY_STASH )) || return 0
+  _CARRY_STASH=0
+  git stash pop --quiet \
+    || warn "carried changes applied with conflicts — resolve them in the working tree; your original snapshot is retained in 'git stash list'"
+}
+
+# create-only: show what's dirty and ask for a single keystroke. 0 = carry.
+_prompt_carry_into_stack() {  # $1 = prefix (for the message)
+  printf '%suncommitted changes:%s\n' "$C_DIM" "$C_RESET" >&2
+  git status --short --untracked-files=no >&2
+  printf 'carry these into new stack %s%s%s? %s[y/N]%s ' \
+    "$C_CYAN" "$1" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+  local ans=""
+  read -r -n 1 ans < /dev/tty || { echo >&2; return 1; }
+  echo >&2
+  [[ "$ans" == y || "$ans" == Y ]]
+}
+
 require_no_op_in_progress() {
   local gitdir marker
   gitdir=$(git rev-parse --git-dir)
@@ -1675,13 +1736,16 @@ ${b}Stack-level subcommands:${r}
                                     and check out its tip (highest-leaf
                                     branch) — a fast hop, even from inside
                                     another stack.
-  ${sub}create${r} <prefix> <slug> [${fl}--onto${r} <ref>]
+  ${sub}create${r} <prefix> <slug> [${fl}--onto${r} <ref>] [${fl}--stash${r}]
                                     Start a brand-new stack: first branch
                                     (leaf \`010\`) off the resolved base
                                     (${fl}stack.base${r} → origin/<default> → local
                                     default), or ${fl}--onto${r} <ref>. Errors if the
                                     prefix already has branches (use ${sub}add${r}).
-                                    Checks out the new branch.
+                                    Checks out the new branch. A dirty tree
+                                    prompts to carry the uncommitted work into
+                                    the new stack; ${fl}--stash${r} carries it without
+                                    prompting (required to carry non-interactively).
   ${sub}sync${r}                              Push the whole stack to the remote, additive
                                     only (force-with-lease on every branch; no
                                     deletes, no PR work). Remote cleanup is
@@ -1710,6 +1774,9 @@ ${b}Branch-level subcommands:${r}
                                     pick the midpoint of the gap (refuses, no
                                     cascade, if exhausted). Errors outside a
                                     stack — use ${sub}create${r} or ${sub}pick${r}.
+                                    A dirty tree is carried onto the new branch
+                                    automatically (stashed + reapplied when the
+                                    insert lands off your current commit).
   ${sub}checkout${r} [<number>]               Check out the stack branch whose leaf starts
                                     with that number (numeric match, so \`5\`
                                     finds \`05-foo\`).
@@ -3159,9 +3226,11 @@ cmd_add() {
   (( n_pos <= 1 )) || die "add: --last, --before, --after, --at are mutually exclusive"
 
   require_in_repo
-  require_clean_tree
   require_no_op_in_progress
   require_no_state_file
+  # No require_clean_tree: a dirty tree is carried onto the new branch below
+  # (see _carry_begin). Everything from here through placement resolution is
+  # read-only, so dirty state flows through harmlessly.
 
   # `add` places a branch in the *current* stack only — no bootstrap. Starting
   # a brand-new stack is `create`; switching to an existing one is `pick`.
@@ -3282,6 +3351,10 @@ cmd_add() {
   predecessor_sha=$(git rev-parse "$predecessor_ref") \
     || die "add: cannot resolve predecessor '$predecessor_ref'"
 
+  # Carry a dirty tree onto the new branch (stash now if relocating; the
+  # checkout carries it for free when predecessor == HEAD).
+  _carry_begin "$predecessor_sha" "git-stack add → $new_branch"
+
   # Snapshot before mutation.
   if (( ${#branches[@]} > 0 )); then
     snapshot_stack add "$prefix" "${branches[@]}"
@@ -3291,11 +3364,15 @@ cmd_add() {
 
   # Create the branch — single update-ref, no cascade.
   if ! git update-ref "refs/heads/${new_branch}" "${predecessor_sha}" ""; then
+    _carry_unwind
     die "git update-ref failed; ref unchanged"
   fi
 
   # Switch HEAD to the new branch.
-  git checkout --quiet "$new_branch"
+  git checkout --quiet "$new_branch" || { _carry_unwind; die "add: failed to checkout '$new_branch'"; }
+
+  # Pop the carried work onto the new branch (no-op unless we stashed).
+  _carry_finish
 
   log "${C_GREEN}add${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label})${C_RESET}"
 }
@@ -3305,7 +3382,7 @@ cmd_add() {
 # the prefix already has branches (use `add` for that). Checks out the new
 # branch. The first leaf is sparse width-3 (010).
 cmd_create() {
-  OPT_PREFIX=""; OPT_ONTO=""
+  OPT_PREFIX=""; OPT_ONTO=""; OPT_CARRY=0
   local prefix_arg="" slug=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
@@ -3314,6 +3391,7 @@ cmd_create() {
     fi
     case "$1" in
       --onto) shift; [[ $# -gt 0 ]] || die "--onto needs an argument"; OPT_ONTO="$1"; shift ;;
+      --stash) OPT_CARRY=1; shift ;;
       -*)     die "unknown create flag: $1" ;;
       *)      if [[ -z "$prefix_arg" ]]; then prefix_arg="$1"
               elif [[ -z "$slug" ]];    then slug="$1"
@@ -3322,7 +3400,7 @@ cmd_create() {
     esac
   done
 
-  [[ -n "$prefix_arg" ]] || die "usage: git stack create <prefix> <slug> [--onto <ref>]"
+  [[ -n "$prefix_arg" ]] || die "usage: git stack create <prefix> <slug> [--onto <ref>] [--stash]"
   [[ -n "$slug" ]] || die "create: missing <slug> (usage: git stack create <prefix> <slug>)"
   _validate_slug "$slug"
 
@@ -3335,9 +3413,10 @@ cmd_create() {
   [[ ! "$first_seg" =~ ^[0-9]+- ]] || die "create: prefix '$prefix' would clash with leaf-numbering pattern"
 
   require_in_repo
-  require_clean_tree
   require_no_op_in_progress
   require_no_state_file
+  # No require_clean_tree: a dirty tree may be carried into the new stack (see
+  # the _carry_begin block below). Read-only until the snapshot.
 
   # Guard: the prefix must be empty — otherwise this is an `add`.
   local branches=()
@@ -3376,12 +3455,30 @@ cmd_create() {
   predecessor_sha=$(git rev-parse "$predecessor_ref") \
     || die "create: cannot resolve base '$predecessor_ref'"
 
+  # Dirty tree: offer to carry the work into the new stack. Gated — carrying
+  # onto a fresh stack off the base branch is a bigger surprise than `add`.
+  # --stash is the explicit, scriptable affirmative; otherwise prompt on a TTY
+  # and refuse non-interactively.
+  if _tree_is_dirty; then
+    if (( ! OPT_CARRY )); then
+      if [[ ! -e /dev/tty ]] || { [[ ! -t 0 ]] && [[ ! -t 2 ]]; }; then
+        die "working tree has uncommitted changes; commit or stash first (or pass --stash)"
+      fi
+      _prompt_carry_into_stack "$prefix" || die "create: aborted (changes left untouched)"
+    fi
+    _carry_begin "$predecessor_sha" "git-stack create → $new_branch"
+  fi
+
   snapshot_stack create "$prefix"
 
   if ! git update-ref "refs/heads/${new_branch}" "${predecessor_sha}" ""; then
+    _carry_unwind
     die "git update-ref failed; ref unchanged"
   fi
-  git checkout --quiet "$new_branch"
+  git checkout --quiet "$new_branch" || { _carry_unwind; die "create: failed to checkout '$new_branch'"; }
+
+  # Pop the carried work onto the new branch (no-op unless we stashed).
+  _carry_finish
 
   log "${C_GREEN}create${C_RESET}  ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(off ${predecessor_label})${C_RESET}"
 }
