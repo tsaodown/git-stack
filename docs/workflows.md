@@ -68,6 +68,12 @@ one you're on with `*`, and shows each branch's sync state against its remote �
 here `[unpushed]`, since nothing's been pushed yet. (`git stack list` gives the
 zoomed-out view: one line per stack across the whole repo.)
 
+**Uncommitted work in the tree?** Neither verb makes you stash first — both carry
+your changes onto the new branch. `add` does it silently; `create` asks before
+carrying onto a fresh stack (or pass `--stash` to skip the prompt — required when
+there's no terminal, e.g. in a script). The carry mechanics are spelled out in
+[scenario 4](#4-you-need-a-branch-in-the-middle).
+
 You don't have to use `create`/`add` — `git stack` adopts any branch whose final
 path segment looks like `<number>-<slug>`, so building the stack the plain-git
 way (`git checkout -b feat/010-auth`, commit, repeat) works just as well.
@@ -227,9 +233,15 @@ parent: main  [up to date]
 feat/010-auth` lands at `005` (between the base and `010`), so its predecessor is
 `main`. No existing branch is renumbered.
 
-`add` is **never destructive** — it creates one empty branch (its tip equals its
-predecessor's, which is why `015-cache` shows the same SHA as `010-auth` until you
-commit) and never touches anything else. Other placements:
+`add` never touches **other branches** — it creates one empty branch (its tip
+equals its predecessor's, which is why `015-cache` shows the same SHA as
+`010-auth` until you commit). It does carry any **uncommitted work** onto the new
+branch, though: when the insert lands on your current commit the changes ride
+along on the checkout (staged-ness preserved); when it lands elsewhere — like the
+`--before`/`--after` inserts above — `add` stashes the diff and pops it onto the
+new branch. If that pop conflicts it leaves the markers in place, keeps the stash
+entry, and warns rather than aborting. (`create` carries the same way but asks
+first, or takes `--stash`.) Other placements:
 
 ```sh
 git stack add fix --at 7      # explicit leaf → feat/007-fix
@@ -431,24 +443,27 @@ a branch is checked out elsewhere, or any target name already exists.
 
 *(advanced)*
 
-**Situation.** The bottom branches are settled and pushed; you've only been
-editing the top. You want to reflow *from* a given branch up, not the whole
-stack — and push only what changed.
+**Situation.** The bottom branches are settled; you've only been reworking the
+upper part of the stack. You want to reflow a given branch and everything above
+it, not the whole stack — and push just the part you touched.
 
 ```sh
-git stack restack --from feat/020-login           # reflow the branches ABOVE feat/020-login
+git stack restack --from feat/020-login            # re-thread feat/020-login and every branch above it
 git stack restack --from feat/020-login --push     # ...and push each as it reflows
 git stack sync                                      # (for contrast) push the whole stack
 ```
 
-**What happened.** `restack --from X` is **exclusive**: it reflows the branches
-*above* X, with X as the fixed base they replay onto (it defaults to the current
-branch's child), leaving the lower branches untouched. Adding `--push`
-force-with-leases each reflowed branch as it finishes — so you push only the part
-that moved. `sync` is the all-or-nothing counterpart: it pushes every branch in
-the stack additively, no per-branch selection. (The old `push --from`/`push
---all` per-branch push paths are gone — use `restack --push` for partial, `sync`
-for whole-stack.)
+**What happened.** `restack --from X` re-threads **X and every branch above it**,
+cherry-picking each onto its predecessor's new HEAD. So X is the *lowest* branch
+that gets rewritten; it replays onto its own predecessor (here `feat/010-auth`),
+which stays put — as does everything below X. With **no** `--from`, the reflow
+starts one higher, at the current branch's child: the branch you're standing on
+is the fixed base and only the branches above it move. Adding `--push`
+force-with-leases each rewritten branch as it finishes, so you push only the part
+from X up. `sync` is the all-or-nothing counterpart: it pushes every branch in the
+stack additively, no per-branch selection. (The old `push --from`/`push --all`
+per-branch push paths are gone — use `restack --push` for partial, `sync` for
+whole-stack.)
 
 **See also:** [main moved](#3-main-moved-underneath-you)
 

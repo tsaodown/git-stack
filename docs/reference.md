@@ -38,6 +38,25 @@ shows), then a branch. `pick` instead always offers the stack selector — even
 from inside another stack — and lands you on the chosen stack's **tip** (a fast
 hop); use `checkout` when you want a specific branch.
 
+## Building with uncommitted work: `create` and `add`
+
+Neither verb requires a clean tree — both carry uncommitted tracked changes onto
+the new branch rather than erroring.
+
+```sh
+git stack create feat auth          # dirty tree → prompts before carrying
+git stack create feat auth --stash  # carry without prompting (required non-interactively)
+git stack add login                 # carries automatically, no prompt
+```
+
+`add` carries silently; `create` is gated, since carrying onto a brand-new stack
+is a bigger surprise — on a TTY it prompts, and off a TTY it refuses unless you
+pass `--stash`. The carry rides the checkout when the new branch sits on your
+current commit (staged-ness preserved) and uses stash+pop when it lands elsewhere
+(staged changes return unstaged, like `rebase --autostash`); a conflicting pop
+warns and keeps the stash entry rather than aborting. Untracked files travel
+across regardless. See [workflows scenario 4](workflows.md#4-you-need-a-branch-in-the-middle).
+
 ## The default branch: `default-branch`
 
 ```sh

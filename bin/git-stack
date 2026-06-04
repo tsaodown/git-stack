@@ -1786,9 +1786,9 @@ ${b}Branch-level subcommands:${r}
                                     stack first (shared with ${sub}list${r}/${sub}pick${r}),
                                     then a specific branch.
   ${sub}restack${r} [${fl}--from${r} <branch>] [${fl}--onto${r} <ref>] [${fl}--push${r}] [${fl}--force${r}]
-                                    Reset+cherry-pick each branch above ${fl}--from${r}
-                                    (default: current branch's child) onto its
-                                    predecessor's new HEAD. With ${fl}--onto${r} <ref>,
+                                    Reset+cherry-pick ${fl}--from${r} (default: current
+                                    branch's child) and each branch above it onto
+                                    its predecessor's new HEAD. With ${fl}--onto${r} <ref>,
                                     rebase ${fl}--from${r} (default: bottom of stack)
                                     onto <ref> first, then propagate up. With
                                     ${fl}--push${r}, force-with-lease push each branch
