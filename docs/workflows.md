@@ -326,9 +326,10 @@ git stack pr sync
 
 `pr sync` pushes any unpushed branches, opens a **draft PR per branch** (each
 based on the branch below it, the bottom on `stack.base`), and keeps every PR's
-`[N/M]` title prefix and stack-navigation footer in sync. Re-run it after *any*
-structural change — new branch, removed branch, reorder — to bring the PRs back
-into alignment. It's idempotent: PRs already matching aren't touched.
+title (`[N/M]` prefix + the branch's latest commit subject) and stack-navigation
+footer in sync. Re-run it after *any* structural change — new branch, removed
+branch, reorder — or after rewording a commit, to bring the PRs back into
+alignment. It's idempotent: PRs already matching aren't touched.
 
 ```sh
 git stack pr sync --ready       # open as ready-for-review instead of drafts

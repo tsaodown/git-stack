@@ -453,17 +453,42 @@ HOOK
   [ "$(jq -r .title "$GH_STUB_DIR/by-num/103.json")" = "[3/3] third commit" ]
 }
 
-@test "pr sync: preserves non-position bracket prefix like [WIP]" {
+@test "pr sync: re-syncs the title and nav footer from an amended commit subject" {
+  make_stack_branches feat 01-foo 02-bar
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  # Titles are seeded from each branch's last commit subject.
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/2] 01-foo" ]
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/102.json")" = "[2/2] 02-bar" ]
+  # Amend the top branch's commit subject (HEAD is feat/02-bar).
+  git commit -q --amend -m "renamed bar"
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  [ "$status" -eq 0 ]
+  # The PR title follows the new subject, position prefix preserved.
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/102.json")" = "[2/2] renamed bar" ]
+  # The nav footer (in #102's own body, and in #101's, which references it)
+  # reflects the new subject in the SAME sync — pr sync stays a one-pass fixpoint.
+  local body101 body102
+  body102=$(gh_log_stdin "pr edit 102")
+  [[ "$body102" == *"renamed bar"* ]] || return 1
+  [[ "$body102" != *"02-bar"* ]] || return 1
+  body101=$(gh_log_stdin "pr edit 101")
+  [[ "$body101" == *"renamed bar"* ]] || return 1
+}
+
+@test "pr sync: clobbers a manually-edited title back to the commit subject" {
   make_stack_branches feat 01-foo 02-bar 03-baz
   make_remote_origin
   git stack pr sync --no-color > /dev/null
-  # User manually edits #101's title.
+  # User manually edits #101's title on GitHub.
   jq '.title = "[WIP] Foo overhaul"' "$GH_STUB_DIR/by-num/101.json" > "$GH_STUB_DIR/x"
   mv "$GH_STUB_DIR/x" "$GH_STUB_DIR/by-num/101.json"
   truncate -s 0 "$GH_STUB_LOG"
   run git stack pr sync --no-color
   [ "$status" -eq 0 ]
-  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/3] [WIP] Foo overhaul" ]
+  # pr sync re-derives the title from the commit subject — manual edits don't survive.
+  [ "$(jq -r .title "$GH_STUB_DIR/by-num/101.json")" = "[1/3] 01-foo" ]
 }
 
 @test "pr sync: re-aligns base when an existing PR points at the wrong branch" {
@@ -666,8 +691,9 @@ HOOK
   # No new PR created for 01-foo (we re-discovered #999); one for 02-bar
   [[ "$output" == *"exists  #999 feat/01-foo"* ]]
   [[ "$output" == *"create  #101 feat/02-bar"* ]]
-  # And the title's position prefix should have been rebracketed to [1/2],
-  # preserving the rest of the title ("Old name").
+  # And the title should have been rebracketed to [1/2] AND its content
+  # re-derived from the branch's commit subject ("01-foo"), clobbering the
+  # stale "Old name" content.
   # NOTE: env-seeded PRs don't get persisted edits in the stub (it can't write
   # to env vars), so we verify the edit via the stub log instead. The stub
   # logs argv shell-quoted via %q, so reconstruct it with `eval set --`.
@@ -683,7 +709,7 @@ HOOK
     fi
     shift
   done
-  [ "$title_arg" = "[1/2] Old name" ]
+  [ "$title_arg" = "[1/2] 01-foo" ]
 }
 
 @test "pr sync: weaves a merged predecessor into the nav footer (struck through)" {

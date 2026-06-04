@@ -1303,29 +1303,26 @@ _post_rename_sync() {
   fi
 }
 
-# The branch's last commit subject — used as the content portion of a fresh
-# PR title (before the [N/M] position prefix is applied).
+# The branch's last commit subject — the content portion of a PR title, before
+# the [N/M] position prefix is applied. pr sync re-derives the title from this on
+# every run, so a title tracks its branch's latest commit subject.
 _pr_branch_title() {
   local branch="$1"
   git log -1 --format='%s' "refs/heads/$branch" 2>/dev/null
 }
 
-# Compose a PR title with a [N/M] position prefix.
-# Args: <pos> <total> <existing_title> [<leaf_fallback>]
-#   - If existing matches "^\[\d+/\d+\] ", replace just that prefix.
-#   - Else if existing is non-empty, prepend "[N/M] " to it.
-#   - Else compose "[N/M] <leaf_fallback>".
+# Compose a PR title with a [N/M] position prefix from the given content.
+# Args: <pos> <total> <content>
+#   - If <content> already carries a "[\d+/\d+] " prefix, that prefix is
+#     replaced (so a content string that itself starts with a position bracket
+#     doesn't end up double-prefixed).
+#   - Otherwise "[N/M] " is prepended to <content>.
 _pr_title_with_pos() {
-  local pos="$1" total="$2" existing="${3-}" leaf_fallback="${4-}"
-  if [[ "$existing" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
-    printf '[%d/%d] %s' "$pos" "$total" "${BASH_REMATCH[1]}"
-    return 0
+  local pos="$1" total="$2" content="${3-}"
+  if [[ "$content" =~ ^\[[0-9]+/[0-9]+\][[:space:]](.*)$ ]]; then
+    content="${BASH_REMATCH[1]}"
   fi
-  if [[ -n "$existing" ]]; then
-    printf '[%d/%d] %s' "$pos" "$total" "$existing"
-    return 0
-  fi
-  printf '[%d/%d] %s' "$pos" "$total" "$leaf_fallback"
+  printf '[%d/%d] %s' "$pos" "$total" "$content"
 }
 
 # Print the repo's PR template body to stdout (empty if none found).
@@ -5474,7 +5471,7 @@ cmd_pr_sync() {
     else
       leaf=$(_pr_branch_title "$b")
       local fresh_title
-      fresh_title=$(_pr_title_with_pos "$((j+1))" "$N" "" "$leaf")
+      fresh_title=$(_pr_title_with_pos "$((j+1))" "$N" "$leaf")
       if (( opt_dry_run )); then
         log "${C_GREEN}create${C_RESET}  ${C_CYAN}$b${C_RESET} ${C_DIM}-> ${parent}  title='${fresh_title}'  body=${#template_body}B${C_RESET}"
         PR_NUMS+=("DRY")
@@ -5514,11 +5511,24 @@ cmd_pr_sync() {
   local PLAN_TITLE_CHANGED=() PLAN_BODY_CHANGED=() PLAN_BASE_CHANGED=()
   local PLAN_DESIRED_TITLE=() PLAN_DESIRED_BODY=() PLAN_CUR_BASE=() PLAN_PARENT=()
   local k
+  # Each active branch's last commit subject — the single source for both the PR
+  # title content and its nav-footer entry. (Active branches always have a commit
+  # ahead of their parent, so this is non-empty.)
+  local LEAF_SUBJ=()
+  for ((k = 0; k < N; k++)); do
+    LEAF_SUBJ+=("$(_pr_branch_title "${ACTIVE[k]}")")
+  done
   # Active chain as flat (branch, num, title) triples — the same for every PR's
-  # weave, so build it once.
+  # weave, so build it once. The content follows the commit subject (same as the
+  # PR title), but each entry keeps its CURRENT [N/M] bracket so the weave can
+  # still detect a position move and strike the old position through.
   local active_flat=()
   for ((k = 0; k < N; k++)); do
-    active_flat+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${PR_TITLES[k]}")
+    local k_bracket=""
+    if [[ "${PR_TITLES[k]}" =~ ^(\[[0-9]+/[0-9]+\])[[:space:]] ]]; then
+      k_bracket="${BASH_REMATCH[1]} "
+    fi
+    active_flat+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${k_bracket}${LEAF_SUBJ[k]}")
   done
   for ((j = 0; j < N; j++)); do
     b="${ACTIVE[j]}"
@@ -5539,9 +5549,9 @@ cmd_pr_sync() {
     local cur_title="${PR_TITLES[j]}"
     local cur_body="${PR_BODIES[j]}"
     local cur_base="${PR_BASES[j]}"
-    leaf=$(_pr_branch_title "$b")
+    leaf="${LEAF_SUBJ[j]}"
     local desired_title
-    desired_title=$(_pr_title_with_pos "$((j+1))" "$N" "$cur_title" "$leaf")
+    desired_title=$(_pr_title_with_pos "$((j+1))" "$N" "$leaf")
     local stripped
     stripped=$(printf '%s' "$cur_body" | _pr_strip_nav_footer)
     # The old footer's PR numbers drive both the merged-predecessor gather and

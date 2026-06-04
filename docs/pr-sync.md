@@ -27,8 +27,9 @@ On each run, `pr sync`:
    `stack.base` for the bottom branch. The body uses the repo's PR template if
    present (`.github/PULL_REQUEST_TEMPLATE.md` or its variants) unless
    `--no-template`.
-3. **Updates** existing PRs so their title carries the right `[N/M]` position
-   prefix and their body carries an up-to-date [nav footer](#the-nav-footer).
+3. **Updates** existing PRs so their title tracks the branch's latest commit
+   subject behind the right `[N/M]` position prefix, and their body carries an
+   up-to-date [nav footer](#the-nav-footer).
 
 It's **idempotent**: a PR whose title and body already match is left untouched, so
 re-running is cheap and safe. Re-run it after *any* structural change to the stack
@@ -41,10 +42,13 @@ GitHub can't open a PR with no commits between base and head, so a branch with n
 commit ahead of its [predecessor](concepts.md#predecessor) is left out of the
 chain — only [active branches](concepts.md#active-branch) get a PR.
 
-### The `[N/M]` title prefix
+### The title: `[N/M]` prefix + commit subject
 
-Each PR title is prefixed with its position in the chain, e.g. `[2/3] add login`.
-`pr sync` keeps this prefix correct as the stack grows, shrinks, or reorders. (The
+Each PR title is the branch's latest commit subject behind a position prefix,
+e.g. `[2/3] add login`. `pr sync` rebuilds the title on every run, so it tracks
+both the position (as the stack grows, shrinks, or reorders) **and** the commit
+subject (after an amend or rebase reword). A title you edit by hand on GitHub is
+not preserved — the next `pr sync` re-derives it from the commit subject. (The
 prefix is *stripped* in `pr list`'s display, since the row order already conveys
 position.)
 
