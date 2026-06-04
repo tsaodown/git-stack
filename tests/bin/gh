@@ -311,6 +311,13 @@ case "$_sub1 $_sub2" in
         echo "stub: simulated rename failure for $_old" >&2
         exit 1
       fi
+      # Model the rename on the actual origin so tests exercise the real push
+      # path (the branch lives under its new name on the remote afterward).
+      _origin_url=$(git remote get-url origin 2>/dev/null || true)
+      if [ -n "$_origin_url" ] \
+         && git --git-dir="$_origin_url" rev-parse --verify --quiet "refs/heads/${_old}" >/dev/null 2>&1; then
+        git --git-dir="$_origin_url" branch -m "${_old}" "${_new_name}" 2>/dev/null || true
+      fi
       printf '{"name":"%s","protected":false}\n' "$_new_name"
       exit 0
     fi

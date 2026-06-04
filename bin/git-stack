@@ -1256,7 +1256,7 @@ _remote_rename_batch_or_skip() {
     warn "no GitHub remote detected; skipping remote rename."
     return 0
   fi
-  local old new
+  local old new news=()
   while (( $# >= 2 )); do
     old="$1"; new="$2"; shift 2
     # Skip branches that aren't pushed.
@@ -1267,7 +1267,17 @@ _remote_rename_batch_or_skip() {
     if ! _remote_rename_one "$old" "$new"; then
       die "gh api branches/${old}/rename failed; local renames already applied. Resolve on GitHub (UI or 'gh api ... /rename') then 'git fetch --prune' and re-run 'git stack pr sync' ${C_DIM}[gstkprs]${C_RESET}."
     fi
+    news+=("$new")
   done
+  # The branches now live under their new names on the remote, but our
+  # remote-tracking refs still point at the old names. Refresh origin/<new> for
+  # each so the follow-up `--force-with-lease` push has a valid lease — without
+  # this it rejects as "stale info" (no tracking ref for the new name).
+  if (( ${#news[@]} > 0 )); then
+    local refspecs=() n
+    for n in "${news[@]}"; do refspecs+=("+refs/heads/${n}:refs/remotes/origin/${n}"); done
+    git fetch --quiet origin "${refspecs[@]}" 2>/dev/null || true
+  fi
 }
 
 # Invoke pr sync unless --no-sync was given. Idempotent; safe to call after

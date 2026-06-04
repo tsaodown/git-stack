@@ -1876,6 +1876,23 @@ $old_footer"
   [ "$(gh_log_count 'pr comment 42')" -ge 1 ]
 }
 
+@test "fold: renamed survivor force-pushes cleanly over its renamed remote branch" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  # Default slug renames the survivor 010-a -> 010-b; its remote branch is
+  # renamed too, so the follow-up --force-with-lease push must still land
+  # (regression: it was rejected as "stale info" with no refreshed tracking ref).
+  run git stack fold feat/020-b --allow-pr-rebuild --yes --no-color
+  assert_status 0
+  local new_sha
+  new_sha=$(git rev-parse feat/010-b)
+  run git ls-remote --heads origin feat/010-b
+  assert_output_contains "010-b"
+  # The remote carries the new squashed SHA → the force-push succeeded.
+  assert_output_contains "$new_sha"
+}
+
 @test "fold --slug: remote rename failure leaves the victim branch intact" {
   make_stack_branches feat 010-a 020-b 030-c
   make_remote_origin
