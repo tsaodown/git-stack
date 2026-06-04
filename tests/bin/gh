@@ -79,7 +79,7 @@ _envget() {
 # Build a single-PR JSON object with all fields needed by both `pr sync`
 # and `pr list`. Uses jq for safe quoting. The extra args (state, draft,
 # base, review, comments-count) are optional and have sensible defaults.
-# Usage: _emit_pr_json <num> <title> <body> [<state>] [<draft:0|1>] [<base>] [<review>] [<comments_n>]
+# Usage: _emit_pr_json <num> <title> <body> [<state>] [<draft:0|1>] [<base>] [<review>] [<comments_n>] [<head>]
 _emit_pr_json() {
   local num="$1" title="$2" body="$3"
   local state="${4:-OPEN}"
@@ -87,6 +87,7 @@ _emit_pr_json() {
   local base="${6:-main}"
   local review="${7-}"      # empty by default (REVIEW_REQUIRED / null)
   local n_comments="${8:-0}"
+  local head="${9-}"        # headRefName (the PR's source branch)
   local is_draft_json
   if [ "$draft" = "1" ] || [ "$draft" = "true" ]; then
     is_draft_json="true"
@@ -102,6 +103,7 @@ _emit_pr_json() {
     --arg base "$base" \
     --arg review "$review" \
     --argjson nc "$n_comments" \
+    --arg head "$head" \
     '{
        number: $n,
        title: $t,
@@ -109,6 +111,7 @@ _emit_pr_json() {
        state: $state,
        isDraft: $is_draft,
        baseRefName: $base,
+       headRefName: $head,
        reviewDecision: $review,
        comments: (if $nc > 0 then [range(0; $nc) | {id: ., body: "stub"}] else [] end)
      }'
@@ -145,12 +148,50 @@ _lookup_pr() {
       # Fill in defaults for any fields not present in the stored JSON.
       jq '
         {state: "OPEN", isDraft: true, baseRefName: "main",
-         reviewDecision: "", comments: []} * .
+         reviewDecision: "", comments: [], headRefName: ""} * .
       ' "$jf"
       return 0
     fi
   fi
   return 1
+}
+
+# Emit a JSON array of every known PR whose state matches <want> (uppercase
+# state, or "" for any). Mirrors `gh pr list` without a --head filter — the
+# bulk discovery query. Sources: env-var by-branch seeds (which must carry a
+# GH_PR_<safe>__HEAD seed so the emitted object has a headRefName to match on)
+# and PRs persisted by `pr create` (headRefName recorded at create time).
+_enumerate_prs() {
+  local want="$1"
+  local objs='[]'
+  local var safe head obj st
+  # Env-var by-branch seeds.
+  while IFS= read -r var; do
+    case "$var" in GH_PR_*__NUM) ;; *) continue ;; esac
+    safe="${var#GH_PR_}"; safe="${safe%__NUM}"
+    head=$(_envget "GH_PR_${safe}__HEAD")
+    [ -n "$head" ] || continue
+    obj=$(_lookup_pr "$head") || continue
+    obj=$(printf '%s' "$obj" | jq -c --arg h "$head" '. + {headRefName: $h}')
+    st=$(printf '%s' "$obj" | jq -r '.state')
+    if [ -z "$want" ] || [ "$st" = "$want" ]; then
+      objs=$(printf '%s' "$objs" | jq -c --argjson o "$obj" '. + [$o]')
+    fi
+  done < <(env | sed -n 's/=.*//p')
+  # Persisted PRs.
+  local jf
+  for jf in "$_stub_dir"/by-num/*.json; do
+    [ -f "$jf" ] || continue
+    obj=$(jq -c '
+      {state: "OPEN", isDraft: true, baseRefName: "main",
+       reviewDecision: "", comments: [], headRefName: ""} * .
+    ' "$jf")
+    st=$(printf '%s' "$obj" | jq -r '.state')
+    if [ -z "$want" ] || [ "$st" = "$want" ]; then
+      objs=$(printf '%s' "$objs" | jq -c --argjson o "$obj" '. + [$o]')
+    fi
+  done
+  printf '%s' "$objs"
 }
 
 _sub1="${1-}"
@@ -167,10 +208,25 @@ case "$_sub1 $_sub2" in
   "pr list")
     _head=$(_flagval --head "$@" || true)
     _jq=$(_flagval --jq "$@" || true)
-    if pr_obj=$(_lookup_pr "$_head"); then
-      _json="[$pr_obj]"
+    _state=$(_flagval --state "$@" || true)
+    if [ -n "$_head" ]; then
+      # Single-branch lookup (the --head filter).
+      if pr_obj=$(_lookup_pr "$_head"); then
+        pr_obj=$(printf '%s' "$pr_obj" | jq -c --arg h "$_head" '. + {headRefName: $h}')
+        _json="[$pr_obj]"
+      else
+        _json='[]'
+      fi
     else
-      _json='[]'
+      # Bulk listing — every PR matching the requested state.
+      _want=""
+      case "$_state" in
+        open|OPEN)     _want="OPEN" ;;
+        merged|MERGED) _want="MERGED" ;;
+        closed|CLOSED) _want="CLOSED" ;;
+        *)             _want="" ;;
+      esac
+      _json=$(_enumerate_prs "$_want")
     fi
     if [ -n "$_jq" ]; then
       printf '%s' "$_json" | jq -r "$_jq"
@@ -203,7 +259,7 @@ case "$_sub1 $_sub2" in
     _n=$((_n + 1))
     printf '%d' "$_n" > "$_counter"
     _safe_h=$(_safe "$_head")
-    _emit_pr_json "$_n" "$_title" "$_stdin" "OPEN" "$_draft" "${_base:-main}" "" 0 \
+    _emit_pr_json "$_n" "$_title" "$_stdin" "OPEN" "$_draft" "${_base:-main}" "" 0 "$_head" \
       > "$_stub_dir/by-num/$_n.json"
     printf '%d' "$_n" > "$_stub_dir/by-branch/$_safe_h.num"
     printf 'https://github.com/%s/pull/%d\n' "${GH_STUB_REPO:-test/repo}" "$_n"

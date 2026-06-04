@@ -308,7 +308,11 @@ can't run inside the engine anyway (a paused/resumed reflow has no TTY).
 The effectful read step producing **chain state**: per **active
 branch**, its PR number/title/base/body, plus merged-status and titles for
 **merged predecessor** candidates (selected by a pure lineage-guard helper so the
-**reconciler** never touches gh).
+**reconciler** never touches gh). Built to minimize gh round trips: discovery is
+one bulk `gh pr list` indexed in memory (not a query per branch), and a merged
+predecessor is resolved from the PR's existing footer when already struck-through
+there (a merge is terminal — no query), with any remaining live check memoised
+per run so a predecessor shared by several PRs costs a single `gh pr view`.
 
 **Chain state**:
 **Gather**'s output and the **reconciler**'s sole input: the current GitHub state

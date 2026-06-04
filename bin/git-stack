@@ -1437,18 +1437,44 @@ _merged_predecessor_candidates() {
 # "num<TAB>title" line per confirmed merged predecessor (none -> no output), in
 # candidate order. This is the only gh touch the reconciler needs — its output
 # feeds the pure _pr_weave_footer_triples.
-# Usage: _pr_gather_merged_preds <self_num> <active_csv> <old_num>...
+#
+# Two short-circuits keep the gh round trips minimal:
+#   1. <self_body> already records the candidate as a struck-through merged
+#      entry — a merge is terminal, so reuse the recorded title (no gh).
+#   2. otherwise, the merged-state + title are resolved through the per-run
+#      cache (_gh_merged_resolve), so a predecessor shared by several PRs in
+#      the same stack is queried at most once.
+# Usage: _pr_gather_merged_preds <self_num> <active_csv> <self_body> <old_num>...
 _pr_gather_merged_preds() {
-  local self="$1" active_csv="$2"; shift 2
+  local self="$1" active_csv="$2" body="$3"; shift 3
   local cand mt
   while IFS= read -r cand; do
     [[ -z "$cand" ]] && continue
-    if _gh_pr_is_merged "$cand"; then
-      mt=$(gh pr view "$cand" --repo "$GH_REPO" --json title --jq '.title' 2>/dev/null) \
-        || mt="PR #$cand"
+    # (1) Trust the existing footer.
+    if mt=$(_pr_footer_merged_title "$cand" "$body"); then
+      printf '%s\t%s\n' "$cand" "$mt"
+      continue
+    fi
+    # (2) Resolve via the per-run cache — prints the title iff merged.
+    if mt=$(_gh_merged_resolve "$cand"); then
       printf '%s\t%s\n' "$cand" "$mt"
     fi
   done < <(_merged_predecessor_candidates "$self" "$active_csv" "$@")
+}
+
+# Pure: if <body>'s nav footer renders PR <num> as a struck-through merged
+# predecessor — "- ~~#<num> <title>~~ (merged)" — print <title> and return 0;
+# return 1 otherwise. Lets pr sync reuse an already-recorded merge instead of
+# re-querying GitHub for a state that can no longer change.
+_pr_footer_merged_title() {
+  local num="$1" body="$2" line
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*~~#${num}[[:space:]]+(.*)~~[[:space:]]*\(merged\)[[:space:]]*$ ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <<< "$body"
+  return 1
 }
 
 # Pure: assemble a PR nav-footer's body triples, encoding merged-predecessor
@@ -1572,6 +1598,46 @@ _gh_pr_find() {
     2>/dev/null
 }
 
+# Bulk open-PR index for `pr sync` discovery: one round trip fetches every open
+# PR, replacing the per-branch `_gh_pr_find` loop (N queries -> 1). Records are
+# RS (\x1e) separated; fields US (\x1f) separated, leading with the head branch
+# so a lookup is a string match. _GH_OPEN_INDEX_OK distinguishes a successful
+# (possibly empty) load from a gh failure: on a clean load a lookup miss means
+# "no open PR for this branch" and discovery trusts it; on failure the caller
+# falls back to a live per-branch `_gh_pr_find`.
+_GH_OPEN_INDEX=""
+_GH_OPEN_INDEX_OK=0
+_gh_load_open_index() {
+  _GH_OPEN_INDEX=""
+  _GH_OPEN_INDEX_OK=0
+  local out
+  out=$(gh pr list --repo "$GH_REPO" --state open --limit 1000 \
+    --json number,title,baseRefName,headRefName,body \
+    --jq '.[] | "\(.headRefName)\(.number)\(.title // "")\(.baseRefName // "")\(.body // "")"' \
+    2>/dev/null) || return 1
+  _GH_OPEN_INDEX="$out"
+  _GH_OPEN_INDEX_OK=1
+}
+
+# Look up <branch> in the loaded open-PR index. On hit, prints the same
+# "<num><US><title><US><baseRef><US><body>" record _gh_pr_find returns; returns
+# 1 on miss. Pure (no gh) — the index must already be loaded.
+_gh_open_index_find() {
+  local b="$1" rec h
+  while IFS= read -r -d $'\x1e' rec; do
+    # gh's --jq prints a newline after each record, so every record past the
+    # first arrives with a leading newline — strip it before matching.
+    rec="${rec#$'\n'}"
+    [[ -z "$rec" ]] && continue
+    h="${rec%%$'\x1f'*}"
+    if [[ "$h" == "$b" ]]; then
+      printf '%s' "${rec#*$'\x1f'}"
+      return 0
+    fi
+  done <<< "$_GH_OPEN_INDEX"
+  return 1
+}
+
 # Return 0 (true) if ANY of the given branches has an open head PR on origin.
 # On true, sets _ORPHAN_PR_BRANCH and _ORPHAN_PR_NUM (globals) for the caller's
 # error message. On false (no open PRs found), returns 1 with empty globals.
@@ -1636,11 +1702,39 @@ _fold_breadcrumb() {
     || warn "fold: could not comment on PR #${victim_pr} (referencing #${sup})"
 }
 
-# Return 0 if PR <num> is merged on GitHub, 1 otherwise.
-_gh_pr_is_merged() {
-  local state
-  state=$(gh pr view "$1" --repo "$GH_REPO" --json state --jq '.state' 2>/dev/null) || return 1
-  [[ "$state" == "MERGED" ]]
+# Resolve PR <num>'s merged-state + title in a single round trip: on merged,
+# print the title and return 0; on any other state (or query failure) return 1.
+# Combines what used to be two `gh pr view` calls (state, then title) into one,
+# and is the only live gh touch left in the merged-predecessor gather. Results
+# are memoised per run in _GH_MERGED_CACHE, so a predecessor referenced by
+# several PRs in one stack costs a single query. (cmd_pr_sync's pre-pass primes
+# this cache from the parent shell, since the gather runs in a subshell.)
+_GH_MERGED_CACHE=""   # "<num><US><title-or-empty><RS>" records; title empty == not merged
+_gh_merged_resolve() {
+  local num="$1" rec hit out state title
+  # Cache hit?
+  while IFS= read -r -d $'\x1e' rec; do
+    rec="${rec#$'\n'}"
+    [[ -z "$rec" ]] && continue
+    if [[ "${rec%%$'\x1f'*}" == "$num" ]]; then
+      hit="${rec#*$'\x1f'}"
+      [[ -n "$hit" ]] || return 1   # cached as not-merged
+      printf '%s' "$hit"
+      return 0
+    fi
+  done <<< "$_GH_MERGED_CACHE"
+  # Miss — one combined query, then memoise the answer (merged or not).
+  out=$(gh pr view "$num" --repo "$GH_REPO" --json state,title \
+    --jq '"\(.state)\(.title // "")"' 2>/dev/null) || out=""
+  state="${out%%$'\x1f'*}"
+  title="${out#*$'\x1f'}"
+  if [[ "$state" == "MERGED" ]]; then
+    _GH_MERGED_CACHE+="${num}"$'\x1f'"${title}"$'\x1e'
+    printf '%s' "$title"
+    return 0
+  fi
+  _GH_MERGED_CACHE+="${num}"$'\x1f'$'\x1e'   # remember "not merged"
+  return 1
 }
 
 # Create a draft PR (or non-draft if draft=0) for <branch>.
@@ -5378,6 +5472,10 @@ cmd_pr_sync() {
   require_in_repo
   _gh_preflight
 
+  # Fresh per-run merged-state cache (this proc may run pr sync more than once,
+  # e.g. after a move/fold rename).
+  _GH_MERGED_CACHE=""
+
   local prefix
   prefix=$(detect_prefix "$OPT_PREFIX")
 
@@ -5447,6 +5545,9 @@ cmd_pr_sync() {
   fi
   local PR_FAILURES=()
   local j parent leaf found
+  # One bulk query indexes every open PR; per-branch lookups are then local.
+  # If the bulk load fails, fall back to a live per-branch query.
+  _gh_load_open_index
   for ((j = 0; j < N; j++)); do
     b="${ACTIVE[j]}"
     if (( j == 0 )); then
@@ -5454,7 +5555,11 @@ cmd_pr_sync() {
     else
       parent="${ACTIVE[j-1]}"
     fi
-    found=$(_gh_pr_find "$b")
+    if (( _GH_OPEN_INDEX_OK )); then
+      found=$(_gh_open_index_find "$b") || found=""
+    else
+      found=$(_gh_pr_find "$b")
+    fi
     if [[ -n "$found" ]]; then
       local cur_num cur_title cur_base cur_body rest
       cur_num="${found%%$'\x1f'*}"
@@ -5530,6 +5635,31 @@ cmd_pr_sync() {
     fi
     active_flat+=("${ACTIVE[k]}" "${PR_NUMS[k]}" "${k_bracket}${LEAF_SUBJ[k]}")
   done
+  # --- pre-resolve merged predecessors (batched, deduped) ---
+  # The per-PR gather below runs in a process-substitution subshell, which can't
+  # persist _GH_MERGED_CACHE back to this shell. So resolve every predecessor
+  # that needs a live check ONCE here, in this shell — populating the cache the
+  # subshells inherit — so a predecessor shared by several PRs is queried a
+  # single time. Footer-known merges are skipped (the gather reads those
+  # straight from the PR's own footer, no query at all).
+  local pre_active_csv=""
+  for ((k = 0; k < N; k++)); do pre_active_csv="${pre_active_csv:+$pre_active_csv,}${PR_NUMS[k]}"; done
+  local pre_need="" pre_j pre_body pre_num pre_old pre_cand pre_q
+  for ((pre_j = 0; pre_j < N; pre_j++)); do
+    pre_num="${PR_NUMS[pre_j]}"
+    [[ "$pre_num" == "?" ]] && continue
+    pre_body="${PR_BODIES[pre_j]}"
+    pre_old=$(printf '%s' "$pre_body" | _pr_extract_nav_pr_nums)
+    while IFS= read -r pre_cand; do
+      [[ -z "$pre_cand" ]] && continue
+      _pr_footer_merged_title "$pre_cand" "$pre_body" >/dev/null && continue
+      case " $pre_need " in *" $pre_cand "*) continue ;; esac
+      pre_need="${pre_need:+$pre_need }$pre_cand"
+    done < <(_merged_predecessor_candidates "$pre_num" "$pre_active_csv" $pre_old)
+  done
+  for pre_q in $pre_need; do
+    _gh_merged_resolve "$pre_q" >/dev/null || true
+  done
   for ((j = 0; j < N; j++)); do
     b="${ACTIVE[j]}"
     local num="${PR_NUMS[j]}"
@@ -5572,7 +5702,7 @@ cmd_pr_sync() {
     while IFS=$'\t' read -r mn mt; do
       [[ -z "$mn" ]] && continue
       merged_flat+=("$mn" "$mt")
-    done < <(_pr_gather_merged_preds "$num" "$active_csv" $old_pr_nums)
+    done < <(_pr_gather_merged_preds "$num" "$active_csv" "$cur_body" $old_pr_nums)
     local footer_args=("$b")
     local wline wb wn wt rest
     # Split each TAB triple by hand: a merged predecessor has an empty leading

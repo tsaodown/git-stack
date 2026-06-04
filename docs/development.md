@@ -47,13 +47,22 @@ the engine executes it one **unit** at a time, persisting the coarse
 
 ### PR-sync reconciler — chain state → edit plan
 
-`pr sync` is split into an effectful **gather** (read each active branch's PR
-number/title/base/body and merged-predecessor candidates), a pure **reconcile**
+`pr sync` is split into an effectful **gather** (each active branch's PR
+number/title/base/body plus merged-predecessor candidates), a pure **reconcile**
 (map that *chain state* plus the stack structure to an **edit plan** — every
 presentation rule: the `[N/M]` prefix, strikethrough, nav-footer rendering,
 normalized change detection), and an effectful **apply** (create/edit PRs; same
 write path as the engine's remote-sync phase). The pure reconciler holds the
 presentation logic so it's testable without `gh`.
+
+The gather minimizes `gh` round trips, which dominate wall time: discovery is a
+single bulk `gh pr list` indexed in memory (one query for the whole stack, not
+one `--head` query per branch; a clean miss means "no open PR", a load failure
+falls back to per-branch lookups). Merged predecessors woven into the footer are
+resolved without re-querying where possible — an entry a PR's current body
+already renders struck-through as merged is trusted as-is (a merge is terminal),
+and any predecessor that still needs a live check is memoised per run, so one
+shared by several PRs in the stack costs a single `gh pr view`.
 
 ### Doctor scan — stack shape → issue list
 

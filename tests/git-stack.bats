@@ -431,6 +431,17 @@ HOOK
   [ "$(gh_log_count 'pr edit')" -eq 0 ]
 }
 
+@test "pr sync: discovery is a single bulk pr list, not one per branch" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  assert_status 0
+  # One bulk open-PR query for the whole stack — not one `--head` query per branch.
+  assert_eq "$(gh_log_count 'pr list')" 1 "pr list calls"
+}
+
 @test "pr sync: stack growing from 2 to 3 rebrackets existing titles" {
   make_stack_branches feat 01-foo 02-bar
   make_remote_origin
@@ -684,6 +695,7 @@ HOOK
   # Seed an existing PR for feat/01-foo with a stale position prefix
   # (simulates a stack that's been reshuffled since the prior run).
   export GH_PR_feat_01_foo__NUM=999
+  export GH_PR_feat_01_foo__HEAD="feat/01-foo"
   export GH_PR_feat_01_foo__TITLE="[5/9] Old name"
   export GH_PR_feat_01_foo__BODY=""
   run git stack pr sync --no-color
@@ -729,11 +741,13 @@ HOOK
 
 <!-- git-stack:nav-end -->'
   export GH_PR_feat_02_bar__NUM=102
+  export GH_PR_feat_02_bar__HEAD="feat/02-bar"
   export GH_PR_feat_02_bar__TITLE="[2/3] 02-bar"
   export GH_PR_feat_02_bar__BODY="prose two
 
 $old_footer"
   export GH_PR_feat_03_baz__NUM=103
+  export GH_PR_feat_03_baz__HEAD="feat/03-baz"
   export GH_PR_feat_03_baz__TITLE="[3/3] 03-baz"
   export GH_PR_feat_03_baz__BODY="prose three
 
@@ -757,6 +771,85 @@ $old_footer"
   [[ "$body" == *"[2/2] 03-baz"* ]] || return 1
   # The prose above the footer is preserved.
   [[ "$body" == *"prose two"* ]] || return 1
+}
+
+@test "pr sync: a footer-known merged predecessor is trusted without any gh pr view" {
+  # Same shape as the weave test, but #101 is ALREADY recorded as merged in the
+  # active PRs' footers. A merged PR can't revert, so pr sync must reuse the
+  # recorded title and skip the GitHub round trip entirely — no gh pr view.
+  make_stack_branches feat 02-bar 03-baz
+  make_remote_origin
+  local old_footer='<!-- git-stack:nav-start -->
+## Stack
+
+- ~~#101 01-foo~~ (merged)
+- #102 [1/2] 02-bar
+- #103 [2/2] 03-baz
+
+<!-- git-stack:nav-end -->'
+  export GH_PR_feat_02_bar__NUM=102
+  export GH_PR_feat_02_bar__HEAD="feat/02-bar"
+  export GH_PR_feat_02_bar__TITLE="[1/2] 02-bar"
+  export GH_PR_feat_02_bar__BODY="prose two
+
+$old_footer"
+  export GH_PR_feat_03_baz__NUM=103
+  export GH_PR_feat_03_baz__HEAD="feat/03-baz"
+  export GH_PR_feat_03_baz__TITLE="[2/2] 03-baz"
+  export GH_PR_feat_03_baz__BODY="prose three
+
+$old_footer"
+  # #101 is deliberately NOT seeded as a by-num PR: if the code trusts the
+  # footer it never asks GitHub about #101 at all.
+  run git stack pr sync --no-color
+  assert_status 0
+  # No state/title query for the merged predecessor — it came from the footer.
+  assert_eq "$(gh_log_count 'pr view')" 0 "pr view calls"
+  # #101 is still woven back in as a struck-through merged predecessor.
+  local body
+  body=$(gh_log_stdin "pr edit 102")
+  [[ "$body" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
+}
+
+@test "pr sync: a merged predecessor shared by multiple PRs is resolved with one gh pr view" {
+  # #101 is referenced (as a plain active entry, NOT yet marked merged) by both
+  # #102's and #103's old footers, and is in fact MERGED. The gather must
+  # resolve its state+title once for the whole run, not once per referencing PR.
+  make_stack_branches feat 02-bar 03-baz
+  make_remote_origin
+  local old_footer='<!-- git-stack:nav-start -->
+## Stack
+
+- #101 [1/3] 01-foo
+- #102 [2/3] 02-bar
+- #103 [3/3] 03-baz
+
+<!-- git-stack:nav-end -->'
+  export GH_PR_feat_02_bar__NUM=102
+  export GH_PR_feat_02_bar__HEAD="feat/02-bar"
+  export GH_PR_feat_02_bar__TITLE="[2/3] 02-bar"
+  export GH_PR_feat_02_bar__BODY="prose two
+
+$old_footer"
+  export GH_PR_feat_03_baz__NUM=103
+  export GH_PR_feat_03_baz__HEAD="feat/03-baz"
+  export GH_PR_feat_03_baz__TITLE="[3/3] 03-baz"
+  export GH_PR_feat_03_baz__BODY="prose three
+
+$old_footer"
+  export GH_PR_NUM_101__STATE=MERGED
+  export GH_PR_NUM_101__TITLE="01-foo"
+  run git stack pr sync --no-color
+  assert_status 0
+  # One combined state+title query for #101 across the whole sync (deduped),
+  # not one per referencing PR and not a separate state and title call.
+  assert_eq "$(grep -c '^gh pr view 101 ' "$GH_STUB_LOG")" 1 "gh pr view 101 calls"
+  # Woven in as merged for both PRs.
+  local b102 b103
+  b102=$(gh_log_stdin "pr edit 102")
+  b103=$(gh_log_stdin "pr edit 103")
+  [[ "$b102" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
+  [[ "$b103" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
 }
 
 # ---------- pr list ----------
