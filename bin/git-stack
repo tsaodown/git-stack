@@ -1389,18 +1389,20 @@ _pr_strip_nav_footer() {
 }
 
 # Extract PR numbers referenced inside the nav footer block in stdin.
-# Outputs one number per line. Handles both active (#N) and merged (~~#N~~) entries.
+# Outputs one number per line. Handles both active (#N) and merged (~~#N~~)
+# entries — each entry's number is the FIRST "#N" on its line. Only that first
+# match is emitted: a later "#N" on the same line is title text, not a stack
+# member (e.g. a Revert/Reapply title embeds the original "(#1234)"). Harvesting
+# those would re-seed bogus merged-predecessor entries on every `pr sync`.
 _pr_extract_nav_pr_nums() {
-  local in_block=0
+  local in_block=0 line
   while IFS= read -r line; do
     [[ "$line" == *'<!-- git-stack:nav-start -->'* ]] && in_block=1 && continue
     [[ "$line" == *'<!-- git-stack:nav-end -->'* ]] && in_block=0 && continue
     (( in_block )) || continue
-    local tmp="$line"
-    while [[ "$tmp" =~ \#([0-9]+) ]]; do
+    if [[ "$line" =~ \#([0-9]+) ]]; then
       printf '%s\n' "${BASH_REMATCH[1]}"
-      tmp="${tmp#*#${BASH_REMATCH[1]}}"
-    done
+    fi
   done
 }
 
@@ -1423,10 +1425,17 @@ _merged_predecessor_candidates() {
     case ",$active_csv," in *",$n,"*) guard=1 ;; esac
   done
   (( guard )) || return 0
+  # Emit each candidate at most once. The extractor already anchors to one
+  # number per entry, but a footer that picked up duplicate entries (e.g. from
+  # the pre-fix re-seeding bug) must still collapse to a single mining — never
+  # multiply across syncs.
+  local seen=","
   for n in "$@"; do
     [[ -z "$n" ]] && continue
     [[ "$n" == "$self" ]] && continue
     case ",$active_csv," in *",$n,"*) continue ;; esac
+    case "$seen" in *",$n,"*) continue ;; esac
+    seen="$seen$n,"
     printf '%s\n' "$n"
   done
 }

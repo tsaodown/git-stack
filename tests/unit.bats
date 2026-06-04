@@ -273,6 +273,41 @@ engine_next() {
   [ "$output" == $'paused\t1\t2' ]
 }
 
+# --- pr-sync reconciler: nav-footer PR-number extraction ---
+# Pure filter (stdin -> stdout): emit the PR number of each structural stack
+# entry inside the nav block, one per line. ONLY the first "#N" on a line is a
+# stack member; later "#N" tokens are title text (e.g. a Revert/Reapply title
+# embeds the original "(#1234)") and must NOT be harvested, or every sync
+# re-seeds bogus merged-predecessor entries from them.
+
+extract_nav() {
+  run bash -c "source '$GIT_STACK_BIN'; _pr_extract_nav_pr_nums" <<< "$1"
+}
+
+@test "extract nav nums: only the leading entry number per line (title #refs ignored)" {
+  extract_nav '## ignore me #999 outside the block
+<!-- git-stack:nav-start -->
+## Stack
+
+- ~~#3818 [1/2] update DARCS endpoint~~ (merged)
+- ~~#3858 [2/3] Reapply "update DARCS endpoint (#3818)"~~ (merged)
+- ~~#3884 [1/3] Revert "Reapply "...(#3818)" (#3858)"~~ (merged)
+- #3900 [1/2] split DARCS config-keys call
+- #3843 [2/2] flip monitors out of shadow ← this PR
+
+<!-- git-stack:nav-end -->
+trailing #777 outside the block'
+  [ "$status" -eq 0 ]
+  [ "$output" == $'3818\n3858\n3884\n3900\n3843' ]
+}
+
+@test "extract nav nums: nothing outside the fenced block is harvested" {
+  extract_nav '#111 before
+- #222 still before the block'
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 # --- pr-sync reconciler: merged-predecessor lineage guard ---
 # Pure: from an old nav-footer's PR numbers, return those no longer in the
 # active stack that are CANDIDATES for merged-predecessor weaving — but only
@@ -306,6 +341,14 @@ mpc() {
 
 @test "merged candidates: excludes active and self, lists multiple in order" {
   mpc 101 "101" 101 201 202
+  [ "$status" -eq 0 ]
+  [ "$output" == $'201\n202' ]
+}
+
+@test "merged candidates: a repeated old-footer number is mined only once" {
+  # Defense-in-depth: even if the same merged predecessor shows up several times
+  # in the old footer, it must be emitted once — never multiplied across syncs.
+  mpc 101 "101" 101 201 201 202 201
   [ "$status" -eq 0 ]
   [ "$output" == $'201\n202' ]
 }
