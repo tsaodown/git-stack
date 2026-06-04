@@ -89,6 +89,13 @@ If a cherry-pick collides, the reflow **pauses** on a [conflict](doctor.md#recov
 — you resolve the files, `git add` them, and run `git stack continue`, or back
 the whole thing out with `git stack abort`.
 
+A branch that carries no commit of its own (created on top of its predecessor
+and never committed to) is **skipped**, not picked: it just fast-forwards onto
+the predecessor's new tip. Likewise, if a pick comes up empty because its change
+is already present in the new predecessor (e.g. after a message-only amend, or a
+commit that already landed upstream), the reflow skips it rather than stalling on
+a spurious conflict.
+
 ## Snapshot
 
 A backup of the stack's refs, written before any mutating operation, so you can

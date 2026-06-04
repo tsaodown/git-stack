@@ -1104,7 +1104,7 @@ _engine_finalize() {
 do_one_step() {
   local cursor=$1
   local B="${STACK_BRANCHES[$cursor]}"
-  local prev_new prev_label prev_ref B_orig
+  local prev_new prev_label prev_ref prev_orig B_orig
   if (( cursor == STACK_FROM_IDX )) && [[ -n "$STACK_ONTO" ]]; then
     prev_new="$STACK_ONTO"
     prev_label="${STACK_ONTO_REF:-$STACK_ONTO}"
@@ -1114,8 +1114,27 @@ do_one_step() {
     prev_new=$(git rev-parse "refs/heads/$P")
     prev_label="$P"
     prev_ref="refs/heads/$P"
+    prev_orig="${STACK_ORIG_SHAS[$((cursor - 1))]}"
   fi
   B_orig=$(orig_sha_for "$B") || die "no orig SHA recorded for $B"
+
+  # Empty-branch fast-path. A branch created on top of its predecessor with no
+  # commit of its own shares the predecessor's tip, so at run start its original
+  # SHA equals the predecessor's original SHA. Once the predecessor moves, the
+  # cherry-pick below would replay the predecessor's *original* commit — already
+  # contained in the new head — and stall on an empty pick (a spurious conflict).
+  # Detect that here and just fast-forward the empty branch onto the predecessor's
+  # new head. When the predecessor didn't move, B_orig == prev_new and the skip
+  # further down handles it; the --onto bottom branch has no in-stack predecessor
+  # so prev_orig is empty and we fall through. This must precede the multi-commit
+  # guard, whose count diff can false-positive on an empty branch when the
+  # predecessor is rebased onto a shorter base.
+  if [[ -n "$prev_orig" && "$B_orig" == "$prev_orig" ]]; then
+    log "${C_GREEN}restack${C_RESET} ${C_CYAN}$B${C_RESET} ${C_DIM}onto${C_RESET} ${C_CYAN}$prev_label${C_RESET} ${C_DIM}(empty branch)${C_RESET}"
+    git checkout --quiet "$B"
+    git reset --hard --quiet "$prev_new"
+    return 0
+  fi
 
   # Multi-commit guard. The cherry-pick below replays only B_orig (the tip),
   # so a branch with multiple commits relative to its predecessor would
@@ -1159,6 +1178,25 @@ do_one_step() {
   local cp_out cp_rc=0
   cp_out=$(git cherry-pick "$B_orig" 2>&1) || cp_rc=$?
   if (( cp_rc != 0 )); then
+    # Empty-pick self-heal. The pick can come up empty when B_orig's patch is
+    # already contained in the new predecessor — e.g. a message-only amend of
+    # the predecessor (the upfront empty-branch check can't see this: cmd_amend
+    # rewrites the predecessor before run-start, so the recorded orig SHAs no
+    # longer match), or a commit that already landed upstream. git then pauses
+    # mid-pick with a clean tree. That's a no-op, not a conflict: HEAD already
+    # sits at prev_new, the desired result — so skip it and resume the reflow.
+    # The guards below exclude every kind of real conflict: a content conflict
+    # dirties the worktree; a staged-but-uncommitted state (hook/sign failure)
+    # fails the cached check; a delete/modify or mode conflict leaves unmerged
+    # entries. Only a genuinely empty pick satisfies all four.
+    if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
+       && git diff --quiet 2>/dev/null \
+       && git diff --cached --quiet 2>/dev/null \
+       && [[ -z "$(git ls-files --unmerged)" ]]; then
+      git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1 || true
+      log "${C_DIM}skip${C_RESET} ${C_CYAN}$B${C_RESET} ${C_DIM}(no change after restack onto ${C_CYAN}$prev_label${C_RESET}${C_DIM})${C_RESET}"
+      return 0
+    fi
     if [[ -n "$cp_out" ]]; then
       if [[ -n "$C_DIM" ]]; then
         printf '%s%s%s\n' "$C_DIM" "$cp_out" "$C_RESET" >&2

@@ -90,6 +90,44 @@ teardown() { teardown_repo; }
   assert_branch_parent_is feat/01-a "$new_main"
 }
 
+@test "restack: empty branch sharing parent tip reflows without spurious cherry-pick" {
+  # An empty branch (created on top of its parent, no commit of its own) shares
+  # the parent's tip. When the parent moves, the old code reset the empty branch
+  # to the parent's new head and then cherry-picked the parent's *original*
+  # commit onto it — which is already present, so the pick comes up empty and the
+  # reflow pauses on a spurious conflict. The empty branch must instead just
+  # track the parent's new head.
+  make_stack_branches feat 01-a
+  git checkout -q -b feat/02-b   # empty: shares feat/01-a's tip
+  git checkout -q main
+  git commit --allow-empty -q -m base2
+  local new_main
+  new_main=$(git rev-parse main)
+  git checkout -q feat/02-b
+  run git stack restack --onto main --from feat/01-a --no-color
+  assert_status 0
+  assert_branch_parent_is feat/01-a "$new_main"
+  # Empty branch tracks its parent's NEW head, still carrying no unique commit.
+  assert_sha_eq feat/02-b "$(git rev-parse feat/01-a)"
+}
+
+@test "amend: message-only amend with empty child reflows without spurious conflict" {
+  # cmd_amend rewrites the parent BEFORE cmd_restack captures orig SHAs, so the
+  # empty child's recorded orig no longer matches the parent's — the upfront
+  # empty-branch check can't fire. The post-pick empty-pick heal must catch it:
+  # cherry-picking the parent's old commit onto its reworded self is empty.
+  make_stack_branches feat 01-a
+  git checkout -q -b feat/02-b   # empty: shares feat/01-a's tip
+  git checkout -q feat/01-a
+  run git stack amend -m "01-a reworded" --no-color
+  assert_status 0
+  local new_a
+  new_a=$(git rev-parse refs/heads/feat/01-a)
+  # Empty child fast-forwards to the parent's new head; no cherry-pick left mid-air.
+  assert_sha_eq feat/02-b "$new_a"
+  refute test -f .git/CHERRY_PICK_HEAD
+}
+
 # ---------- multi-commit guard (added in this refactor) ----------
 
 @test "restack: refuses multi-commit branch without --force" {
