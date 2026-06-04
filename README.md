@@ -15,7 +15,7 @@ feat/030-profile
 `git stack` keeps the stack linear and the GitHub PRs in sync as you work. It:
 
 - **[reflows](docs/concepts.md#reflow)** the stack after you amend the bottom or rebase onto a new base, replaying each branch onto its predecessor;
-- **[inserts, moves, and renames](docs/workflows.md#4-you-need-a-branch-in-the-middle)** branches without renumbering the rest, using sparse leaf numbers;
+- **[inserts, moves, renames, and folds](docs/workflows.md#4-you-need-a-branch-in-the-middle)** branches without renumbering the rest, using sparse leaf numbers (`fold` squashes a branch into a neighbor to retire it while keeping its diff);
 - pushes with `--force-with-lease` and **[opens/updates a GitHub PR chain](docs/pr-sync.md)** (via `gh`), one PR per branch;
 - **[repairs and rolls back](docs/doctor.md)** — squashes messy branches, prunes merged ones, and keeps snapshots so you can undo.
 

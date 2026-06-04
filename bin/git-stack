@@ -96,6 +96,8 @@ STACK_PHASES=()             # ordered phase types, e.g. (reflow-pick)
 STACK_PHASE_IDX=0           # index into STACK_PHASES of the current phase
 STACK_UNIT_IDX=0            # phase-relative index of the current unit
 STACK_RENAME_PAIRS=()       # alternating old/new branch names for rename-batch
+STACK_FOLD_VICTIM=""        # fold: remote branch to delete + breadcrumb in remote-sync
+STACK_FOLD_SURVIVOR_NEW=""  # fold: survivor's (post-fold) name, for the breadcrumb target
 _PHASE_OUTCOME=""           # set by a phase op: unit-done|phase-complete|paused
 
 # ---------- helpers ----------
@@ -498,6 +500,8 @@ load_state() {
   STACK_PHASE_IDX=0
   STACK_UNIT_IDX=0
   STACK_RENAME_PAIRS=()
+  STACK_FOLD_VICTIM=""
+  STACK_FOLD_SURVIVOR_NEW=""
   # shellcheck disable=SC1090
   source "$f"
   case "${STACK_VERSION-}" in
@@ -755,6 +759,8 @@ save_engine_state() {
     printf 'STACK_UNIT_IDX=%d\n'        "$STACK_UNIT_IDX"
     printf 'STACK_OPT_NO_PUSH=%d\n'     "$STACK_OPT_NO_PUSH"
     printf 'STACK_OPT_NO_SYNC=%d\n'     "$STACK_OPT_NO_SYNC"
+    printf 'STACK_FOLD_VICTIM=%q\n'        "$STACK_FOLD_VICTIM"
+    printf 'STACK_FOLD_SURVIVOR_NEW=%q\n'  "$STACK_FOLD_SURVIVOR_NEW"
     _emit_array STACK_BRANCHES STACK_BRANCHES
     _emit_array STACK_ORIG_SHAS STACK_ORIG_SHAS
     _emit_array STACK_PUSH_FAILURES STACK_PUSH_FAILURES
@@ -971,8 +977,17 @@ _phase_remote_sync_advance() {
   if (( ! OPT_NO_PUSH )) && (( ${#pairs[@]} > 0 )); then
     _remote_rename_batch_or_skip "${pairs[@]}"
   fi
+  # Fold: capture the victim's PR number, delete its remote branch (closing the
+  # PR), then — after pr sync mints the superseding PR — leave a breadcrumb.
+  local fold_pr=""
+  if (( ! OPT_NO_PUSH )) && [[ -n "$STACK_FOLD_VICTIM" ]]; then
+    fold_pr=$(_fold_remote_drop_victim "$STACK_FOLD_VICTIM")
+  fi
   if (( ! OPT_NO_PUSH )); then
     _post_rename_sync "$STACK_PREFIX"
+  fi
+  if (( ! OPT_NO_PUSH )) && [[ -n "$STACK_FOLD_VICTIM" && -n "$fold_pr" ]]; then
+    _fold_breadcrumb "$fold_pr" "$STACK_FOLD_SURVIVOR_NEW"
   fi
   _PHASE_OUTCOME=phase-complete
 }
@@ -1576,6 +1591,44 @@ _check_no_open_prs() {
   return 1
 }
 
+# Fold remote tail, step 1: capture the victim's open PR number (best-effort),
+# then delete its remote branch — which closes that PR on GitHub. Prints the
+# captured PR number (empty if none / gh unavailable) so the caller can
+# breadcrumb it once pr sync has minted the superseding PR.
+# Usage: _fold_remote_drop_victim <victim_branch>
+_fold_remote_drop_victim() {
+  local victim="$1" pr="" found
+  if command -v gh >/dev/null 2>&1 && gh auth status -h github.com >/dev/null 2>&1; then
+    if [[ -z "${GH_REPO:-}" ]]; then
+      GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || GH_REPO=""
+    fi
+    if [[ -n "${GH_REPO:-}" ]]; then
+      found=$(_gh_pr_find "$victim")
+      [[ -n "$found" ]] && pr="${found%%$'\x1f'*}"
+    fi
+  fi
+  if git remote get-url origin >/dev/null 2>&1 \
+     && git ls-remote --exit-code --heads origin "$victim" >/dev/null 2>&1; then
+    git push --quiet origin --delete "$victim" 2>/dev/null \
+      || warn "fold: could not delete remote branch '$victim'"
+  fi
+  printf '%s' "$pr"
+}
+
+# Fold remote tail, step 2: leave a breadcrumb on the (now-closed) victim PR
+# pointing at the PR that supersedes it. Best-effort; runs after pr sync so the
+# superseding PR exists. Usage: _fold_breadcrumb <victim_pr> <survivor_branch>
+_fold_breadcrumb() {
+  local victim_pr="$1" survivor="$2" found sup=""
+  [[ -n "${GH_REPO:-}" ]] || return 0
+  found=$(_gh_pr_find "$survivor")
+  [[ -n "$found" ]] && sup="${found%%$'\x1f'*}"
+  [[ -n "$sup" ]] || return 0
+  local body="Folded into #${sup} via \`git stack fold\`; this branch no longer exists."
+  gh pr comment "$victim_pr" --repo "$GH_REPO" --body "$body" >/dev/null 2>&1 \
+    || warn "fold: could not comment on PR #${victim_pr} (referencing #${sup})"
+}
+
 # Return 0 if PR <num> is merged on GitHub, 1 otherwise.
 _gh_pr_is_merged() {
   local state
@@ -1863,6 +1916,30 @@ ${b}Branch-level subcommands:${r}
                                     head PR (same head-ref-deleted issue as
                                     ${sub}move${r}); pass ${fl}--allow-pr-rebuild${r} to
                                     proceed and rebuild the PRs.
+  ${sub}fold${r} [<branch>] [${fl}--up${r}|${fl}--down${r}] [${fl}--slug${r} <s>] [${fl}--at${r} <num>]
+       [${fl}--allow-pr-rebuild${r}] [${fl}--dry-run${r}] [${fl}--yes${r}] [${fl}--no-push${r}]
+                                    Merge a branch away by squashing it into an
+                                    adjacent neighbor (default: ${fl}--down${r} into the
+                                    predecessor), preserving the combined diff as
+                                    one commit, then reflowing the children. The
+                                    survivor keeps its leaf + slug by default;
+                                    ${fl}--slug${r} renames it, ${fl}--at${r} renumbers it (to a
+                                    free leaf below the children). Squashes the
+                                    whole victim/survivor range, so multi-commit/
+                                    merge-tip branches fold fine (note: reflowed
+                                    *children* are still cherry-picked tip-only).
+                                    Errors at the stack boundaries (bottom ${fl}--down${r},
+                                    tip ${fl}--up${r}, lone branch — use ${sub}clean${r}).
+                                    Destructive: snapshots first (undo via
+                                    ${sub}history restore${r}, which warns about any
+                                    duplicate-leaf leftovers a rename leaves),
+                                    refuses a dirty tree, needs ${fl}--yes${r} off a TTY.
+                                    Deleting the victim (and renaming the survivor
+                                    under ${fl}--slug${r}) closes their head PRs: refuses
+                                    unless ${fl}--allow-pr-rebuild${r} (or ${fl}--no-push${r}),
+                                    then deletes the remote victim, re-syncs PRs,
+                                    and breadcrumbs the closed PR to the
+                                    superseding one. ${fl}--dry-run${r} previews.
   ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}]
           [${fl}--no-rename${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
                                     Detect and offer to fix problems in the
@@ -2483,6 +2560,40 @@ cmd_history_restore() {
   printf '%s' "$stdin" | git update-ref --stdin -m "git-stack history restore ${run_id}" \
     || die "git update-ref failed"
   log "${C_GREEN}done${C_RESET}    restored from ${run_id}"
+
+  # A restore only resets/re-creates the snapshotted refs; a prior fold/move
+  # that renamed a branch leaves the renamed ref behind, which can now collide
+  # on a leaf with a just-restored branch. Surface any such leftovers.
+  _warn_duplicate_leaves "$prefix_path"
+}
+
+# Warn (to stderr) when two or more branches under the prefix share a leaf
+# number — e.g. a fold/move rename whose old name was re-created by a restore.
+# Usage: _warn_duplicate_leaves <prefix_path>
+_warn_duplicate_leaves() {
+  local prefix_path="$1"
+  [[ -n "$prefix_path" ]] || return 0
+  local branches=()
+  _load_stack_branches "${prefix_path}/" branches
+  (( ${#branches[@]} > 1 )) || return 0
+  local dups b seg
+  dups=$(
+    for b in "${branches[@]}"; do
+      seg="${b##*/}"
+      printf '%s\t%s\n' "${seg%%-*}" "$b"
+    done | sort | awk -F'\t' '
+      { c[$1]++; list[$1] = list[$1] (list[$1] ? ", " : "") $2 }
+      END { for (k in c) if (c[k] > 1) print list[k] }
+    '
+  )
+  [[ -n "$dups" ]] || return 0
+  warn "duplicate leaf numbers remain — a prior fold/move rename left branches sharing a leaf:"
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && printf '  %s%s%s\n' "$C_YELLOW" "$line" "$C_RESET" >&2
+  done <<< "$dups"
+  printf '  delete the unwanted branch, or run %sgit stack doctor%s %s[gstkd]%s to reconcile\n' \
+    "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET" >&2
 }
 
 # Yes/no confirmation. Prints "<prompt> [y/N] " to stderr, reads one char from
@@ -4287,6 +4398,8 @@ _doctor_finish() {
   local want_reflow=0 want_remote=0
   (( from_idx >= 0 && from_idx < ${#branches[@]} )) && want_reflow=1
   (( ${#STACK_RENAME_PAIRS[@]} > 0 && ! OPT_NO_PUSH )) && want_remote=1
+  # Fold always has a remote victim to delete (+ breadcrumb), even with no rename.
+  [[ -n "$STACK_FOLD_VICTIM" ]] && (( ! OPT_NO_PUSH )) && want_remote=1
   (( want_reflow || want_remote )) || return 0
 
   STACK_BRANCHES=("${branches[@]}")
@@ -4320,7 +4433,11 @@ _doctor_finish() {
     STACK_PHASES+=(reflow-pick)
     log ""
     log "${C_DIM}reflow${C_RESET}  re-threading branches from index $from_idx"
-    snapshot_stack doctor-reflow "$prefix" "${STACK_BRANCHES[@]}"
+    # Callers that already snapshotted the pre-mutation state (e.g. fold, whose
+    # snapshot must capture the to-be-deleted victim) suppress this one so the
+    # newest snapshot is the meaningful one.
+    (( ${STACK_SUPPRESS_REFLOW_SNAPSHOT:-0} )) \
+      || snapshot_stack doctor-reflow "$prefix" "${STACK_BRANCHES[@]}"
   else
     STACK_FORCE=0
     STACK_FROM_IDX=${#STACK_BRANCHES[@]}
@@ -4331,8 +4448,219 @@ _doctor_finish() {
   _engine_run
 }
 
+cmd_fold() {
+  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0
+  local victim_arg="" opt_up=0 opt_yes=0 opt_slug="" opt_at="" opt_allow_pr_rebuild=0 opt_dry_run=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then shift "$_FLAG_SHIFT"; continue; fi
+    case "$1" in
+      --up)   opt_up=1; shift ;;
+      --down) opt_up=0; shift ;;
+      --slug) shift; [[ $# -gt 0 ]] || die "--slug needs an argument"; opt_slug="$1"; shift ;;
+      --at)   shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
+      --allow-pr-rebuild) opt_allow_pr_rebuild=1; shift ;;
+      --dry-run) opt_dry_run=1; shift ;;
+      --yes)  opt_yes=1; shift ;;
+      -*)     die "unknown fold flag: $1" ;;
+      *)      [[ -z "$victim_arg" ]] || die "fold: extra arg '$1'"; victim_arg="$1"; shift ;;
+    esac
+  done
+  if [[ -n "$opt_at" && ! "$opt_at" =~ ^[0-9]+$ ]]; then
+    die "fold --at: requires a non-negative integer leaf number (got '$opt_at')"
+  fi
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+  (( ${#branches[@]} >= 2 )) || die "fold: stack has fewer than 2 branches; use 'git stack clean' to remove a lone branch"
+  _require_valid_leaf_nums "${branches[@]}"
+
+  # Default victim to the current branch.
+  if [[ -z "$victim_arg" ]]; then
+    victim_arg=$(current_branch) \
+      || die "usage: git stack fold [<branch>] [--up|--down]
+fold: no <branch> given and HEAD is detached"
+  fi
+  local victim rc=0
+  victim=$(_resolve_branch_ref "$victim_arg" "${branches[@]}") || rc=$?
+  (( rc == 0 )) || die "fold: '$victim_arg' not in stack '$prefix'"
+  local victim_idx
+  victim_idx=$(branch_index "$victim" "${branches[@]}")
+
+  # Resolve the survivor: the neighbor in the fold direction (default down =
+  # predecessor). Hard-error with a directional hint at the stack boundaries.
+  local survivor_idx survivor
+  if (( opt_up )); then
+    (( victim_idx < ${#branches[@]} - 1 )) \
+      || die "fold: '$victim' is the tip — nothing above to fold into; use --down"
+    survivor_idx=$((victim_idx + 1))
+  else
+    (( victim_idx > 0 )) \
+      || die "fold: '$victim' is the bottom branch — nothing below to fold into; use --up"
+    survivor_idx=$((victim_idx - 1))
+  fi
+  survivor="${branches[$survivor_idx]}"
+
+  # The merged commit spans [lo's stack-parent .. hi's tip], keeps the
+  # survivor's name, and sits in the survivor's slot.
+  local lo=$victim_idx hi=$victim_idx
+  if (( survivor_idx < victim_idx )); then lo=$survivor_idx; else hi=$survivor_idx; fi
+
+  local base_ref
+  if (( lo == 0 )); then
+    local parent_name
+    parent_name=$(_resolve_parent_name) \
+      || die "fold: cannot determine parent branch (set stack.base or create main/master)"
+    base_ref=$(_resolve_parent_ref "$parent_name")
+  else
+    base_ref="refs/heads/${branches[$((lo - 1))]}"
+  fi
+
+  # On a TTY (no --slug/--yes/--dry-run), offer to rename the result inline —
+  # the "write the slug" moment. Empty input keeps the survivor's slug. Done
+  # before name resolution so the entered slug flows through the gate + validation.
+  if (( ! opt_yes && ! opt_dry_run )) && [[ -z "$opt_slug" && -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
+    local _cur_slug="${survivor##*/}"; _cur_slug="${_cur_slug#*-}"
+    local _entered=""
+    printf '%sresult slug [%s]:%s ' "$C_DIM" "$_cur_slug" "$C_RESET" >&2
+    if read -r _entered < /dev/tty && [[ -n "$_entered" ]]; then
+      opt_slug="$_entered"
+    fi
+  fi
+
+  # Resolve the result branch name (leaf + slug). Default keeps the survivor's
+  # own leaf and slug; --slug overrides the slug, --at the leaf. Validate before
+  # any mutation so a bad --at fails clean.
+  local seg="${survivor##*/}"
+  local survivor_leaf="${seg%%-*}" survivor_slug="${seg#*-}"
+  local new_slug="${opt_slug:-$survivor_slug}"
+  local width result_leaf_num
+  width=$(_leaf_width_for "${branches[@]}")
+  if [[ -n "$opt_at" ]]; then
+    result_leaf_num=$((10#$opt_at))
+    # Bound strictly between the merged pair's predecessor and the first child,
+    # so the result cannot reorder past a neighbor.
+    local pred_leaf_num=0
+    (( lo > 0 )) && { local pseg="${branches[$((lo - 1))]##*/}"; pred_leaf_num=$((10#${pseg%%-*})); }
+    (( result_leaf_num > pred_leaf_num )) \
+      || die "fold --at: leaf $opt_at is not above the predecessor leaf $pred_leaf_num"
+    if (( hi + 1 < ${#branches[@]} )); then
+      local cseg="${branches[$((hi + 1))]##*/}" child_leaf_num
+      child_leaf_num=$((10#${cseg%%-*}))
+      (( result_leaf_num < child_leaf_num )) \
+        || die "fold --at: leaf $opt_at would reorder past child leaf $child_leaf_num; pick a lower number"
+    fi
+    local cb
+    for cb in "${branches[@]}"; do
+      [[ "$cb" == "$victim" || "$cb" == "$survivor" ]] && continue
+      local cbseg="${cb##*/}"
+      (( 10#${cbseg%%-*} == result_leaf_num )) && die "fold --at: leaf $opt_at collides with '$cb'"
+    done
+  else
+    result_leaf_num=$((10#$survivor_leaf))
+  fi
+  result_leaf=$(_format_leaf "$result_leaf_num" "$width")
+  local new_survivor="${prefix}${result_leaf}-${new_slug}"
+  [[ "$new_survivor" == */* ]] || die "fold: could not derive result branch name"
+  if [[ "$new_survivor" != "$survivor" ]]; then
+    git rev-parse --verify --quiet "refs/heads/${new_survivor}" >/dev/null \
+      && die "fold: target branch '${new_survivor}' already exists"
+  fi
+
+  # Dry run: describe the plan (incl. any PRs that would close) and stop before
+  # any mutation. No --yes / TTY needed since nothing changes.
+  if (( opt_dry_run )); then
+    local n_children=$(( ${#branches[@]} - 1 - hi ))
+    log "${C_BOLD}dry run${C_RESET}: would fold ${C_CYAN}${victim}${C_RESET} into ${C_CYAN}${new_survivor}${C_RESET}"
+    [[ "$new_survivor" != "$survivor" ]] \
+      && log "  ${C_DIM}survivor ${survivor} renamed to ${new_survivor}${C_RESET}"
+    log "  ${C_DIM}reflow ${n_children} child(ren) onto ${new_survivor}${C_RESET}"
+    if (( ! OPT_NO_PUSH )); then
+      local dr_gate=("$victim")
+      [[ "$new_survivor" != "$survivor" ]] && dr_gate+=("$survivor")
+      if _check_no_open_prs "${dr_gate[@]}"; then
+        log "  ${C_YELLOW}would close PR #${_ORPHAN_PR_NUM}${C_RESET} for ${_ORPHAN_PR_BRANCH} (needs --allow-pr-rebuild)"
+      fi
+    fi
+    log "  ${C_DIM}rerun without --dry-run to apply${C_RESET}"
+    return 0
+  fi
+
+  # PR gate: deleting the victim (always) and renaming the survivor (slug change)
+  # close their head PRs on GitHub, with no reattach. Refuse by default unless
+  # --allow-pr-rebuild or --no-push.
+  if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
+    local gate_branches=("$victim")
+    [[ "$new_survivor" != "$survivor" ]] && gate_branches+=("$survivor")
+    if _check_no_open_prs "${gate_branches[@]}"; then
+      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — deleting or renaming a branch closes its head PR on GitHub, with no reattach. Pass --allow-pr-rebuild to accept the close (a breadcrumb to the superseding PR is posted, and 'pr sync' rebuilds the survivor)."
+    fi
+  fi
+
+  # Destructive op: confirm on a TTY, refuse non-interactively without --yes.
+  if (( ! opt_yes )); then
+    if [[ -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
+      _confirm "fold ${victim} into ${survivor} (deletes ${victim})?" \
+        || die "fold: aborted"
+    else
+      die "fold: refusing to fold '${victim}' into '${survivor}' non-interactively; pass --yes"
+    fi
+  fi
+
+  # Snapshot the full pre-fold state (including the victim, which the apply step
+  # deletes) so 'history restore' can undo the whole fold. The inner reflow
+  # snapshot is suppressed so this stays the newest one.
+  snapshot_stack fold "$prefix" "${branches[@]}"
+  STACK_SUPPRESS_REFLOW_SNAPSHOT=1
+
+  local base_sha merged_tree msg squash
+  base_sha=$(git rev-parse "$base_ref")
+  merged_tree=$(git rev-parse "refs/heads/${branches[$hi]}^{tree}")
+  msg=$(git log -1 --format=%B "refs/heads/${survivor}")
+  squash=$(printf '%s' "$msg" | git commit-tree "$merged_tree" -p "$base_sha")
+
+  # Point the (possibly renamed) survivor at the squash, then drop the victim
+  # and the old survivor name. Detach first so we never hold a ref we delete.
+  git checkout --quiet --detach "$squash"
+  git update-ref "refs/heads/${new_survivor}" "$squash"
+  [[ "$new_survivor" != "$survivor" ]] && git update-ref -d "refs/heads/${survivor}"
+  git update-ref -d "refs/heads/${victim}"
+  git checkout --quiet "$new_survivor"
+
+  log "${C_GREEN}done${C_RESET}    folded ${C_CYAN}${victim}${C_RESET} into ${C_CYAN}${new_survivor}${C_RESET}"
+
+  # Re-thread the children (everything above the merged pair) onto the
+  # survivor, via the resumable reflow engine — same composer doctor uses.
+  # A slug change is a rename, fed to the remote tail via STACK_RENAME_PAIRS.
+  local post=() b
+  for b in "${branches[@]}"; do
+    [[ "$b" == "$victim" ]] && continue
+    if [[ "$b" == "$survivor" ]]; then post+=("$new_survivor"); else post+=("$b"); fi
+  done
+  local survivor_post_idx
+  survivor_post_idx=$(branch_index "$new_survivor" "${post[@]}")
+  if [[ "$new_survivor" != "$survivor" ]]; then
+    STACK_RENAME_PAIRS=("$survivor" "$new_survivor")
+  else
+    STACK_RENAME_PAIRS=()
+  fi
+  # The remote tail (in the remote-sync phase) deletes the victim's remote
+  # branch and breadcrumbs its PR to the superseding one.
+  STACK_FOLD_VICTIM="$victim"
+  STACK_FOLD_SURVIVOR_NEW="$new_survivor"
+  _doctor_finish "$prefix" "$((survivor_post_idx + 1))" "${post[@]}"
+}
+
 cmd_doctor() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
+  STACK_SUPPRESS_REFLOW_SNAPSHOT=0
   local opt_dry_run=0 opt_yes=0 opt_no_squash=0 opt_no_rename=0
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
@@ -5722,6 +6050,7 @@ alias gstkh='git stack history'
 alias gstkhs='git stack history show'
 alias gstkhr='git stack history restore'
 alias gstkmv='git stack move'
+alias gstkfo='git stack fold'
 alias gstkrn='git stack rename'
 alias gstkd='git stack doctor'
 POSIX_EOF
@@ -5752,6 +6081,7 @@ abbr -a -g gstkh git stack history
 abbr -a -g gstkhs git stack history show
 abbr -a -g gstkhr git stack history restore
 abbr -a -g gstkmv git stack move
+abbr -a -g gstkfo git stack fold
 abbr -a -g gstkrn git stack rename
 abbr -a -g gstkd git stack doctor
 FISH_EOF
@@ -5794,6 +6124,7 @@ main() {
     history)           shift; cmd_history "$@" ;;
     rename)            shift; cmd_rename "$@" ;;
     move|mv)           shift; cmd_move "$@" ;;
+    fold)              shift; cmd_fold "$@" ;;
     doctor)            shift; cmd_doctor "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;

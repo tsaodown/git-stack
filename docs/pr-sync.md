@@ -67,6 +67,13 @@ names — refuse by default when any affected branch has an open head PR. Pass
 `--allow-pr-rebuild` to accept that those PRs close and the next `pr sync` opens
 fresh ones.
 
+[`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) closes PRs the
+same way — the deleted victim's head PR always, and the survivor's if `--slug`
+renames it — so it shares the `--allow-pr-rebuild` gate. When you accept it, `fold`
+deletes the remote victim branch, runs `pr sync` to rebuild the chain, and then
+posts a **breadcrumb** comment on the closed victim PR pointing at the PR that now
+supersedes it (the breadcrumb runs after the sync, once the superseding PR exists).
+
 ## `git stack pr list`
 
 ```sh

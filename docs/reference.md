@@ -57,6 +57,41 @@ current commit (staged-ness preserved) and uses stash+pop when it lands elsewher
 warns and keeps the stash entry rather than aborting. Untracked files travel
 across regardless. See [workflows scenario 4](workflows.md#4-you-need-a-branch-in-the-middle).
 
+## Removing a branch: `clean` vs `fold`
+
+```sh
+git stack fold              # fold the current branch DOWN into its predecessor
+git stack fold 020 --up     # fold leaf 020 UP into its successor
+git stack fold --slug retry # keep the survivor's position, rename it
+git stack fold 020 --at 15  # renumber the merged result to a free leaf
+git stack fold --dry-run    # preview the plan, change nothing
+```
+
+Two different "get rid of a branch" verbs:
+
+- **`clean`** prunes branches whose upstream is `[gone]` (already merged/closed) and
+  reflows the survivors. Use it after a PR merges.
+- **`fold`** *merges a branch away that you're keeping the work for* — it squashes
+  the branch into an adjacent neighbor so the combined diff survives as one commit,
+  then reflows the children onto the survivor. A plain delete would orphan the
+  children from the context they were written against; folding keeps every
+  surviving branch's tree intact, so children cherry-pick clean.
+
+By default `fold` goes **down** (into the predecessor, which keeps its identity);
+`--up` folds into the successor instead. The survivor keeps its leaf and slug
+unless you pass `--slug` (rename) or `--at` (renumber to a free leaf below the
+children). It squashes the whole victim/survivor range, so multi-commit branches
+fold fine.
+
+`fold` is destructive, so it snapshots first (undo with `git stack history
+restore @0` — which also warns if a rename left a duplicate-leaf branch behind),
+refuses a dirty tree, and needs `--yes` when run off a TTY. Deleting the victim —
+and renaming the survivor under `--slug` — closes their GitHub head PRs, so `fold`
+refuses unless you pass `--allow-pr-rebuild` (or `--no-push`); with it, `fold`
+deletes the remote victim branch, re-syncs the PR chain, and leaves a breadcrumb
+comment on the closed PR pointing at the one that supersedes it. See
+[workflows scenario 13](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away).
+
 ## The default branch: `default-branch`
 
 ```sh

@@ -317,6 +317,11 @@ case "$_sub1 $_sub2" in
     # Unrecognized api call — silently succeed (don't break tests using it).
     exit 0
     ;;
+  "pr comment")
+    # gh pr comment <num> --repo R --body B — invocation already logged above;
+    # just succeed (the fold breadcrumb only needs a clean exit).
+    exit 0
+    ;;
   *)
     printf 'gh-stub: unrecognized command: %s %s\n' "$_sub1" "$_sub2" >&2
     exit 2

@@ -546,7 +546,11 @@ If the branch you're removing has an open PR, pass `--allow-pr-rebuild` to the
 `move`, and after the remote branch is deleted let [`clean`](#7-the-bottom-pr-merged)
 tidy it up instead of `git branch -D`.
 
-**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order) · [multi-commit branches](#10-a-branch-grew-a-second-commit)
+> **Want to keep the change, just not as its own branch?** That's
+> [`fold`](#13-a-branchs-change-is-obsolete-fold-it-away) — it squashes the branch
+> into a neighbor instead of discarding it.
+
+**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order) · [multi-commit branches](#10-a-branch-grew-a-second-commit) · [fold a branch away](#13-a-branchs-change-is-obsolete-fold-it-away)
 
 ---
 
@@ -582,3 +586,46 @@ When a shared stack gets tangled, [`doctor`](doctor.md) and
 [`history`](doctor.md#rolling-back-with-history) are your recovery tools.
 
 **See also:** [doctor.md](doctor.md) · [rolling back](doctor.md#rolling-back-with-history)
+
+---
+
+## 13. A branch's change is obsolete: fold it away
+
+**Situation.** `feat/020-retry` took an approach that no longer makes sense, and
+you reworked it in `feat/030-backoff` on top. You want **one** branch carrying the
+net effect, at the old position — not two. A plain delete of `020-retry` would
+strip its commit out from under `030-backoff`, which was written against it, so the
+rework would cherry-pick with conflicts (or silently wrong).
+
+`fold` squashes a branch into a neighbor instead, preserving the combined diff:
+
+```sh
+git stack checkout 30                  # on feat/030-backoff (the rework)
+git stack fold --slug backoff          # fold it DOWN into 020-retry, rename to the new meaning
+```
+
+```
+fold feat/030-backoff into feat/020-retry (deletes feat/030-backoff)?
+done    folded feat/030-backoff into feat/020-backoff
+reflow  re-threading branches from index 2
+done    reflow complete (0 branches restacked)
+```
+
+The result is a single `feat/020-backoff` at the old slot, containing both commits
+squashed into one; `feat/030-backoff` is gone. Folding **down** keeps the
+predecessor's position (so everything above is undisturbed), and `--slug` renames
+the survivor to reflect what the work now means.
+
+- Fold the other way with `--up` (into the successor); renumber the result with
+  `--at <leaf>`; squash the whole range, so multi-commit branches fold fine.
+- It's destructive, so it snapshots first — undo with
+  `git stack history restore @0` (which warns if the rename left a duplicate-leaf
+  branch behind). It refuses a dirty tree and needs `--yes` off a TTY.
+- If the folded-away branch (or a `--slug`-renamed survivor) has an open PR, pass
+  `--allow-pr-rebuild`: `fold` deletes the remote branch, re-syncs the chain, and
+  comments on the closed PR pointing at the one that now supersedes it.
+
+Contrast with [scenario 11](#11-pull-a-branch-out-of-the-middle), which *discards*
+a branch's change; `fold` *keeps* it.
+
+**See also:** [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [reference: clean vs fold](reference.md#removing-a-branch-clean-vs-fold)

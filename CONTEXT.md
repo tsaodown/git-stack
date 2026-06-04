@@ -203,6 +203,22 @@ deletes remote refs (that is **clean**'s job). No PR work, no per-branch `--from
 selection. Replaces `push` / `push --all`.
 _Avoid_: "push" — the per-branch, network-detail framing.
 
+**fold** `[branch]`:
+Merge a branch away by squashing it into an adjacent neighbor (default `--down`
+into the predecessor; `--up` into the successor), preserving the combined diff
+as one commit and reflowing the children. The survivor keeps its leaf + slug by
+default; `--slug` renames it, `--at` renumbers it (to a free leaf below the
+children — rejects a reorder). Squashes the whole range, so multi-commit / merge
+branches fold cleanly. Destructive: snapshots first (undo via `history restore`,
+which now warns about any duplicate-leaf leftovers a rename leaves behind),
+refuses a dirty tree, needs `--yes` off a TTY, and errors at the stack
+boundaries (lone branch → **clean**). PR side: `--allow-pr-rebuild` gate (the
+deleted victim's head PR always closes; the survivor's only on a `--slug`
+rename), then the remote-sync phase deletes the remote victim, re-syncs the PR
+chain, and breadcrumbs the closed PR to the superseding one (ADR 0003).
+_Avoid_: "squash"/"absorb" — **doctor** already owns those words (the
+multi-commit fix and the tree-equals-predecessor case, respectively).
+
 `move`, `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
 and `pr sync` / `pr list` keep their current meanings. **move** additionally
 **renumbers in place** when the chosen position is the branch's current slot —

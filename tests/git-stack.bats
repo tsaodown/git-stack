@@ -1026,14 +1026,14 @@ $old_footer"
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches the verb map (23, no shell functions)" {
-  # 23 simple aliases; no compound shell functions after the redesign.
+@test "init bash: alias count matches the verb map (24, no shell functions)" {
+  # 24 simple aliases; no compound shell functions after the redesign.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count func_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk' || true)
   func_count=$(printf '%s\n' "$output" | grep -c '^gstk.*()' || true)
-  [ "$alias_count" -eq 23 ]
+  [ "$alias_count" -eq 24 ]
   [ "$func_count" -eq 0 ]
 }
 
@@ -1043,6 +1043,7 @@ $old_footer"
   [[ "$output" == *"alias gstkcr='git stack create'"* ]]
   [[ "$output" == *"alias gstkad='git stack add'"* ]]
   [[ "$output" == *"alias gstkmv='git stack move'"* ]]
+  [[ "$output" == *"alias gstkfo='git stack fold'"* ]]
   [[ "$output" == *"alias gstkrn='git stack rename'"* ]]
   # Removed: gstkn (new), gstkpa (push --all).
   [[ "$output" != *"alias gstkn="* ]]
@@ -1672,6 +1673,270 @@ $old_footer"
   # Remote rename happened and pr sync ran.
   [ "$(gh_log_count 'api -X POST')" -ge 1 ]
   [ "$(gh_log_count 'pr')" -ge 1 ]
+}
+
+# ---------- fold ----------
+
+@test "fold: squashes a branch down into its predecessor and deletes it" {
+  make_stack_branches feat 01-a 02-b
+  run git stack fold feat/02-b --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_exists feat/01-a
+  # The survivor keeps its name and now carries the victim's diff too.
+  run git show feat/01-a:file
+  assert_output_contains "01-a"
+  assert_output_contains "02-b"
+}
+
+@test "fold: reflows children onto the survivor after folding a middle branch" {
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack fold feat/02-b --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/03-c
+  # 03-c is re-threaded onto the rewritten 01-a and keeps the full diff.
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+  run git show feat/03-c:file
+  assert_output_contains "01-a"
+  assert_output_contains "02-b"
+  assert_output_contains "03-c"
+}
+
+@test "fold --up: folds a branch into its successor" {
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack fold feat/02-b --up --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/03-c
+  # Survivor 03-c sits on 01-a and carries the folded-in 02-b diff.
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+  run git show feat/03-c:file
+  assert_output_contains "02-b"
+  assert_output_contains "03-c"
+}
+
+@test "fold: bottom branch with default down errors, hints --up" {
+  make_stack_branches feat 01-a 02-b
+  run git stack fold feat/01-a --yes --no-push --no-color
+  assert_status 1
+  assert_output_contains "bottom branch"
+  assert_output_contains "--up"
+}
+
+@test "fold --up: tip branch errors, hints --down" {
+  make_stack_branches feat 01-a 02-b
+  run git stack fold feat/02-b --up --yes --no-push --no-color
+  assert_status 1
+  assert_output_contains "--down"
+}
+
+@test "fold: lone branch in stack errors, hints clean" {
+  make_stack_branches feat 01-a
+  run git stack fold feat/01-a --yes --no-push --no-color
+  assert_status 1
+  assert_output_contains "clean"
+}
+
+@test "fold: non-TTY without --yes refuses and mutates nothing" {
+  make_stack_branches feat 01-a 02-b
+  run git stack fold feat/02-b --no-push --no-color
+  assert_status 1
+  assert_output_contains "--yes"
+  assert_branch_exists feat/02-b
+}
+
+@test "fold: newest snapshot restores the deleted victim" {
+  make_stack_branches feat 01-a 02-b 03-c
+  orig_b=$(git rev-parse feat/02-b)
+  run git stack fold feat/02-b --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  # The pre-fold snapshot is the newest one (@0); restoring it brings the
+  # victim back at its original SHA.
+  git checkout -q main
+  run git stack history restore @0 --yes --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_exists feat/02-b
+  assert_sha_eq feat/02-b "$orig_b"
+}
+
+@test "fold --slug: renames the survivor to the new slug" {
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack fold feat/02-b --slug merged --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_absent feat/01-a
+  assert_branch_exists feat/01-merged
+  assert_branch_exists feat/03-c
+  # Child re-threads onto the renamed survivor; full diff preserved.
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-merged)"
+  run git show feat/01-merged:file
+  assert_output_contains "01-a"
+  assert_output_contains "02-b"
+}
+
+@test "fold: refuses on a dirty working tree and mutates nothing" {
+  make_stack_branches feat 01-a 02-b
+  printf 'dirty\n' >> file
+  run git stack fold feat/02-b --yes --no-push --no-color
+  assert_status 1
+  assert_branch_exists feat/02-b
+}
+
+@test "fold: squashes a multi-commit victim into one commit on the survivor" {
+  git checkout -q -b feat/01-a; printf 'a\n' >> file; git add file; git commit -q -m 01-a
+  git checkout -q -b feat/02-b; printf 'b1\n' >> file; git add file; git commit -q -m 02-b-1
+  printf 'b2\n' >> file; git add file; git commit -q -m 02-b-2
+  run git stack fold feat/02-b --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  run git show feat/01-a:file
+  assert_output_contains "a"
+  assert_output_contains "b1"
+  assert_output_contains "b2"
+  # The whole victim range collapses to a single commit on the base.
+  run git rev-list --count main..feat/01-a
+  assert_output_contains "1"
+}
+
+@test "fold --at: renumbers the merged result to a chosen free leaf" {
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack fold feat/020-b --at 15 --yes --no-push --no-color
+  assert_status 0
+  assert_branch_exists feat/015-a
+  assert_branch_absent feat/010-a
+  assert_branch_exists feat/030-c
+  assert_branch_parent_is feat/030-c "$(git rev-parse feat/015-a)"
+}
+
+@test "fold --at: rejects a leaf that would reorder past a child" {
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack fold feat/020-b --at 40 --yes --no-push --no-color
+  assert_status 1
+  assert_branch_exists feat/020-b
+}
+
+@test "fold: refuses when the victim has an open PR without --allow-pr-rebuild" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_020_b__NUM=42
+  run git stack fold feat/020-b --yes --no-color
+  assert_status 1
+  assert_output_contains "allow-pr-rebuild"
+  assert_branch_exists feat/020-b
+}
+
+@test "fold --allow-pr-rebuild: deletes the remote victim branch" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_020_b__NUM=42
+  run git stack fold feat/020-b --allow-pr-rebuild --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/020-b
+  run git ls-remote --heads origin feat/020-b
+  assert_status 0
+  assert_eq "$output" "" "remote victim branch should be deleted"
+}
+
+@test "fold --allow-pr-rebuild: breadcrumbs the victim PR to the superseding PR" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_020_b__NUM=42
+  run git stack fold feat/020-b --allow-pr-rebuild --yes --no-color
+  assert_status 0
+  # A breadcrumb comment was posted on the victim PR (#42).
+  [ "$(gh_log_count 'pr comment 42')" -ge 1 ]
+  run cat "$GH_STUB_LOG"
+  assert_output_contains "Folded"
+}
+
+@test "fold --slug --allow-pr-rebuild: renames remote survivor, drops victim, breadcrumbs" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_010_a__NUM=41
+  export GH_PR_feat_020_b__NUM=42
+  run git stack fold feat/020-b --slug merged --allow-pr-rebuild --yes --no-color
+  assert_status 0
+  assert_branch_exists feat/010-merged
+  assert_branch_absent feat/020-b
+  run git ls-remote --heads origin feat/020-b
+  assert_eq "$output" "" "remote victim branch should be deleted"
+  # Survivor remote-rename was attempted and the victim PR got a breadcrumb.
+  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
+  [ "$(gh_log_count 'pr comment 42')" -ge 1 ]
+}
+
+@test "fold --slug: remote rename failure leaves the victim branch intact" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_010_a__NUM=41
+  export GH_PR_feat_020_b__NUM=42
+  export GH_STUB_FAIL_RENAME="feat/010-a"
+  run git stack fold feat/020-b --slug merged --allow-pr-rebuild --yes --no-color
+  assert_status 1
+  # The rename dies before the victim delete — the victim's remote branch (and
+  # therefore its PR) must survive for a clean recovery.
+  run git ls-remote --heads origin feat/020-b
+  assert_output_contains "020-b"
+  [ "$(gh_log_count 'pr comment')" -eq 0 ]
+}
+
+@test "fold --no-push: skips the PR gate even with an open victim PR" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_020_b__NUM=42
+  run git stack fold feat/020-b --yes --no-push --no-color
+  assert_status 0
+  assert_branch_absent feat/020-b
+}
+
+@test "fold --dry-run: previews the plan and mutates nothing" {
+  make_stack_branches feat 010-a 020-b 030-c
+  local before_b before_a before_c
+  before_b=$(git rev-parse feat/020-b)
+  before_a=$(git rev-parse feat/010-a)
+  before_c=$(git rev-parse feat/030-c)
+  run git stack fold feat/020-b --dry-run --no-color
+  assert_status 0
+  assert_output_contains "020-b"
+  assert_output_contains "010-a"
+  # Nothing mutated.
+  assert_branch_exists feat/020-b
+  assert_sha_eq feat/020-b "$before_b"
+  assert_sha_eq feat/010-a "$before_a"
+  assert_sha_eq feat/030-c "$before_c"
+}
+
+@test "fold --dry-run: needs no --yes and works off a TTY" {
+  make_stack_branches feat 010-a 020-b
+  run git stack fold feat/020-b --dry-run --no-color
+  assert_status 0
+  assert_branch_exists feat/020-b
+}
+
+@test "history restore: warns about duplicate-leaf leftovers after a fold rename" {
+  make_stack_branches feat 010-a 020-b 030-c
+  run git stack fold feat/020-b --slug merged --yes --no-push --no-color
+  assert_status 0
+  assert_branch_exists feat/010-merged
+  # Restoring re-creates the pre-fold 010-a but cannot remove the renamed
+  # 010-merged → a duplicate leaf 010 the warning must surface.
+  git checkout -q main
+  run git stack history restore @0 --yes --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_exists feat/010-a
+  assert_branch_exists feat/010-merged
+  assert_output_contains "010-merged"
+  assert_output_contains "doctor"
 }
 
 # ---------- doctor ----------
