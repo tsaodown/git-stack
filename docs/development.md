@@ -65,7 +65,7 @@ and `gh`-free, so the whole diagnosis is unit-testable.
 
 ### Placement — where a new or moved branch lands
 
-`_placement_resolve` is the pure resolver shared by `new` and `move`: given the
+`_placement_resolve` is the pure resolver shared by `create`/`add` and `move`: given the
 stack's leaves, a target intent (before / after / at / last), and the
 [width](concepts.md#width), it returns the new branch's [leaf](concepts.md#leaf)
 and [predecessor](concepts.md#predecessor) (or a base sentinel), or a

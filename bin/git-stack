@@ -2003,8 +2003,8 @@ ${b}Branch-level subcommands:${r}
 ${b}Common flags:${r}
   ${fl}--prefix${r} <p>                      Override the stack prefix (else
                                     git config stack.prefix, else auto-detect).
-  ${fl}--no-push${r}                         (new/move/rename) skip remote rename + pr sync.
-  ${fl}--no-sync${r}                         (new/move/rename) skip pr sync only.
+  ${fl}--no-push${r}                         (move/rename/fold/doctor) skip remote rename + pr sync.
+  ${fl}--no-sync${r}                         (move/rename/fold/doctor) skip pr sync only.
   ${fl}--color${r} | ${fl}--no-color${r}              Force color on/off (default: auto-detect
                                     TTY; honors ${fl}NO_COLOR${r} env var).
   ${fl}-v${r}, ${fl}--verbose${r}                     More output.

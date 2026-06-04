@@ -7,8 +7,9 @@ worth spelling out. For the **exhaustive per-command flag reference**, run:
 git stack help
 ```
 
-`help` is generated from the script itself, so it's always current — this page
-covers the things `help` doesn't, plus the day-to-day shortcuts.
+`help` lists every subcommand and its flags in one place — this page covers the
+things `help` doesn't (the shell aliases, the config knobs) plus the day-to-day
+shortcuts.
 
 ## Seeing your stacks: `list` vs `view`
 
@@ -146,6 +147,7 @@ This defines one short alias per verb:
 | `gstkhs`    | `git stack history show`    |
 | `gstkhr`    | `git stack history restore` |
 | `gstkmv`    | `git stack move`            |
+| `gstkfo`    | `git stack fold`            |
 | `gstkrn`    | `git stack rename`          |
 | `gstkd`     | `git stack doctor`          |
 

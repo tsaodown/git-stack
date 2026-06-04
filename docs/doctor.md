@@ -94,7 +94,7 @@ A leaf-renumber needed to re-space the stack — for instance to open a
 can succeed.
 
 Applying fixes runs the same atomic rename + remote-rename + `pr sync` flow as
-[`new`](workflows.md#4-you-need-a-branch-in-the-middle) and
+[`add`](workflows.md#4-you-need-a-branch-in-the-middle) and
 [`move`](workflows.md#5-the-branches-are-in-the-wrong-order), and a squash that
 rewrites commits triggers a reflow — so a `doctor` repair can pause on a conflict
 just like any other reflow (resolve + `git stack continue`).

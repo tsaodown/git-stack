@@ -26,6 +26,7 @@ Output blocks are captured from real runs; commit SHAs will differ for you.
 | [10](#10-a-branch-grew-a-second-commit) | A branch grew a second commit *(advanced)* |
 | [11](#11-pull-a-branch-out-of-the-middle) | Pull a branch out of the middle *(advanced)* |
 | [12](#12-sharing-a-stack-with-someone-else) | Sharing a stack with someone else *(advanced)* |
+| [13](#13-a-branchs-change-is-obsolete-fold-it-away) | A branch's change is obsolete: fold it away |
 
 ---
 
@@ -606,7 +607,9 @@ git stack fold               # fold it DOWN into 020-retry
 
 ```
 result slug [backoff]:
-fold feat/030-backoff → result feat/020-backoff (squash; removes feat/030-backoff, feat/020-retry). proceed? [Y/n]
+fold 030-backoff
+  into 020-retry
+  → result 020-backoff (deletes both originals). proceed? [Y/n]
 done    folded feat/030-backoff into feat/020-backoff
 reflow  re-threading branches from index 2
 done    reflow complete (0 branches restacked)
