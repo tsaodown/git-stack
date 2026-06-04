@@ -54,8 +54,14 @@ The survivor keeps its identity by default; both axes are independently overrida
   slot, so positions above are undisturbed. `--at <num>` overrides to any free leaf
   in the gap, validated **strictly below the lowest reflowed child** (an `--at` that
   would reorder past a child is rejected). Includes the victim's now-freed number.
-- **Slug:** defaults to the **survivor's** slug. On a TTY, a prompt is pre-filled
-  with it and editable (RET keeps it); `--slug <s>` sets it non-interactively.
+- **Slug:** defaults to the **victim's** slug — the branch you ran `fold` on names
+  the result (so a plain down-fold of `016-split` into `015-reapply` yields
+  `015-split`). On a TTY a prompt is pre-filled with it (RET keeps it); `--slug <s>`
+  sets it non-interactively. *(Amended 2026-06-04: originally shipped defaulting to
+  the survivor's slug, but first real use showed that the branch you invoke `fold`
+  on is the one whose name you have in mind — the survivor-slug default forced a
+  retype every time. Trade-off: the default now renames the survivor, so a plain
+  fold closes its PR too, not just the victim's.)*
 - **Commit message:** defaults to the survivor's. `-e/--edit` opens `$EDITOR`
   pre-filled with *both* commit messages (git-squash style). Reuses `doctor`'s
   editor affordance.
@@ -153,8 +159,10 @@ breadcrumb) only.
   `restack`/`amend`).
 - **State file:** refuse if a reflow state file already exists (mid-flight op).
 - **Confirmation:** a bare TTY run uses the current branch, down, prompts for the
-  slug, then a `y/N` confirm summarizing the plan + which PRs close + the breadcrumb
-  target. Non-TTY requires `--yes`.
+  slug, then a confirm summarizing the result branch name + what's removed. Non-TTY
+  requires `--yes`. *(Amended 2026-06-04: the confirm defaults to **yes** (`[Y/n]`),
+  and names the resulting branch explicitly — the original `y/N` with the old
+  survivor name shown was misread as not honoring the entered slug.)*
 
 ### History-restore caveat + cleanup warning
 

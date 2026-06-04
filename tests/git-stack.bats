@@ -1682,9 +1682,10 @@ $old_footer"
   run git stack fold feat/02-b --yes --no-push --no-color
   assert_status 0
   assert_branch_absent feat/02-b
-  assert_branch_exists feat/01-a
-  # The survivor keeps its name and now carries the victim's diff too.
-  run git show feat/01-a:file
+  # Result keeps the predecessor's leaf (01) but takes the folded branch's slug.
+  assert_branch_absent feat/01-a
+  assert_branch_exists feat/01-b
+  run git show feat/01-b:file
   assert_output_contains "01-a"
   assert_output_contains "02-b"
 }
@@ -1694,10 +1695,10 @@ $old_footer"
   run git stack fold feat/02-b --yes --no-push --no-color
   assert_status 0
   assert_branch_absent feat/02-b
-  assert_branch_exists feat/01-a
+  assert_branch_exists feat/01-b
   assert_branch_exists feat/03-c
-  # 03-c is re-threaded onto the rewritten 01-a and keeps the full diff.
-  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+  # 03-c is re-threaded onto the rewritten survivor and keeps the full diff.
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-b)"
   run git show feat/03-c:file
   assert_output_contains "01-a"
   assert_output_contains "02-b"
@@ -1710,10 +1711,11 @@ $old_footer"
   assert_status 0
   assert_branch_absent feat/02-b
   assert_branch_exists feat/01-a
-  assert_branch_exists feat/03-c
-  # Survivor 03-c sits on 01-a and carries the folded-in 02-b diff.
-  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
-  run git show feat/03-c:file
+  # Survivor is the successor (leaf 03); result takes the folded branch's slug.
+  assert_branch_exists feat/03-b
+  assert_branch_absent feat/03-c
+  assert_branch_parent_is feat/03-b "$(git rev-parse feat/01-a)"
+  run git show feat/03-b:file
   assert_output_contains "02-b"
   assert_output_contains "03-c"
 }
@@ -1793,12 +1795,12 @@ $old_footer"
   run git stack fold feat/02-b --yes --no-push --no-color
   assert_status 0
   assert_branch_absent feat/02-b
-  run git show feat/01-a:file
+  run git show feat/01-b:file
   assert_output_contains "a"
   assert_output_contains "b1"
   assert_output_contains "b2"
   # The whole victim range collapses to a single commit on the base.
-  run git rev-list --count main..feat/01-a
+  run git rev-list --count main..feat/01-b
   assert_output_contains "1"
 }
 
@@ -1806,10 +1808,11 @@ $old_footer"
   make_stack_branches feat 010-a 020-b 030-c
   run git stack fold feat/020-b --at 15 --yes --no-push --no-color
   assert_status 0
-  assert_branch_exists feat/015-a
+  # --at sets the leaf (015); the slug still defaults to the folded branch's (b).
+  assert_branch_exists feat/015-b
   assert_branch_absent feat/010-a
   assert_branch_exists feat/030-c
-  assert_branch_parent_is feat/030-c "$(git rev-parse feat/015-a)"
+  assert_branch_parent_is feat/030-c "$(git rev-parse feat/015-b)"
 }
 
 @test "fold --at: rejects a leaf that would reorder past a child" {

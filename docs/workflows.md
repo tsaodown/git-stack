@@ -600,30 +600,33 @@ rework would cherry-pick with conflicts (or silently wrong).
 `fold` squashes a branch into a neighbor instead, preserving the combined diff:
 
 ```sh
-git stack checkout 30                  # on feat/030-backoff (the rework)
-git stack fold --slug backoff          # fold it DOWN into 020-retry, rename to the new meaning
+git stack checkout 30        # on feat/030-backoff (the rework)
+git stack fold               # fold it DOWN into 020-retry
 ```
 
 ```
-fold feat/030-backoff into feat/020-retry (deletes feat/030-backoff)?
+result slug [backoff]:
+fold feat/030-backoff → result feat/020-backoff (squash; removes feat/030-backoff, feat/020-retry). proceed? [Y/n]
 done    folded feat/030-backoff into feat/020-backoff
 reflow  re-threading branches from index 2
 done    reflow complete (0 branches restacked)
 ```
 
 The result is a single `feat/020-backoff` at the old slot, containing both commits
-squashed into one; `feat/030-backoff` is gone. Folding **down** keeps the
-predecessor's position (so everything above is undisturbed), and `--slug` renames
-the survivor to reflect what the work now means.
+squashed into one. The result lands at the **predecessor's leaf** (020, so
+everything above is undisturbed) but is **named after the branch you ran `fold`
+on** (`030-backoff`) — exactly the obsolete-superseded case, no flags needed. Pass
+`--slug` if you want a different name.
 
 - Fold the other way with `--up` (into the successor); renumber the result with
   `--at <leaf>`; squash the whole range, so multi-commit branches fold fine.
 - It's destructive, so it snapshots first — undo with
   `git stack history restore @0` (which warns if the rename left a duplicate-leaf
-  branch behind). It refuses a dirty tree and needs `--yes` off a TTY.
-- If the folded-away branch (or a `--slug`-renamed survivor) has an open PR, pass
-  `--allow-pr-rebuild`: `fold` deletes the remote branch, re-syncs the chain, and
-  comments on the closed PR pointing at the one that now supersedes it.
+  branch behind). It refuses a dirty tree and prompts `[Y/n]` (needs `--yes` off a TTY).
+- Because the default renames the survivor (020-retry → 020-backoff), folding a
+  branch with pushed PRs closes both the victim's PR and the survivor's, so `fold`
+  asks for `--allow-pr-rebuild`: it then deletes the remote victim branch, re-syncs
+  the chain, and comments on each closed PR pointing at the one that supersedes it.
 
 Contrast with [scenario 11](#11-pull-a-branch-out-of-the-middle), which *discards*
 a branch's change; `fold` *keeps* it.

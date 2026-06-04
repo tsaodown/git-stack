@@ -77,19 +77,21 @@ Two different "get rid of a branch" verbs:
   children from the context they were written against; folding keeps every
   surviving branch's tree intact, so children cherry-pick clean.
 
-By default `fold` goes **down** (into the predecessor, which keeps its identity);
-`--up` folds into the successor instead. The survivor keeps its leaf and slug
-unless you pass `--slug` (rename) or `--at` (renumber to a free leaf below the
-children). It squashes the whole victim/survivor range, so multi-commit branches
-fold fine.
+By default `fold` goes **down** (into the predecessor); `--up` folds into the
+successor instead. The result lands at the survivor's leaf but is **named after
+the branch you ran `fold` on** (the victim's slug) — so folding `016-split` down
+into `015-reapply` yields `015-split`. Pass `--slug` to choose a different name,
+or `--at` to renumber to a free leaf below the children. It squashes the whole
+victim/survivor range, so multi-commit branches fold fine.
 
 `fold` is destructive, so it snapshots first (undo with `git stack history
 restore @0` — which also warns if a rename left a duplicate-leaf branch behind),
-refuses a dirty tree, and needs `--yes` when run off a TTY. Deleting the victim —
-and renaming the survivor under `--slug` — closes their GitHub head PRs, so `fold`
-refuses unless you pass `--allow-pr-rebuild` (or `--no-push`); with it, `fold`
-deletes the remote victim branch, re-syncs the PR chain, and leaves a breadcrumb
-comment on the closed PR pointing at the one that supersedes it. See
+refuses a dirty tree, prompts `[Y/n]` (default yes), and needs `--yes` when run
+off a TTY. Deleting the victim closes its head PR; because the default slug
+renames the survivor, the survivor's PR usually closes too — so `fold` refuses
+unless you pass `--allow-pr-rebuild` (or `--no-push`). With it, `fold` deletes the
+remote victim branch, re-syncs the PR chain, and leaves a breadcrumb comment on
+each closed PR pointing at the one that supersedes it. See
 [workflows scenario 13](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away).
 
 ## The default branch: `default-branch`

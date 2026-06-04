@@ -206,15 +206,18 @@ _Avoid_: "push" — the per-branch, network-detail framing.
 **fold** `[branch]`:
 Merge a branch away by squashing it into an adjacent neighbor (default `--down`
 into the predecessor; `--up` into the successor), preserving the combined diff
-as one commit and reflowing the children. The survivor keeps its leaf + slug by
-default; `--slug` renames it, `--at` renumbers it (to a free leaf below the
+as one commit and reflowing the children. The result keeps the survivor's leaf
+but **defaults its slug to the victim's** (the branch you ran `fold` on names the
+result); `--slug` overrides the slug, `--at` the leaf (to a free leaf below the
 children — rejects a reorder). Squashes the whole range, so multi-commit / merge
 branches fold cleanly. Destructive: snapshots first (undo via `history restore`,
 which now warns about any duplicate-leaf leftovers a rename leaves behind),
-refuses a dirty tree, needs `--yes` off a TTY, and errors at the stack
-boundaries (lone branch → **clean**). PR side: `--allow-pr-rebuild` gate (the
-deleted victim's head PR always closes; the survivor's only on a `--slug`
-rename), then the remote-sync phase deletes the remote victim, re-syncs the PR
+refuses a dirty tree, prompts `[Y/n]` (default yes) and needs `--yes` off a TTY,
+and errors at the stack boundaries (lone branch → **clean**). Note: because the
+default slug renames the survivor, a plain `fold` closes the survivor's PR too
+(not just the victim's) — `--allow-pr-rebuild` gate (the deleted victim's head PR
+always closes; the survivor's whenever the slug differs), then the remote-sync
+phase deletes the remote victim, re-syncs the PR
 chain, and breadcrumbs the closed PR to the superseding one (ADR 0003).
 _Avoid_: "squash"/"absorb" — **doctor** already owns those words (the
 multi-commit fix and the tree-equals-predecessor case, respectively).

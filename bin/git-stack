@@ -1922,8 +1922,10 @@ ${b}Branch-level subcommands:${r}
                                     adjacent neighbor (default: ${fl}--down${r} into the
                                     predecessor), preserving the combined diff as
                                     one commit, then reflowing the children. The
-                                    survivor keeps its leaf + slug by default;
-                                    ${fl}--slug${r} renames it, ${fl}--at${r} renumbers it (to a
+                                    result keeps the survivor's leaf but takes the
+                                    folded branch's slug by default (the branch you
+                                    ran ${sub}fold${r} on names the result); ${fl}--slug${r}
+                                    overrides the slug, ${fl}--at${r} the leaf (to a
                                     free leaf below the children). Squashes the
                                     whole victim/survivor range, so multi-commit/
                                     merge-tip branches fold fine (note: reflowed
@@ -4523,11 +4525,12 @@ fold: no <branch> given and HEAD is detached"
     base_ref="refs/heads/${branches[$((lo - 1))]}"
   fi
 
-  # On a TTY (no --slug/--yes/--dry-run), offer to rename the result inline —
-  # the "write the slug" moment. Empty input keeps the survivor's slug. Done
-  # before name resolution so the entered slug flows through the gate + validation.
+  # On a TTY (no --slug/--yes/--dry-run), offer to set the result slug inline —
+  # the "write the slug" moment. Default is the victim's slug (the branch you ran
+  # fold on names the result); empty input keeps it. Done before name resolution
+  # so the entered slug flows through the gate + validation.
   if (( ! opt_yes && ! opt_dry_run )) && [[ -z "$opt_slug" && -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
-    local _cur_slug="${survivor##*/}"; _cur_slug="${_cur_slug#*-}"
+    local _cur_slug="${victim##*/}"; _cur_slug="${_cur_slug#*-}"
     local _entered=""
     printf '%sresult slug [%s]:%s ' "$C_DIM" "$_cur_slug" "$C_RESET" >&2
     if read -r _entered < /dev/tty && [[ -n "$_entered" ]]; then
@@ -4535,12 +4538,15 @@ fold: no <branch> given and HEAD is detached"
     fi
   fi
 
-  # Resolve the result branch name (leaf + slug). Default keeps the survivor's
-  # own leaf and slug; --slug overrides the slug, --at the leaf. Validate before
-  # any mutation so a bad --at fails clean.
+  # Resolve the result branch name (leaf + slug). The result keeps the survivor's
+  # leaf (position) but defaults its slug to the *victim's* — the branch you ran
+  # fold on names the result. --slug overrides the slug, --at the leaf. Validate
+  # before any mutation so a bad --at fails clean.
   local seg="${survivor##*/}"
   local survivor_leaf="${seg%%-*}" survivor_slug="${seg#*-}"
-  local new_slug="${opt_slug:-$survivor_slug}"
+  local victim_seg="${victim##*/}"
+  local victim_slug="${victim_seg#*-}"
+  local new_slug="${opt_slug:-$victim_slug}"
   local width result_leaf_num
   width=$(_leaf_width_for "${branches[@]}")
   if [[ -n "$opt_at" ]]; then
@@ -4578,7 +4584,7 @@ fold: no <branch> given and HEAD is detached"
   # any mutation. No --yes / TTY needed since nothing changes.
   if (( opt_dry_run )); then
     local n_children=$(( ${#branches[@]} - 1 - hi ))
-    log "${C_BOLD}dry run${C_RESET}: would fold ${C_CYAN}${victim}${C_RESET} into ${C_CYAN}${new_survivor}${C_RESET}"
+    log "${C_BOLD}dry run${C_RESET}: would fold ${C_BOLD}${C_CYAN}${victim}${C_RESET} into ${C_BOLD}${C_CYAN}${new_survivor}${C_RESET}"
     [[ "$new_survivor" != "$survivor" ]] \
       && log "  ${C_DIM}survivor ${survivor} renamed to ${new_survivor}${C_RESET}"
     log "  ${C_DIM}reflow ${n_children} child(ren) onto ${new_survivor}${C_RESET}"
@@ -4607,10 +4613,28 @@ fold: no <branch> given and HEAD is detached"
   # Destructive op: confirm on a TTY, refuse non-interactively without --yes.
   if (( ! opt_yes )); then
     if [[ -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
-      _confirm "fold ${victim} into ${survivor} (deletes ${victim})?" \
-        || die "fold: aborted"
+      # Spell out the plan, multi-line and prefix-stripped so it stays legible.
+      local _v="${victim#"$prefix"}" _s="${survivor#"$prefix"}" _r="${new_survivor#"$prefix"}"
+      # Branch names in bold cyan; reset before each (to clear the dim framing)
+      # and re-dim after, so the names genuinely stand out.
+      local _hl="${C_RESET}${C_BOLD}${C_CYAN}" _fr="${C_RESET}${C_DIM}"
+      if [[ "$new_survivor" != "$survivor" ]]; then
+        printf '%sfold %s%s%s\n  into %s%s%s\n  → result %s%s%s (deletes both originals). proceed?%s [Y/n] ' \
+          "$C_DIM" "$_hl" "$_v" "$_fr" \
+          "$_hl" "$_s" "$_fr" \
+          "$_hl" "$_r" "$_fr" "$C_RESET" >&2
+      else
+        printf '%sfold %s%s%s\n  into %s%s%s (deletes %s%s%s). proceed?%s [Y/n] ' \
+          "$C_DIM" "$_hl" "$_v" "$_fr" \
+          "$_hl" "$_s" "$_fr" \
+          "$_hl" "$_v" "$_fr" "$C_RESET" >&2
+      fi
+      local _ans
+      read -r _ans < /dev/tty || die "fold: aborted"
+      _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')
+      [[ "${_ans:0:1}" == "n" ]] && die "fold: aborted"
     else
-      die "fold: refusing to fold '${victim}' into '${survivor}' non-interactively; pass --yes"
+      die "fold: refusing to fold '${victim}' into '${new_survivor}' non-interactively; pass --yes"
     fi
   fi
 
@@ -4634,7 +4658,7 @@ fold: no <branch> given and HEAD is detached"
   git update-ref -d "refs/heads/${victim}"
   git checkout --quiet "$new_survivor"
 
-  log "${C_GREEN}done${C_RESET}    folded ${C_CYAN}${victim}${C_RESET} into ${C_CYAN}${new_survivor}${C_RESET}"
+  log "${C_GREEN}done${C_RESET}    folded ${C_BOLD}${C_CYAN}${victim}${C_RESET} into ${C_BOLD}${C_CYAN}${new_survivor}${C_RESET}"
 
   # Re-thread the children (everything above the merged pair) onto the
   # survivor, via the resumable reflow engine — same composer doctor uses.
