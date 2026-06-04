@@ -401,6 +401,63 @@ weave() {
   [ "$output" == $'\t55\told base\nfeat/010-a\t101\t[1/1] auth' ]
 }
 
+# --- pr-sync reconciler: PR-reference linkification ---
+# Pure: rewrite every "#<digits>" in <text> to an explicit markdown link
+# [#N](https://github.com/<repo>/pull/N). A bare "#N" renders as a js-issue-link
+# that GitHub expands to the PR title client-side (unreadable nav); an explicit
+# link keeps the literal "#N" text AND stays clickable. A "#" not followed by a
+# digit is left alone; an empty repo passes the text through unchanged.
+
+mdlink() {
+  run bash -c "source '$GIT_STACK_BIN'; _md_link_pr_refs \"\$@\"" _ "$@"
+}
+
+@test "md link: a structural #N becomes an explicit pull link" {
+  mdlink datavant/healthsource '#3818'
+  [ "$status" -eq 0 ]
+  [ "$output" == '[#3818](https://github.com/datavant/healthsource/pull/3818)' ]
+}
+
+@test "md link: refs embedded in a revert title are linkified in place" {
+  mdlink datavant/healthsource 'Revert "foo (#3818)" (#3858)'
+  [ "$status" -eq 0 ]
+  [ "$output" == 'Revert "foo ([#3818](https://github.com/datavant/healthsource/pull/3818))" ([#3858](https://github.com/datavant/healthsource/pull/3858))' ]
+}
+
+@test "md link: a # not followed by a digit is left untouched" {
+  mdlink datavant/healthsource 'C# at # and ## headings'
+  [ "$status" -eq 0 ]
+  [ "$output" == 'C# at # and ## headings' ]
+}
+
+@test "md link: empty repo passes text through unchanged" {
+  mdlink '' '#3818 stays bare'
+  [ "$status" -eq 0 ]
+  [ "$output" == '#3818 stays bare' ]
+}
+
+# --- pr-sync reconciler: nav-footer rendering ---
+# _pr_render_nav_footer <repo> <self> then (branch, num, title) triples. An
+# empty branch marks a merged predecessor (strikethrough); a branch equal to
+# <self> gets the "← this PR" marker. Every #N is linkified.
+
+render() {
+  run bash -c "source '$GIT_STACK_BIN'; _pr_render_nav_footer \"\$@\"" _ "$@"
+}
+
+@test "render: merged predecessor strikes through and linkifies structural + embedded refs" {
+  render datavant/healthsource feat/self \
+    "" 3858 'Reapply "foo (#3818)"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'- ~~[#3858](https://github.com/datavant/healthsource/pull/3858) Reapply "foo ([#3818](https://github.com/datavant/healthsource/pull/3818))"~~ (merged)'* ]]
+}
+
+@test "render: the self entry gets a linkified number and the this-PR marker" {
+  render datavant/healthsource feat/self feat/self 3843 '[2/2] flip monitors'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'- [#3843](https://github.com/datavant/healthsource/pull/3843) [2/2] flip monitors ← this PR'* ]]
+}
+
 # --- pr-sync reconciler: round-trip-tolerant body normalization ---
 # Pure filter (stdin -> stdout): strip CR, drop trailing blank lines. Used
 # comparison-only so a GitHub body round-trip (CRLF, trailing newline) does not

@@ -62,6 +62,15 @@ the markers — your PR description, the template — is preserved untouched. Ch
 detection is normalized so a GitHub body round-trip doesn't produce a spurious
 edit.
 
+Every PR reference is written as an explicit `[#N](…/pull/N)` markdown link
+rather than a bare `#N`. A bare `#N` is a GitHub *issue-link* that the page
+resolves to the PR title client-side — so a chain of them (and the `(#N)` refs
+embedded in `Revert`/`Reapply` titles) expands into an unreadable wall of nested
+titles. An explicit link keeps the literal `#N` text, stays clickable, and is
+not expanded. To match a stack entry's number when re-reading a footer, the
+parser takes only the first `#N` on each line; later `#N` tokens are title text,
+not chain members.
+
 ### Renames close head PRs
 
 GitHub auto-closes a PR when its head branch is renamed, and there's no API to

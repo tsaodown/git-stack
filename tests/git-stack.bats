@@ -661,7 +661,7 @@ HOOK
   local body
   body=$(jq -r .body "$GH_STUB_DIR/by-num/101.json")
   assert grep -qF "git-stack:nav-start" <<<"$body"
-  assert grep -qF "#101 [1/1] 01-solo ← this PR" <<<"$body"
+  assert grep -qF "[#101](https://github.com/test/repo/pull/101) [1/1] 01-solo ← this PR" <<<"$body"
   assert grep -qF "git-stack:nav-end" <<<"$body"
 }
 
@@ -766,7 +766,7 @@ $old_footer"
   # is guarded with `|| return 1` to make it a real check.
   local body
   body=$(gh_log_stdin "pr edit 102")
-  [[ "$body" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
+  [[ "$body" == *"~~[#101](https://github.com/test/repo/pull/101) 01-foo~~ (merged)"* ]] || return 1
   [[ "$body" == *"[1/2] 02-bar"* ]] || return 1
   [[ "$body" == *"[2/2] 03-baz"* ]] || return 1
   # The prose above the footer is preserved.
@@ -808,7 +808,7 @@ $old_footer"
   # #101 is still woven back in as a struck-through merged predecessor.
   local body
   body=$(gh_log_stdin "pr edit 102")
-  [[ "$body" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
+  [[ "$body" == *"~~[#101](https://github.com/test/repo/pull/101) 01-foo~~ (merged)"* ]] || return 1
 }
 
 @test "pr sync: a merged predecessor shared by multiple PRs is resolved with one gh pr view" {
@@ -848,8 +848,8 @@ $old_footer"
   local b102 b103
   b102=$(gh_log_stdin "pr edit 102")
   b103=$(gh_log_stdin "pr edit 103")
-  [[ "$b102" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
-  [[ "$b103" == *"~~#101 01-foo~~ (merged)"* ]] || return 1
+  [[ "$b102" == *"~~[#101](https://github.com/test/repo/pull/101) 01-foo~~ (merged)"* ]] || return 1
+  [[ "$b103" == *"~~[#101](https://github.com/test/repo/pull/101) 01-foo~~ (merged)"* ]] || return 1
 }
 
 # ---------- pr list ----------

@@ -1525,24 +1525,56 @@ _pr_weave_footer_triples() {
   done
 }
 
+# Rewrite every "#<digits>" PR reference in <text> to an explicit markdown link
+# [#N](https://github.com/<repo>/pull/N). A bare "#N" renders as a js-issue-link
+# that GitHub resolves to the PR title client-side — so a nav block full of them
+# (and of the "(#N)" refs embedded in revert/reapply titles) expands into an
+# unreadable wall of nested titles. An explicit link keeps the literal "#N" text
+# AND stays clickable, and is not expanded. A "#" not followed by a digit is left
+# untouched; an empty <repo> passes the text through unchanged (degrade to bare
+# "#N" rather than emit a broken URL).
+_md_link_pr_refs() {
+  local repo="$1" s="$2"
+  [[ -z "$repo" ]] && { printf '%s' "$s"; return 0; }
+  local out="" i ch j num
+  for (( i = 0; i < ${#s}; i++ )); do
+    ch="${s:i:1}"
+    if [[ "$ch" == "#" && "${s:i+1:1}" == [0-9] ]]; then
+      num=""
+      j=$(( i + 1 ))
+      while (( j < ${#s} )) && [[ "${s:j:1}" == [0-9] ]]; do
+        num+="${s:j:1}"
+        j=$(( j + 1 ))
+      done
+      out+="[#${num}](https://github.com/${repo}/pull/${num})"
+      i=$(( j - 1 ))
+    else
+      out+="$ch"
+    fi
+  done
+  printf '%s' "$out"
+}
+
 # Emit the fenced stack-nav footer to stdout.
-# Args: <self_branch> then repeating triples of (branch, pr_num, title).
+# Args: <repo> <self_branch> then repeating triples of (branch, pr_num, title).
 # A branch value of "" marks a merged predecessor — rendered as strikethrough.
-# Titles with a leading "[N/M] " prefix have that prefix stripped before
-# display (the bracket info is redundant inside the chain listing).
+# <repo> ("owner/name") is needed to linkify each "#N" (see _md_link_pr_refs);
+# refs embedded in the title are linkified in place too.
 _pr_render_nav_footer() {
-  local self="$1"; shift
+  local repo="$1" self="$2"; shift 2
   printf '<!-- git-stack:nav-start -->\n'
   printf '## Stack\n\n'
-  local b n t
+  local b n t link disp
   while (( $# >= 3 )); do
     b="$1"; n="$2"; t="$3"
+    link=$(_md_link_pr_refs "$repo" "#$n")
+    disp=$(_md_link_pr_refs "$repo" "$t")
     if [[ -z "$b" ]]; then
-      printf -- '- ~~#%s %s~~ (merged)\n' "$n" "$t"
+      printf -- '- ~~%s %s~~ (merged)\n' "$link" "$disp"
     elif [[ "$b" == "$self" ]]; then
-      printf -- '- #%s %s ← this PR\n' "$n" "$t"
+      printf -- '- %s %s ← this PR\n' "$link" "$disp"
     else
-      printf -- '- #%s %s\n' "$n" "$t"
+      printf -- '- %s %s\n' "$link" "$disp"
     fi
     shift 3
   done
@@ -5723,7 +5755,7 @@ cmd_pr_sync() {
       footer_args+=("$wb" "$wn" "$wt")
     done < <(_pr_weave_footer_triples "$old_csv" "${merged_flat[@]+"${merged_flat[@]}"}" -- "${active_flat[@]}")
     local footer
-    footer=$(_pr_render_nav_footer "${footer_args[@]}")
+    footer=$(_pr_render_nav_footer "$GH_REPO" "${footer_args[@]}")
     local desired_body
     if [[ -n "$stripped" ]]; then
       desired_body=$(printf '%s\n\n%s' "$stripped" "$footer")
