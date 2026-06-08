@@ -65,6 +65,12 @@ eval "$(git stack init zsh)"
 git stack init fish | source
 ```
 
+For **zsh** and **fish**, `init` also installs **tab completion**: verbs, leaf
+numbers for `checkout` (with slug hints), and stack prefixes for `view` and
+`--prefix`. It needs your shell's own git completion loaded (zsh's `_git`, fish's
+bundled git completion), which both ship by default. bash gets aliases only —
+it can't render the description hints.
+
 See the [full alias list](docs/reference.md#shell-integration--aliases) in the reference.
 
 ## Quick start

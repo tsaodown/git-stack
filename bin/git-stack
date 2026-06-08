@@ -6266,14 +6266,109 @@ cmd_default_branch() {
   fi
 }
 
+# Hidden plumbing: emit dynamic shell-completion candidates as
+# `candidate<TAB>description` lines on stdout, one per line. Consumed by the
+# shell completion wiring. NON-NEGOTIABLE: this runs on every keystroke-tab, so
+# it must NEVER die, prompt, or print errors — every degenerate case (no repo,
+# detached HEAD, non-stack branch, empty repo, mid-reflow, unknown kind) exits 0
+# with empty stdout. Guards the repo check itself and uses only the non-dying
+# helpers (_try_detect_prefix, _load_stack_branches without its err arg).
+cmd___complete() {
+  # Silent repo gate — do NOT call the die-ing require_in_repo.
+  git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+  local kind="${1-}"
+  shift || true
+  case "$kind" in
+    verbs)    _complete_verbs ;;
+    subverbs) _complete_subverbs "${1-}" ;;
+    leaves)   _complete_leaves "$@" ;;
+    prefixes) _complete_prefixes ;;
+    *) exit 0 ;;
+  esac
+}
+
+# Every user-facing verb with a one-line description. Source of truth for the
+# verb list — excludes removed verbs (new/close/push/status) and plumbing
+# (init, default-branch, prefix, __complete).
+_complete_verbs() {
+  printf '%s\t%s\n' \
+    list      "Overview of all stacks in the repo" \
+    view      "Show one stack's branches without checking out" \
+    pick      "Pick a stack and check out its tip" \
+    checkout  "Check out a stack branch by leaf number" \
+    create    "Start a brand-new stack" \
+    add       "Add an empty branch to the current stack" \
+    sync      "Push the whole stack additively to the remote" \
+    clean     "Prune gone branches and reflow survivors" \
+    restack   "Reset+cherry-pick branches onto their predecessors" \
+    amend     "Amend the current branch and reflow upper branches" \
+    continue  "Resume a paused reflow after resolving conflicts" \
+    abort     "Abort a paused reflow and restore original SHAs" \
+    pr        "Sync or list GitHub PRs for the stack" \
+    history   "Show or restore stack snapshots" \
+    rename    "Rename every branch in the stack to a new prefix" \
+    move      "Move a branch to a different position in the stack" \
+    fold      "Fold one branch's commits into another" \
+    doctor    "Diagnose stack health"
+}
+
+# Subverbs for verbs that have them; nothing (exit 0) for any other verb.
+_complete_subverbs() {
+  case "${1-}" in
+    pr)
+      printf '%s\t%s\n' \
+        sync "Create/update PRs for the stack" \
+        list "List the stack's PRs"
+      ;;
+    history)
+      printf '%s\t%s\n' \
+        show    "Show a stack snapshot" \
+        restore "Restore a stack snapshot"
+      ;;
+    *) exit 0 ;;
+  esac
+}
+
+# `<number><TAB><slug>` per branch in leaf order for the resolved stack.
+# --prefix <p> overrides; otherwise detect from the current branch. Silent if
+# the prefix can't be resolved or the stack is empty.
+_complete_leaves() {
+  local override=""
+  if [[ "${1-}" == "--prefix" ]]; then
+    override="${2-}"
+  fi
+  local prefix
+  prefix=$(_try_detect_prefix "$override") || exit 0
+  local branches=()
+  _load_stack_branches "$prefix" branches
+  (( ${#branches[@]} )) || exit 0
+  local b leaf num slug
+  for b in "${branches[@]}"; do
+    leaf="${b##*/}"
+    [[ "$leaf" =~ ^([0-9]+)- ]] || continue
+    num="${BASH_REMATCH[1]}"
+    slug="${leaf#${num}-}"
+    printf '%s\t%s\n' "$num" "$slug"
+  done
+}
+
+# Each stack prefix in the repo, one per line (trailing-empty description).
+_complete_prefixes() {
+  local p
+  while IFS= read -r p; do
+    printf '%s\t\n' "$p"
+  done < <(stack_prefixes)
+}
+
 # Emit shell-specific alias/function/abbr definitions for the given shell.
 # Designed to be `eval`d (bash/zsh) or sourced (fish) at shell startup.
 cmd_init() {
   local shell="${1-}"
   [[ -n "$shell" ]] || die "usage: git stack init <bash|zsh|fish>"
   case "$shell" in
-    bash|zsh) _emit_init_posix ;;
-    fish)     _emit_init_fish ;;
+    bash) _emit_init_posix ;;
+    zsh)  _emit_init_posix; _emit_completion_zsh ;;
+    fish) _emit_init_fish; _emit_completion_fish ;;
     *) die "unsupported shell: $shell (supported: bash, zsh, fish)" ;;
   esac
 }
@@ -6340,6 +6435,118 @@ abbr -a -g gstkd git stack doctor
 FISH_EOF
 }
 
+# zsh completion. zsh's bundled `_git` dispatches `git stack` to a function
+# named `_git-stack` if one exists in the $functions table — so defining the
+# function (no compdef, no fpath file) is enough. All dynamic candidates come
+# from `git stack __complete`; ref slots (--onto/--from) defer to native git
+# completion. `value<TAB>desc` lines from __complete are reshaped into the
+# `value:desc` form _describe wants so hints render.
+_emit_completion_zsh() {
+  cat <<'ZSH_EOF'
+# git stack zsh completion (driven by `git stack __complete`).
+_git-stack() {
+  local -a _gs_items
+  _gs_complete() {
+    # $1 = __complete kind + any extra args; populate _gs_items as value:desc.
+    _gs_items=()
+    local _gs_line
+    for _gs_line in "${(@f)$(git stack __complete "$@" 2>/dev/null)}"; do
+      [[ -n $_gs_line ]] || continue
+      _gs_items+=("${_gs_line%%$'\t'*}:${_gs_line#*$'\t'}")
+    done
+  }
+
+  # Forward an explicit `--prefix <p>` from the line into `__complete leaves`.
+  _gs_leaves() {
+    local i pfx=""
+    for (( i = 1; i < CURRENT; i++ )); do
+      if [[ ${words[i]} == --prefix ]]; then
+        pfx=${words[i+1]}
+        break
+      fi
+    done
+    if [[ -n $pfx ]]; then
+      _gs_complete leaves --prefix "$pfx"
+    else
+      _gs_complete leaves
+    fi
+    _describe -t leaves 'leaf' _gs_items
+  }
+
+  _gs_refs() {
+    (( $+functions[__git_branch_names] )) && __git_branch_names
+  }
+
+  # words[1]=stack, words[2]=verb. Complete the verb itself at CURRENT==2.
+  if (( CURRENT == 2 )); then
+    _gs_complete verbs
+    _describe -t verbs 'git stack verb' _gs_items
+    return
+  fi
+
+  # Option-value slots take priority over positional dispatch.
+  case ${words[CURRENT-1]} in
+    --prefix) _gs_complete prefixes; _describe -t prefixes 'prefix' _gs_items; return ;;
+    --before|--after|--at) _gs_leaves; return ;;
+    --onto|--from) _gs_refs; return ;;
+  esac
+
+  # Positional dispatch keyed on the verb.
+  case ${words[2]} in
+    checkout|co) _gs_leaves; return ;;
+    view) _gs_complete prefixes; _describe -t prefixes 'prefix' _gs_items; return ;;
+    pr|history)
+      if (( CURRENT == 3 )); then
+        _gs_complete subverbs "${words[2]}"
+        _describe -t subverbs 'subcommand' _gs_items
+        return
+      fi
+      ;;
+  esac
+}
+ZSH_EOF
+}
+
+# fish completion. Guarded by `__fish_git_using_command stack` (shipped in
+# fish's git completion). Dynamic candidates come from `git stack __complete`;
+# fish parses `value\tdesc` from `-a '(...)'` into completion+description.
+# `--onto/--from` defer to fish's native git ref completion. NOTE: `--prefix`
+# is NOT forwarded into `leaves` here — fish's `complete` can't easily scrape a
+# prior option value, so leaf completion falls back to current-branch detection
+# (acceptable for v1). NOTE: `git stack pr sync <tab>` re-offers sync/list since
+# they're also top-level verbs; minor, not fought for v1.
+_emit_completion_fish() {
+  cat <<'FISH_COMP_EOF'
+# git stack fish completion (driven by `git stack __complete`).
+# Suppress fish's filename fallback. fish's shipped git completion discovers
+# `git-stack` on $PATH and delegates `git stack <args>` to `complete -C
+# "git-stack <args>"` (see fish's git.fish __fish_git_complete_custom_command).
+# With no completions on the `git-stack` command, that delegated call defaults
+# to filename completion — which is why `git stack <tab>` (and pick/checkout)
+# also list cwd files. Declaring no-files on `git-stack` kills it; -F restores
+# files after `--` so `amend -- <pathspec>` still completes paths. (Our `-c git`
+# entries below can't suppress this — the files come from a separate completion
+# registered against the `git-stack` command name, not `git`.)
+complete -c git-stack -f
+complete -c git-stack -n 'contains -- -- (commandline -xpc)' -F
+# Top-level verbs: only when no verb has been typed yet.
+complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcommand_from list view pick checkout co create add sync clean restack amend continue abort pr history rename move mv fold doctor' -a '(git stack __complete verbs)'
+# Sub-verbs.
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from pr' -a '(git stack __complete subverbs pr)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from history' -a '(git stack __complete subverbs history)'
+# checkout → leaves; view → prefixes.
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from checkout co' -a '(git stack __complete leaves)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from view' -a '(git stack __complete prefixes)'
+# Option-value slots (-x binds the candidates to the option's argument).
+complete -c git -n '__fish_git_using_command stack' -l prefix -x -a '(git stack __complete prefixes)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from add move mv' -l before -x -a '(git stack __complete leaves)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from add move mv' -l after -x -a '(git stack __complete leaves)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from add move mv' -l at -x -a '(git stack __complete leaves)'
+complete -c git -n '__fish_git_using_command stack' -l onto -x -a '(__fish_git_branches)'
+complete -c git -n '__fish_git_using_command stack' -l from -x -a '(__fish_git_branches)'
+FISH_COMP_EOF
+}
+
 # ---------- dispatch ----------
 
 # Subcommand exit codes:
@@ -6381,6 +6588,8 @@ main() {
     doctor)            shift; cmd_doctor "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;
+    # Hidden plumbing for shell completion — intentionally undocumented.
+    __complete)        shift; cmd___complete "$@" ;;
     # Removed verbs — point at the renamed command.
     new)               die "'git stack new' was split: use 'git stack create <prefix> <slug>' to start a stack, or 'git stack add <slug>' to add to the current one" ;;
     close)             die "'git stack close' was renamed to 'git stack clean'" ;;

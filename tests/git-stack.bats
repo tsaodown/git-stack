@@ -1159,6 +1159,24 @@ $old_footer"
   [[ "$output" == *"alias gstkcr='git stack create'"* ]]
 }
 
+@test "init zsh: emits _git-stack completion driven by __complete" {
+  run git stack init zsh
+  assert_status 0
+  assert_output_contains "_git-stack()"
+  assert_output_contains "git stack __complete"
+  assert_output_contains "_gs_complete verbs"
+  assert_output_contains "_gs_complete leaves"
+  assert_output_contains "_gs_complete prefixes"
+  assert_output_contains "_gs_complete subverbs"
+}
+
+@test "init bash: emits NO completion wiring (aliases only)" {
+  run git stack init bash
+  assert_status 0
+  refute grep -qF "_git-stack" <<<"$output"
+  refute grep -qF "__complete" <<<"$output"
+}
+
 @test "init fish: emits abbr-based snippet for fish" {
   run git stack init fish
   assert_status 0
@@ -1169,6 +1187,20 @@ $old_footer"
   refute grep -qF "gstkrom" <<<"$output"
   refute grep -qF "function gstkcl" <<<"$output"
   refute grep -qF "gstkrom()" <<<"$output"
+}
+
+@test "init fish: emits complete -c git completion driven by __complete" {
+  run git stack init fish
+  assert_status 0
+  # Abbrs still present.
+  assert_output_contains "abbr -a -g gstk git stack"
+  # Completion lines.
+  assert_output_contains "complete -c git"
+  assert_output_contains "__fish_git_using_command stack"
+  assert_output_contains "git stack __complete verbs"
+  assert_output_contains "git stack __complete leaves"
+  assert_output_contains "git stack __complete prefixes"
+  assert_output_contains "git stack __complete subverbs"
 }
 
 @test "init: errors with no argument" {
@@ -2665,4 +2697,140 @@ make_conflicting_dups() {
   [[ "$output" == *"clean"* ]]
   [[ "$output" == *"sync"* ]]
   [[ "$output" == *"move"* ]]
+}
+
+# ---------- __complete (hidden completion plumbing) ----------
+
+@test "__complete verbs: lists every user-facing verb with a TAB description" {
+  run git stack __complete verbs
+  assert_status 0
+  # A representative spread of the 18 verbs.
+  for v in list view pick checkout create add sync clean restack amend \
+           continue abort pr history rename move fold doctor; do
+    assert_output_contains "$v"$'\t'
+  done
+}
+
+@test "__complete verbs: every line is candidate<TAB>nonempty-description" {
+  run git stack __complete verbs
+  assert_status 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" != *$'\t'* ]]; then
+      echo "line has no TAB: $line" >&2
+      return 1
+    fi
+    desc="${line#*$'\t'}"
+    if [[ -z "$desc" ]]; then
+      echo "line has empty description: $line" >&2
+      return 1
+    fi
+  done <<< "$output"
+}
+
+@test "__complete verbs: excludes removed verbs and plumbing" {
+  run git stack __complete verbs
+  assert_status 0
+  # Each forbidden token, anchored as a candidate at line start.
+  for bad in new close push status init default-branch prefix __complete; do
+    while IFS= read -r line; do
+      cand="${line%%$'\t'*}"
+      if [[ "$cand" == "$bad" ]]; then
+        echo "verbs should not include: $bad" >&2
+        return 1
+      fi
+    done <<< "$output"
+  done
+}
+
+@test "__complete subverbs pr: sync and list" {
+  run git stack __complete subverbs pr
+  assert_status 0
+  assert_output_contains "sync"$'\t'
+  assert_output_contains "list"$'\t'
+}
+
+@test "__complete subverbs history: show and restore" {
+  run git stack __complete subverbs history
+  assert_status 0
+  assert_output_contains "show"$'\t'
+  assert_output_contains "restore"$'\t'
+}
+
+@test "__complete subverbs view: emits nothing, exit 0" {
+  run git stack __complete subverbs view
+  assert_status 0
+  assert_eq "$output" "" "subverbs view output"
+}
+
+@test "__complete leaves --prefix: number<TAB>slug in leaf order" {
+  make_stack_branches feat 010-auth 020-login
+  git checkout -q main
+  run git stack __complete leaves --prefix feat
+  assert_status 0
+  assert_eq "$output" $'010\tauth\n020\tlogin' "leaves --prefix"
+}
+
+@test "__complete leaves: detects prefix from current branch when no --prefix" {
+  make_stack_branches feat 010-auth 020-login
+  git checkout -q feat/010-auth
+  run git stack __complete leaves
+  assert_status 0
+  assert_eq "$output" $'010\tauth\n020\tlogin' "leaves detected"
+}
+
+@test "__complete prefixes: lists each stack prefix" {
+  make_stack_branches feat 010-x
+  git checkout -q main
+  make_stack_branches fix 010-y
+  git checkout -q main
+  run git stack __complete prefixes
+  assert_status 0
+  assert_output_contains "feat/"
+  assert_output_contains "fix/"
+}
+
+@test "__complete: never fails outside a git repo" {
+  cd /
+  run git stack __complete leaves
+  assert_status 0
+  assert_eq "$output" "" "outside repo"
+}
+
+@test "__complete leaves: empty + exit 0 on detached HEAD" {
+  make_stack_branches feat 010-auth
+  git checkout -q --detach
+  run git stack __complete leaves
+  assert_status 0
+  assert_eq "$output" "" "detached HEAD"
+}
+
+@test "__complete leaves: empty + exit 0 on a non-stack branch" {
+  make_stack_branches feat 010-auth
+  git checkout -q main
+  run git stack __complete leaves
+  assert_status 0
+  assert_eq "$output" "" "non-stack branch"
+}
+
+@test "__complete leaves: empty + exit 0 with no stacks at all" {
+  # Fresh repo (setup_repo) — only main, no stack branches.
+  run git stack __complete leaves --prefix feat
+  assert_status 0
+  assert_eq "$output" "" "no stacks"
+}
+
+@test "__complete leaves: ignores a reflow state file (empty + exit 0)" {
+  # State file present but no stack resolvable → must stay silent.
+  touch "$(git rev-parse --git-dir)/stack-rebase-state"
+  run git stack __complete leaves
+  assert_status 0
+  assert_eq "$output" "" "reflow state present"
+}
+
+@test "__complete: unknown kind exits 0 silently" {
+  make_stack_branches feat 010-auth
+  run git stack __complete bogus-kind
+  assert_status 0
+  assert_eq "$output" "" "unknown kind"
 }

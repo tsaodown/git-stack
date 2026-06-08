@@ -365,6 +365,60 @@ absorbed handling already lives in the squash phase (detect + prompt + delete at
 scan time). The **Absorbed-policy** entry under "Reflow engine" below is a
 discarded proposal, not a target.
 
+### Completion
+
+**Completion** (built 2026-06-08, ADR 0004):
+git-native tab completion for `git stack`, **zsh and fish only** (bash has no
+description-hint support, so it's excluded). Two-layer split:
+
+- **`__complete`** (hidden plumbing subcommand `cmd___complete`, with
+  `_complete_verbs` / `_complete_subverbs` / `_complete_leaves` /
+  `_complete_prefixes`) is the **single source of truth for dynamic candidates**.
+  It emits `candidate<TAB>description` lines and exits 0. Kinds: `verbs`,
+  `subverbs <verb>`, `leaves [--prefix <p>]`, `prefixes`.
+- **Static grammar** (which slot wants which kind, flag-value bindings) lives —
+  **duplicated** — in each shell's native DSL inside `_emit_completion_zsh`
+  (a `_git-stack` function zsh's `_git` auto-dispatches via its `$functions`
+  table, no `compdef`/fpath) and `_emit_completion_fish`
+  (`complete -c git -n '__fish_git_using_command stack' …`). Both are bundled into
+  `git stack init zsh` / `init fish` alongside the aliases, so the user's existing
+  rc line gains completion with no new step.
+
+Because zsh (`complete_aliases` unset) and fish (abbrs expand on space) expand
+the `gstk*` aliases before completing, the aliases inherit arg completion for free.
+
+**Never-fail contract** (invariant of `__complete`): completion runs on every
+tab, so `__complete` must **never** die, prompt, or print errors. Every
+degenerate case — no repo, detached HEAD, off-stack, empty repo, unknown kind,
+mid-reflow — exits 0 with empty stdout. It guards the repo check itself and uses
+only the non-dying helpers (`_try_detect_prefix`, `_load_stack_branches` without
+its error arg). Any leak would corrupt the user's prompt.
+
+> **MAINTENANCE NOTE — drift surface.** The dynamic candidate lists stay correct
+> for free (they derive from live repo state via `__complete`); the *static
+> grammar* is hand-duplicated per shell and is what drifts. zsh and fish are
+> **not symmetric** — note where each needs editing:
+>
+> - **Add or rename a verb** → update (a) the dispatch `case` in `main()`,
+>   (b) `_complete_verbs` (the candidate source of truth — **both** shells render
+>   it automatically), and (c) **fish only**: the
+>   `not __fish_seen_subcommand_from …` guard list in `_emit_completion_fish`
+>   (the full verb set; omit the new verb and fish keeps re-offering top-level
+>   verbs after it's typed). zsh needs **nothing** for a plain verb name — it
+>   completes names dynamically at `CURRENT==2`, and a verb with no special
+>   positional just offers nothing after it (correct).
+> - **A verb that takes special positional/value completion** (leaf number,
+>   prefix, subverb) → add a zsh `case ${words[2]}` arm in `_git-stack` **and** a
+>   fish `__fish_seen_subcommand_from <verb>` line.
+> - **Add a flag that needs value completion** → update each shell's grammar (zsh
+>   prev-word `case` + fish `complete -c git … -x` line). Flag **name**
+>   completion is intentionally not provided (out of scope, v1).
+> - **Add a new dynamic value type** → add a `__complete` kind (`cmd___complete`
+>   case + a `_complete_*` function), then reference it from each shell emitter.
+>
+> So verb *names* are genuinely single-source (`_complete_verbs`); the fish guard
+> duplicates the verb *set* for suppression timing only, not as a candidate list.
+
 ## Flagged ambiguities
 
 **"parent"** — overloaded in the current code. `_resolve_parent_name` /
