@@ -1104,7 +1104,12 @@ _engine_finalize() {
 do_one_step() {
   local cursor=$1
   local B="${STACK_BRANCHES[$cursor]}"
-  local prev_new prev_label prev_ref prev_orig B_orig
+  local prev_new prev_label prev_ref B_orig
+  # Default to empty: the --onto bottom branch has no in-stack predecessor, so
+  # this stays unset. A bare `local prev_orig` would be empty under bash 3.2
+  # (macOS) but truly unset under bash 4.4+ (Linux), tripping `set -u` at the
+  # read below — hence the explicit "".
+  local prev_orig=""
   if (( cursor == STACK_FROM_IDX )) && [[ -n "$STACK_ONTO" ]]; then
     prev_new="$STACK_ONTO"
     prev_label="${STACK_ONTO_REF:-$STACK_ONTO}"
