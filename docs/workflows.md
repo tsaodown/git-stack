@@ -291,11 +291,13 @@ reflowed: `login` was cherry-picked onto its new predecessor and **renumbered** 
 `031` to keep the leaf order consistent (`+1 renames`). Moving a branch changes
 branch names and tip SHAs by definition.
 
-> **Heads up — open PRs.** Because `move` renames branches, it **refuses by
-> default if any affected branch has an open head PR**: GitHub auto-closes a PR
-> when its head branch is renamed, and there's no API to reattach it. Pass
-> `--allow-pr-rebuild` to accept that the old PRs close and fresh ones open on the
-> next `pr sync`. Use `--no-push` / `--no-sync` for local-only moves.
+> **Heads up — open PRs.** `move` is **fully local**: it touches only local refs,
+> never pushing or syncing. So if an affected branch has an open PR, the move would
+> leave that PR stranded on its old remote branch and a later `pr sync` would orphan
+> it. `move` **refuses** in that case and points you at the clean trio: run
+> [`pr desync`](pr-sync.md#git-stack-pr-desync) to take the stack offline, reorder
+> locally, then [`pr sync`](pr-sync.md) to re-publish. (Unpublished stacks reorder
+> freely.)
 
 **Renumber a branch without moving it.** Sometimes you don't want to reorder —
 you just want to change a branch's leaf number (e.g. your stack is `010, 015, 020`
@@ -308,8 +310,8 @@ git stack move feat/010-auth --before feat/015-b  # TTY: pick a leaf in the gap
 ```
 
 This is a **pure rename** — no commits move, no reflow, every other branch
-untouched. It's still a branch rename, so the same open-PR rule applies: pass
-`--allow-pr-rebuild` (or `--no-push`) if the branch has an open head PR.
+untouched. It's still local-only, so the same open-PR rule applies: if the branch
+has an open PR, `pr desync` first, renumber, then `pr sync`.
 
 **See also:** [insert a branch](#4-you-need-a-branch-in-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
 
@@ -432,10 +434,11 @@ git stack rename fix/              # feat/010-auth → fix/010-auth, etc.
 `<new>/<leaf>`, carrying backup refs along. It refuses if a reflow is in progress,
 a branch is checked out elsewhere, or any target name already exists.
 
-> **Heads up — open PRs.** Like [`move`](#5-the-branches-are-in-the-wrong-order),
-> `rename` changes head branch names, so it **refuses if any branch has an open
-> head PR**. Pass `--allow-pr-rebuild` to let those PRs close and reopen on the
-> next sync. Use `--no-history` to skip carrying backup refs.
+> **Heads up — open PRs.** `rename` changes every head branch name, and GitHub
+> closes a PR when its head branch is renamed (no reattach). So it **refuses if any
+> branch has an open head PR**. Pass `--allow-pr-rebuild` to let those PRs close and
+> reopen on the next sync, or run [`pr desync`](pr-sync.md#git-stack-pr-desync) first
+> to re-publish cleanly. Use `--no-history` to skip carrying backup refs.
 
 **See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order)
 
@@ -516,7 +519,7 @@ the move reflows the branches that were above it down onto its old predecessor,
 cleanly extracting its changes:
 
 ```sh
-git stack move feat/020-login --last --no-push --no-sync
+git stack move feat/020-login --last
 git stack view
 ```
 
@@ -544,9 +547,10 @@ git branch -D feat/031-login
 ```
 
 `feat/030-profile` now contains only `auth` + `profile`; login is gone entirely.
-If the branch you're removing has an open PR, pass `--allow-pr-rebuild` to the
-`move`, and after the remote branch is deleted let [`clean`](#7-the-bottom-pr-merged)
-tidy it up instead of `git branch -D`.
+The `move` is local, so if the branch you're removing has an open PR, run
+[`pr desync`](pr-sync.md#git-stack-pr-desync) first to close the chain's PRs (with
+`--delete-remote` to drop the remote branches too); then reorder and delete, and
+let [`clean`](#7-the-bottom-pr-merged) tidy up the rest.
 
 > **Want to keep the change, just not as its own branch?** That's
 > [`fold`](#13-a-branchs-change-is-obsolete-fold-it-away) — it squashes the branch

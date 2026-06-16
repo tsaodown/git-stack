@@ -2093,22 +2093,20 @@ ${b}Branch-level subcommands:${r}
                                     \`history restore <id> [--yes]\`. Run-id may
                                     be full, action-tagged, bare timestamp, or
                                     \`@N\` (relative; @0 = newest).
-  ${sub}move${r} [<branch>] [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--no-push${r}] [${fl}--no-sync${r}] [${fl}--force${r}] [${fl}--allow-pr-rebuild${r}]
+  ${sub}move${r} [<branch>] [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--force${r}]
                                     Relocate <branch> (default: current branch)
                                     in the current stack to
                                     the chosen position. Cherry-picks affected
                                     branches onto their new predecessors using
                                     the existing reflow state machine — on
                                     conflict, resolve + \`git stack continue\`.
-                                    Since the move renames branches (changing
-                                    leaf numbers + tip SHAs), refuses by
-                                    default if any affected branch has an open
-                                    head PR (GitHub auto-closes such PRs on
-                                    rename and there's no API to reattach).
-                                    Pass ${fl}--allow-pr-rebuild${r} to accept the
-                                    rebuild — the old PRs close and fresh ones
-                                    open via \`pr sync\`. ${fl}--first${r} removed; use
-                                    ${fl}--before${r} instead.
+                                    ${b}Fully local${r}: touches only local refs — no
+                                    push, no PR sync. To reorder a published
+                                    stack cleanly, run ${sub}pr desync${r} first, reorder,
+                                    then ${sub}pr sync${r}. Refuses if any affected branch
+                                    has an open PR (it would desync from GitHub),
+                                    pointing you at that workflow. ${fl}--first${r}
+                                    removed; use ${fl}--before${r} instead.
                                     When the chosen position is the branch's
                                     current slot (e.g. ${fl}--before${r} the branch it
                                     already sits below, or ${fl}--at${r} a free leaf in
@@ -2123,9 +2121,11 @@ ${b}Branch-level subcommands:${r}
                                     state file exists, branch checked out
                                     elsewhere, or any target name collides.
                                     Also refuses if any branch has an open
-                                    head PR (same head-ref-deleted issue as
-                                    ${sub}move${r}); pass ${fl}--allow-pr-rebuild${r} to
-                                    proceed and rebuild the PRs.
+                                    head PR (renaming a branch closes its head
+                                    PR on GitHub, with no reattach); pass
+                                    ${fl}--allow-pr-rebuild${r} to proceed and rebuild
+                                    them, or run ${sub}pr desync${r} first to re-publish
+                                    cleanly.
   ${sub}fold${r} [<branch>] [${fl}--up${r}|${fl}--down${r}] [${fl}--slug${r} <s>] [${fl}--at${r} <num>]
        [${fl}--allow-pr-rebuild${r}] [${fl}--dry-run${r}] [${fl}--yes${r}] [${fl}--no-push${r}]
                                     Merge a branch away by squashing it into an
@@ -3088,7 +3088,7 @@ cmd_rename() {
   # or --no-push was passed.
   if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )) && (( ! opt_dry_run )); then
     if _check_no_open_prs "${branches[@]}"; then
-      die "rename would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated (a fresh PR opens for the renamed branch via 'pr sync')."
+      die "rename would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated (a fresh PR opens for the renamed branch via 'pr sync'). Or run 'git stack pr desync' first to take the stack offline, then rename, then 'git stack pr sync' to re-publish cleanly."
     fi
   fi
 
@@ -3853,7 +3853,7 @@ cmd_create() {
 
 cmd_move() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
-  local src="" opt_last=0 opt_before="" opt_after="" opt_at="" opt_allow_pr_rebuild=0
+  local src="" opt_last=0 opt_before="" opt_after="" opt_at=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -3865,7 +3865,7 @@ cmd_move() {
       --before)  shift; [[ $# -gt 0 ]] || die "--before needs an argument"; opt_before="$1"; shift ;;
       --after)   shift; [[ $# -gt 0 ]] || die "--after needs an argument"; opt_after="$1"; shift ;;
       --at)      shift; [[ $# -gt 0 ]] || die "--at needs an argument"; opt_at="$1"; shift ;;
-      --allow-pr-rebuild) opt_allow_pr_rebuild=1; shift ;;
+      --allow-pr-rebuild) die "move: --allow-pr-rebuild has been removed (move is now fully local and never touches PRs). To reorder a published stack, run 'git stack pr desync' first, then reorder, then 'git stack pr sync'." ;;
       --force)   OPT_FORCE=1; shift ;;
       -*)        die "unknown move flag: $1" ;;
       *)         [[ -z "$src" ]] || die "move: extra arg '$1'"; src="$1"; shift ;;
@@ -4061,17 +4061,20 @@ move: no <branch> given and HEAD is detached"
 
     require_branch_not_in_worktree "$src_branch"
 
-    # PR-orphan guard: renaming the branch invalidates any open head-PR for it.
-    if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
-      if _check_no_open_prs "$src_branch"; then
-        die "move would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated."
-      fi
+    # PR-orphan guard: renumbering renames the branch (new leaf number) but move
+    # is fully local — the open PR still sits on the old remote branch, so a
+    # later 'pr sync' would open a fresh PR and orphan the old one. Hard-block
+    # and point at the desync workflow (checked unconditionally; the helper
+    # no-ops when gh is unusable).
+    if _check_no_open_prs "$src_branch"; then
+      die "move: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); reordering would desync it from GitHub. Run 'git stack pr desync' to take the stack offline first, then reorder, then 'git stack pr sync'."
     fi
 
     snapshot_stack move "$prefix" "${branches[@]}"
 
-    # Pure rename: local rename batch, then (unless --no-push) remote rename +
-    # pr sync. No reflow-pick phase — the commit graph is untouched.
+    # Pure rename: local rename batch only — move is fully local. No reflow-pick
+    # phase (the commit graph is untouched) and no remote-sync (republishing is
+    # a separate 'pr sync' step).
     STACK_BRANCHES=("${branches[@]}")
     STACK_ORIG_SHAS=()
     STACK_STARTED_AT=$(date +%s)
@@ -4087,7 +4090,6 @@ move: no <branch> given and HEAD is detached"
     STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
     STACK_RENAME_PAIRS=("$src_branch" "$new_full")
     STACK_PHASES=(rename-batch)
-    (( ! OPT_NO_PUSH )) && STACK_PHASES+=(remote-sync)
     STACK_PHASE_IDX=0
     STACK_UNIT_IDX=0
 
@@ -4148,26 +4150,26 @@ move: no <branch> given and HEAD is detached"
     require_branch_not_in_worktree "${post[$i]}"
   done
 
-  # PR-orphan guard. The cherry-pick reflow rewrites each affected branch's
-  # commits (changing its tip SHA) and the post-rename phase changes leaf
-  # numbers. Both invalidate any open PR for those branches. Refuse by default
-  # when --allow-pr-rebuild was not passed.
-  if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
-    local affected=()
-    for ((i = first_affected; i < ${#post[@]}; i++)); do
-      affected+=("${post[$i]}")
-    done
-    if _check_no_open_prs "${affected[@]}"; then
-      die "move would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated."
-    fi
+  # PR-orphan guard. The cherry-pick reflow rewrites each affected branch's tip
+  # and the post-rename phase changes leaf numbers, but move is fully local — an
+  # affected branch's open PR still sits on its old remote branch, so a later
+  # 'pr sync' would open a fresh PR and orphan the old one. Hard-block and point
+  # at the desync workflow (checked unconditionally; the helper no-ops when gh
+  # is unusable).
+  local affected=()
+  for ((i = first_affected; i < ${#post[@]}; i++)); do
+    affected+=("${post[$i]}")
+  done
+  if _check_no_open_prs "${affected[@]+"${affected[@]}"}"; then
+    die "move: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); reordering would desync it from GitHub. Run 'git stack pr desync' to take the stack offline first, then reorder, then 'git stack pr sync'."
   fi
 
   # Snapshot before mutation.
   snapshot_stack move "$prefix" "${branches[@]}"
 
   # Plan: reflow-pick (rebase affected branches onto new predecessors) →
-  # rename-batch (gap-aware post-move cascade) → remote-sync (remote rename +
-  # PR sync, unless --no-push).
+  # rename-batch (gap-aware post-move cascade). Fully local — no remote-sync;
+  # republishing is a separate 'pr sync' step.
   STACK_BRANCHES=("${post[@]}")
   STACK_ORIG_SHAS=()
   for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
@@ -4210,7 +4212,6 @@ move: no <branch> given and HEAD is detached"
 
   STACK_PHASES=(reflow-pick)
   (( ${#STACK_RENAME_PAIRS[@]} > 0 )) && STACK_PHASES+=(rename-batch)
-  (( ! OPT_NO_PUSH )) && STACK_PHASES+=(remote-sync)
   STACK_PHASE_IDX=0
   STACK_UNIT_IDX=0
 
@@ -4847,7 +4848,7 @@ fold: no <branch> given and HEAD is detached"
       local dr_gate=("$victim")
       [[ "$new_survivor" != "$survivor" ]] && dr_gate+=("$survivor")
       if _check_no_open_prs "${dr_gate[@]}"; then
-        log "  ${C_YELLOW}would close PR #${_ORPHAN_PR_NUM}${C_RESET} for ${_ORPHAN_PR_BRANCH} (needs --allow-pr-rebuild)"
+        log "  ${C_YELLOW}would close PR #${_ORPHAN_PR_NUM}${C_RESET} for ${_ORPHAN_PR_BRANCH} (needs --allow-pr-rebuild, or 'pr desync' first)"
       fi
     fi
     log "  ${C_DIM}rerun without --dry-run to apply${C_RESET}"
@@ -4861,7 +4862,7 @@ fold: no <branch> given and HEAD is detached"
     local gate_branches=("$victim")
     [[ "$new_survivor" != "$survivor" ]] && gate_branches+=("$survivor")
     if _check_no_open_prs "${gate_branches[@]}"; then
-      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — deleting or renaming a branch closes its head PR on GitHub, with no reattach. Pass --allow-pr-rebuild to accept the close (a breadcrumb to the superseding PR is posted, and 'pr sync' rebuilds the survivor)."
+      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — deleting or renaming a branch closes its head PR on GitHub, with no reattach. Pass --allow-pr-rebuild to accept the close (a breadcrumb to the superseding PR is posted, and 'pr sync' rebuilds the survivor). Or run 'git stack pr desync' first to take the stack offline, then fold, then 'git stack pr sync' to re-publish cleanly."
     fi
   fi
 

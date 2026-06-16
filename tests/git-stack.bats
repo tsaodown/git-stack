@@ -1964,9 +1964,9 @@ $old_footer"
   [ "$status" -ne 0 ]
 }
 
-# ---------- move (remote stages) ----------
+# ---------- move (locality + PR guard) ----------
 
-@test "move: renames remote branches via gh api and triggers pr sync" {
+@test "move: is fully local — no remote rename, no pr sync" {
   # Build stack with separate files (avoids cherry-pick conflicts during rebase).
   git checkout -q -b feat/01-a
   printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
@@ -1977,46 +1977,72 @@ $old_footer"
   make_remote_origin
   export GH_STUB_REPO="test/repo"
   run git stack move feat/01-a --last --no-color
-  [ "$status" -eq 0 ]
-  # Gap-aware post-rename only renames the moved branch (01-a → 04-a); the
-  # other two branches keep their leaf numbers, so just one remote rename.
-  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
-  [ "$(gh_log_count 'pr')" -ge 1 ]
-}
-
-@test "move --no-push: skips remote rename and pr sync" {
-  # Build stack with separate files.
-  git checkout -q -b feat/01-a
-  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
-  git checkout -q -b feat/02-b
-  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
-  git checkout -q -b feat/03-c
-  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
-  make_remote_origin
-  export GH_STUB_REPO="test/repo"
-  run git stack move feat/01-a --last --no-push --no-color
-  [ "$status" -eq 0 ]
+  assert_status 0
+  # move touches only local refs: 01-a → 04-a locally, remote untouched.
+  assert_branch_exists feat/04-a
+  assert_branch_absent feat/01-a
+  # No remote rename and no PR mutations. (The orphan-guard preflight may run a
+  # read-only `pr list`, but nothing creates/edits/closes a PR or renames a
+  # remote branch.)
   [ "$(gh_log_count 'api -X POST')" -eq 0 ]
-  [ "$(gh_log_count 'pr')" -eq 0 ]
-}
-
-@test "move --no-sync: does remote rename but skips pr sync" {
-  git checkout -q -b feat/01-a
-  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
-  git checkout -q -b feat/02-b
-  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
-  git checkout -q -b feat/03-c
-  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
-  make_remote_origin
-  export GH_STUB_REPO="test/repo"
-  run git stack move feat/01-a --last --no-sync --no-color
-  [ "$status" -eq 0 ]
-  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
-  # `pr list` may be invoked by the PR-orphan-guard preflight; we only care
-  # that no PR mutations (create/edit/close) happened.
   [ "$(gh_log_count 'pr create')" -eq 0 ]
   [ "$(gh_log_count 'pr edit')" -eq 0 ]
   [ "$(gh_log_count 'pr close')" -eq 0 ]
+  # The remote still carries the original branch name — nothing was pushed.
+  run git ls-remote --heads origin feat/01-a
+  assert_output_contains "feat/01-a"
+  run git ls-remote --heads origin feat/04-a
+  assert_eq "$output" "" "move must not push the renamed branch to origin"
+}
+
+@test "move: reorder dies when an affected branch has an open PR" {
+  # Reordering renames affected branches; their open PRs would desync from
+  # GitHub. The guard hard-blocks and points at the pr desync workflow.
+  git checkout -q -b feat/01-a
+  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_b__NUM=42
+  run git stack move feat/01-a --last --no-color
+  assert_status 1
+  assert_output_contains "pr desync"
+  # Hard block: nothing was reordered.
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/02-b
+}
+
+@test "move: open PR on an UNaffected branch does not block the move" {
+  # The guard only inspects *affected* branches — that's the escape hatch that
+  # makes the no-override-flag decision acceptable. Moving 02-b to last leaves
+  # 01-a unaffected (first_affected=1), so an open PR on 01-a must not block.
+  git checkout -q -b feat/01-a
+  printf 'a\n' > a-file && git add a-file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '03-c'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_01_a__NUM=41
+  run git stack move feat/02-b --last --no-color
+  assert_status 0
+  # The unaffected branch (and its PR) are untouched; the move still ran locally.
+  assert_branch_exists feat/01-a
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
+}
+
+@test "move: --allow-pr-rebuild is removed and points at pr desync" {
+  make_stack_branches feat 01-a 02-b
+  run git stack move feat/01-a --last --allow-pr-rebuild --no-color
+  assert_status 1
+  assert_output_contains "allow-pr-rebuild"
+  assert_output_contains "pr desync"
 }
 
 @test "move: preserves gaps in post-rename" {
@@ -2108,21 +2134,24 @@ $old_footer"
   export GH_PR_feat_010_a__NUM=42
   run git stack move feat/010-a --at 12 --no-color
   assert_status 1
-  assert_output_contains "allow-pr-rebuild"
+  assert_output_contains "pr desync"
   assert_branch_exists feat/010-a
 }
 
-@test "move --at: in-place renumber renames remote + syncs with --allow-pr-rebuild" {
+@test "move --at: in-place renumber is local (no remote rename, no pr sync)" {
   make_stack_branches feat 010-a 015-b 020-c
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  run git stack move feat/010-a --at 12 --allow-pr-rebuild --no-color
+  run git stack move feat/010-a --at 12 --no-color
   assert_status 0
   assert_branch_exists feat/012-a
   assert_branch_absent feat/010-a
-  # Remote rename happened and pr sync ran.
-  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
-  [ "$(gh_log_count 'pr')" -ge 1 ]
+  # Even with a remote configured, the renumber stays local: no remote rename,
+  # no PR mutations.
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
 }
 
 # ---------- fold ----------

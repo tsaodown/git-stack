@@ -239,12 +239,15 @@ chain, and breadcrumbs the closed PR to the superseding one (ADR 0003).
 _Avoid_: "squash"/"absorb" — **doctor** already owns those words (the
 multi-commit fix and the tree-equals-predecessor case, respectively).
 
-`move`, `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
-and `pr sync` / `pr list` keep their current meanings. **move** additionally
-**renumbers in place** when the chosen position is the branch's current slot —
-a pure leaf rename, no reflow (ADR 0002). **pr desync** closes the chain's PRs
-to take a stack off GitHub for clean reordering (the inverse of **pr sync**;
-ADR 0005).
+`rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
+and `pr sync` / `pr list` keep their current meanings. **move** is **fully
+local** — it reorders/renumbers branches touching only local refs, never pushing
+or syncing (ADR 0006); it additionally **renumbers in place** when the chosen
+position is the branch's current slot — a pure leaf rename, no reflow (ADR 0002).
+It refuses when an affected branch has an open PR (reordering would desync it),
+pointing at the **pr desync** → reorder → **pr sync** trio. **pr desync** closes
+the chain's PRs to take a stack off GitHub for clean reordering (the inverse of
+**pr sync**; ADR 0005).
 
 ### Removed verbs
 
@@ -298,8 +301,9 @@ One adapter in a **plan**, satisfying a three-operation contract — `advance`
 (finish an in-flight unit, then advance), `abort` (undo this phase's effects as
 far as it can). Phase types: **reflow-pick** (cherry-pick one branch;
 can pause on **conflict**; carries an **absorbed-policy**), **rename-batch**
-(atomic local ref rename), **remote-sync** (remote rename + PR sync; idempotent).
-_Avoid_: step, stage, pass.
+(atomic local ref rename), **remote-sync** (remote rename + PR sync; idempotent —
+used by **rename**/**fold**/**doctor**, but *not* **move**, which is fully local;
+ADR 0006). _Avoid_: step, stage, pass.
 
 **Unit**:
 One increment of work within a **phase** — for reflow-pick, one branch. The

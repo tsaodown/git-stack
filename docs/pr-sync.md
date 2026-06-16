@@ -74,11 +74,18 @@ not chain members.
 ### Renames close head PRs
 
 GitHub auto-closes a PR when its head branch is renamed, and there's no API to
-reattach it. So [`move`](workflows.md#5-the-branches-are-in-the-wrong-order) and
-[`rename`](workflows.md#8-rename-the-stacks-prefix) — which both change branch
-names — refuse by default when any affected branch has an open head PR. Pass
+reattach it. [`rename`](workflows.md#8-rename-the-stacks-prefix) changes every
+branch name, so it refuses by default when any branch has an open head PR; pass
 `--allow-pr-rebuild` to accept that those PRs close and the next `pr sync` opens
 fresh ones.
+
+[`move`](workflows.md#5-the-branches-are-in-the-wrong-order) also renames branches
+(new leaf numbers), but it is **fully local** — it never pushes or syncs. So a move
+leaves any open PR sitting on the *old* remote branch; a later `pr sync` would open
+a fresh PR and orphan the old one. Rather than rebuild PRs mid-reorder, `move`
+refuses when an affected branch has an open PR and points you at the clean trio:
+[`pr desync`](#git-stack-pr-desync) to take the stack offline → reorder locally →
+`pr sync` to re-publish.
 
 [`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) closes PRs the
 same way — the deleted victim's head PR always, and the survivor's if `--slug`
