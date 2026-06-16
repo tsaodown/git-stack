@@ -2947,7 +2947,7 @@ cmd_clean() {
     local d_bsurv="" d_b d_g d_is_gone
     for d_b in "${branches[@]}"; do
       d_is_gone=0
-      for d_g in "${gone[@]}"; do [[ "$d_b" == "$d_g" ]] && { d_is_gone=1; break; }; done
+      for d_g in "${gone[@]+"${gone[@]}"}"; do [[ "$d_b" == "$d_g" ]] && { d_is_gone=1; break; }; done
       (( d_is_gone )) || { d_bsurv="$d_b"; break; }
     done
     local d_onto_ok=0 d_base_moved=0
