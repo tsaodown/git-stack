@@ -27,6 +27,7 @@ Output blocks are captured from real runs; commit SHAs will differ for you.
 | [11](#11-pull-a-branch-out-of-the-middle) | Pull a branch out of the middle *(advanced)* |
 | [12](#12-sharing-a-stack-with-someone-else) | Sharing a stack with someone else *(advanced)* |
 | [13](#13-a-branchs-change-is-obsolete-fold-it-away) | A branch's change is obsolete: fold it away |
+| [14](#14-reorganize-a-stack-thats-already-on-github) | Reorganize a stack that's already on GitHub |
 
 ---
 
@@ -296,8 +297,9 @@ branch names and tip SHAs by definition.
 > leave that PR stranded on its old remote branch and a later `pr sync` would orphan
 > it. `move` **refuses** in that case and points you at the clean trio: run
 > [`pr desync`](pr-sync.md#git-stack-pr-desync) to take the stack offline, reorder
-> locally, then [`pr sync`](pr-sync.md) to re-publish. (Unpublished stacks reorder
-> freely.)
+> locally, then [`pr sync`](pr-sync.md) to re-publish — walked through end-to-end
+> in [scenario 14](#14-reorganize-a-stack-thats-already-on-github). (Unpublished
+> stacks reorder freely.)
 
 **Renumber a branch without moving it.** Sometimes you don't want to reorder —
 you just want to change a branch's leaf number (e.g. your stack is `010, 015, 020`
@@ -311,7 +313,8 @@ git stack move feat/010-auth --before feat/015-b  # TTY: pick a leaf in the gap
 
 This is a **pure rename** — no commits move, no reflow, every other branch
 untouched. It's still local-only, so the same open-PR rule applies: if the branch
-has an open PR, `pr desync` first, renumber, then `pr sync`.
+has an open PR, `pr desync` first, renumber, then `pr sync`
+([scenario 14](#14-reorganize-a-stack-thats-already-on-github)).
 
 **See also:** [insert a branch](#4-you-need-a-branch-in-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
 
@@ -438,7 +441,8 @@ a branch is checked out elsewhere, or any target name already exists.
 > closes a PR when its head branch is renamed (no reattach). So it **refuses if any
 > branch has an open head PR**. Pass `--allow-pr-rebuild` to let those PRs close and
 > reopen on the next sync, or run [`pr desync`](pr-sync.md#git-stack-pr-desync) first
-> to re-publish cleanly. Use `--no-history` to skip carrying backup refs.
+> to re-publish cleanly ([scenario 14](#14-reorganize-a-stack-thats-already-on-github)).
+> Use `--no-history` to skip carrying backup refs.
 
 **See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order)
 
@@ -550,7 +554,9 @@ git branch -D feat/031-login
 The `move` is local, so if the branch you're removing has an open PR, run
 [`pr desync`](pr-sync.md#git-stack-pr-desync) first to close the chain's PRs (with
 `--delete-remote` to drop the remote branches too); then reorder and delete, and
-let [`clean`](#7-the-bottom-pr-merged) tidy up the rest.
+let [`clean`](#7-the-bottom-pr-merged) tidy up the rest — the
+[desync → reorder → re-sync trio](#14-reorganize-a-stack-thats-already-on-github)
+in full.
 
 > **Want to keep the change, just not as its own branch?** That's
 > [`fold`](#13-a-branchs-change-is-obsolete-fold-it-away) — it squashes the branch
@@ -640,3 +646,39 @@ Contrast with [scenario 11](#11-pull-a-branch-out-of-the-middle), which *discard
 a branch's change; `fold` *keeps* it.
 
 **See also:** [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [reference: clean vs fold](reference.md#removing-a-branch-clean-vs-fold)
+
+---
+
+## 14. Reorganize a stack that's already on GitHub
+
+**Situation.** Your stack is published — an open PR per branch — and you need a
+structural change: reorder the branches, renumber one, or pull a branch out.
+Doing it in place is messy. `move` and `rename` are **fully local**, so they'd
+leave PRs stranded on old remote branches; renaming a head branch also makes
+GitHub auto-close its PR. The clean path is to take the stack *off* GitHub first,
+restructure locally, then re-publish a fresh chain — the **desync → reorder →
+re-sync trio**:
+
+```sh
+git stack pr desync                                        # close the chain's PRs (add --delete-remote for a clean slate)
+git stack move feat/030-profile --before feat/020-login    # reorder/renumber/delete — fully local
+git stack pr sync                                          # re-publish a fresh, correctly-ordered chain
+```
+
+**What happened.** `pr desync` closes each branch's PR. Quiet PRs close silently;
+any PR a human has engaged with — a comment, or any review — makes it **prompt**
+before closing (CI checks don't count as activity). Add `--delete-remote` to drop
+the remote branches too for a fully clean slate. With the stack offline, `move`
+reorders freely — no open-PR refusal to work around (scenario 5). Then `pr sync`
+opens a fresh chain on the new layout, with correct bases, `[N/M]` titles, and nav
+footers.
+
+This is the proactive counterpart to the "heads up — open PRs" notes in
+[scenario 5](#5-the-branches-are-in-the-wrong-order),
+[scenario 8](#8-rename-the-stacks-prefix), and
+[scenario 11](#11-pull-a-branch-out-of-the-middle): when one of those refuses
+because you have open PRs, this is the workflow it's pointing you at. For the full
+`pr desync` reference — the activity rules and `--delete-remote`'s leaf→base
+deletion order — see [pr-sync.md](pr-sync.md#git-stack-pr-desync).
+
+**See also:** [pr-sync.md](pr-sync.md#git-stack-pr-desync) · [reorder branches](#5-the-branches-are-in-the-wrong-order) · [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)

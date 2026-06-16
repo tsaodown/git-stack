@@ -184,4 +184,4 @@ default branch on GitHub. Such a branch is reported `keeping remote <branch>` an
 left in place. Branches without a PR (and the branches of merged or kept PRs) are
 left alone; use [`clean`](workflows.md) for broader remote pruning.
 
-**See also:** [concepts: PR chain](concepts.md#pr-chain) · [workflows §6](workflows.md#6-publish-and-refresh-the-pr-chain) · [workflows §7: bottom PR merged](workflows.md#7-the-bottom-pr-merged)
+**See also:** [concepts: PR chain](concepts.md#pr-chain) · [workflows §14: reorganize a published stack](workflows.md#14-reorganize-a-stack-thats-already-on-github) · [workflows §6](workflows.md#6-publish-and-refresh-the-pr-chain) · [workflows §7: bottom PR merged](workflows.md#7-the-bottom-pr-merged)
