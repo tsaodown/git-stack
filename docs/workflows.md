@@ -176,7 +176,7 @@ git stack sync       # republish the rewritten branches
 
 ```
 fetching all remotes...
-reflowing 2 survivor(s) onto origin/main...
+base    origin/main moved a1b2c3d..e4f5a6b (+3 commit(s)); restacking 2 survivor(s) onto it
 restack feat/010-auth onto origin/main
 restack feat/020-login onto feat/010-auth
 done    reflow complete (2 branches restacked)

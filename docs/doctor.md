@@ -54,24 +54,34 @@ git stack doctor                  # interactive: prompt per issue
 git stack doctor --yes            # auto-apply every fix (required for non-TTY / scripts)
 git stack doctor --no-squash      # rename/dedup only, skip squash checks
 git stack doctor --no-rename      # squash only, skip leaf-rename (also skips dup detection)
+git stack doctor --no-push        # apply locally, skip the remote rename + pr sync
+git stack doctor --no-sync        # rename the remote, but skip pr sync
 ```
+
+Each issue prompts on a TTY: `y` apply, `e` (squash only) apply and edit the
+message in `$EDITOR`, `N` skip (the default), `a` apply all remaining of that
+kind, `q` quit. Duplicate-leaf prompts instead take a space- or comma-separated
+permutation of `1..N` (RET keeps the current order). `--yes` applies everything
+non-interactively using `sort -V` order for duplicates — required off a TTY.
 
 It detects three kinds of issue:
 
 ### Squash
 
-A branch carrying more than one commit, an empty diff, or a fixup-like commit —
-collapsed to a single commit (reset-soft + re-commit) to fit the
-[single-commit model](workflows.md#10-a-branch-grew-a-second-commit):
+A branch that breaks the
+[single-commit model](workflows.md#10-a-branch-grew-a-second-commit) — carrying
+more than one commit (`multi`), a merge-commit tip (`merge`), or both (`both`) —
+collapsed to a single commit (reset-soft + re-commit) on top of its predecessor:
 
 ```
 doctor (dry-run): stack feat/
   squash  feat/020-login  (multi)
 ```
 
-If a squash makes a branch **redundant** — its tree ends up identical to its
-predecessor's, so a reflow cherry-pick would be empty — doctor offers to delete
-that absorbed branch.
+A branch whose tree is already identical to its predecessor's — so a reflow
+cherry-pick would be empty — is classified `absorbed` (still listed under
+squash) but offered for **deletion** rather than squashed. A squash that leaves
+a branch empty is likewise offered for deletion.
 
 ### Duplicate leaf
 
@@ -93,11 +103,13 @@ A leaf-renumber needed to re-space the stack — for instance to open a
 [gap](concepts.md#gap) that was exhausted, so an insert that previously refused
 can succeed.
 
-Applying fixes runs the same atomic rename + remote-rename + `pr sync` flow as
-[`add`](workflows.md#4-you-need-a-branch-in-the-middle) and
-[`move`](workflows.md#5-the-branches-are-in-the-wrong-order), and a squash that
-rewrites commits triggers a reflow — so a `doctor` repair can pause on a conflict
-just like any other reflow (resolve + `git stack continue`).
+When renames are applied, doctor runs the same atomic rename + remote-rename +
+`pr sync` flow as [`rename`](workflows.md#8-rename-the-stacks-prefix) and
+[`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) (suppress the
+remote tail with `--no-push`, or keep the rename but skip the PR step with
+`--no-sync`), and a squash that rewrites commits triggers a reflow — so a
+`doctor` repair can pause on a conflict just like any other reflow (resolve +
+`git stack continue`).
 
 ## Rolling back with history
 

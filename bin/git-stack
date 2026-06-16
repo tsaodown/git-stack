@@ -2187,7 +2187,8 @@ ${b}Branch-level subcommands:${r}
                                     Empty squashes (branch tree == predecessor
                                     tree) offer to delete the absorbed branch.
                                     Same atomic rename + remote-rename + pr
-                                    sync flow as ${sub}add${r}.
+                                    sync flow as ${sub}rename${r} (skip with
+                                    --no-push / --no-sync).
   ${sub}prefix${r}                            Print auto-detected stack prefix (debug).
   ${sub}default-branch${r}                    Print the resolved default branch name
                                     (stack.base → init.defaultBranch → main →
@@ -3875,7 +3876,7 @@ cmd_move() {
   # Default <branch> to the current branch when omitted.
   if [[ -z "$src" ]]; then
     src=$(current_branch) \
-      || die "usage: git stack move [<branch>] [--last|--before <ref>|--after <ref>|--at <num>] [--allow-pr-rebuild]
+      || die "usage: git stack move [<branch>] [--last|--before <ref>|--after <ref>|--at <num>]
 move: no <branch> given and HEAD is detached"
   fi
 

@@ -107,7 +107,7 @@ in a stack repo, then check:
 - `git stack view <tab>` → stack prefixes.
 - `git stack add --before <tab>` → leaves.
 - `git stack add --onto <tab>` → git branches (native ref completion).
-- `git stack pr <tab>` → `sync`/`list`; `git stack history <tab>` → `show`/`restore`.
+- `git stack pr <tab>` → `sync`/`list`/`desync`; `git stack history <tab>` → `show`/`restore`.
 
 **fish** — same set (`git stack <tab>`, `checkout`, `view`, `--before`, `--onto`,
 `pr`/`history` subverbs).

@@ -66,8 +66,8 @@ and left in place.
 
 Classification and confirmation happen in a no-mutation Phase 1; all effectful
 writes are in Phase 2, guarded by `--dry-run`. This mirrors the
-gather → reconcile → apply shape of the PR-sync reconciler (ADR 0002 /
-[CONTEXT.md → Architecture → PR-sync reconciler](../../CONTEXT.md#pr-sync-reconciler-refactor-2)).
+gather → reconcile → apply shape of the PR-sync reconciler
+([CONTEXT.md → Architecture → PR-sync reconciler](../../CONTEXT.md#pr-sync-reconciler-refactor-2)).
 
 ## Consequences
 

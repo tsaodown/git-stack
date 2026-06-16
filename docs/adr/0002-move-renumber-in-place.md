@@ -1,6 +1,9 @@
 # ADR 0002 — `move` renumbers a branch in place
 
-- **Status:** Accepted (2026-06-02)
+- **Status:** Accepted (2026-06-02); PR provisions superseded by
+  [ADR 0006](0006-move-fully-local.md) — `move` is now fully local
+  (`STACK_PHASES=(rename-batch)`, no `remote-sync`), and `--allow-pr-rebuild`
+  was removed. The renumber-in-place decision itself still stands.
 - **Context doc:** [CONTEXT.md → Commands](../../CONTEXT.md#commands)
 
 ## Context
