@@ -436,6 +436,77 @@ HOOK
   [[ "$output" == *"reflow"* ]]
 }
 
+@test "clean: skips reflow when nothing pruned and base unchanged" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "skipping reflow"
+  [[ "$output" != *"reflowing"* ]] || { echo "expected no reflow; got:" >&2; echo "$output" >&2; false; }
+}
+
+@test "clean: still reflows after a prune even if base unchanged" {
+  # Guard for the "skip only when nothing pruned" rule: a prune can require a
+  # reflow (a removed middle branch orphans its successor's predecessor), so the
+  # gate must run the reflow whenever anything was pruned — even though
+  # origin/main never moved here.
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git push -q origin --delete feat/02-b
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  [[ "$output" != *"skipping reflow"* ]] || { echo "expected a reflow, not a skip:" >&2; echo "$output" >&2; false; }
+  assert_output_contains "reflowing"
+}
+
+@test "clean: announces a moved base when origin/<default> advanced" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  # Advance origin/main past where the stack forks from it.
+  git checkout -q main
+  printf 'base\n' >> base.txt
+  git add base.txt
+  git commit -q -m "advance main"
+  git push -q origin main
+  git fetch -q --prune
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "origin/main moved"
+  assert_output_contains "restacking"
+  [[ "$output" != *"skipping reflow"* ]] || { echo "expected a restack, not a skip:" >&2; echo "$output" >&2; false; }
+}
+
+@test "clean --dry-run: announces a moved base without applying it" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git checkout -q main
+  printf 'base\n' >> base.txt
+  git add base.txt
+  git commit -q -m "advance main"
+  git push -q origin main
+  git fetch -q --prune
+  run git stack clean --prefix feat/ --dry-run --no-color
+  assert_status 0
+  assert_output_contains "origin/main has moved"
+  # Dry run mutates nothing.
+  assert_branch_parent_is feat/01-a "$(git rev-parse refs/heads/main~1)"
+}
+
+@test "clean --dry-run: predicts a skipped reflow when base unchanged" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --dry-run --no-color
+  assert_status 0
+  assert_output_contains "would skip reflow"
+}
+
 # ---------- pr sync ----------
 
 @test "pr sync: fresh 3-branch stack creates draft PRs with correct bases" {

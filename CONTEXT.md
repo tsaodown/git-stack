@@ -185,7 +185,12 @@ Janitorial teardown of the current stack, in order: prune local `[gone]`
 branches; delete extraneous **remote** branches under the prefix
 (confirmation-gated — on decline, skip *only* the remote deletion and continue);
 then fetch and **reflow** survivors onto `origin/<default>`. A reflow, so it can
-pause on **conflict** and resume via `continue`. Replaces `close` and the
+pause on **conflict** and resume via `continue`. The reflow is **skipped** when
+nothing was pruned *and* `origin/<default>` is already an ancestor of the bottom
+survivor (base unchanged — the rebase would be a no-op, only churning SHAs);
+any prune still forces it (a removed mid-stack branch orphans its successor's
+predecessor). When the base *has* moved, `clean` announces it loudly
+(`base origin/<default> moved <range>; restacking …`). Replaces `close` and the
 `gstkcl`/`gstkrom`/`gstkromp` shell helpers.
 _Avoid_: "close" (the prune-only predecessor).
 

@@ -1995,8 +1995,9 @@ ${b}Stack-level subcommands:${r}
                                     prefix with no local counterpart
                                     (confirm-gated — declining skips only that
                                     step), then reflow the survivors onto
-                                    origin/<default>. Can pause on conflict
-                                    (resolve + ${sub}continue${r}). ${fl}--keep-history${r}
+                                    origin/<default> (skipped when nothing was
+                                    pruned and the base hasn't moved). Can pause
+                                    on conflict (resolve + ${sub}continue${r}). ${fl}--keep-history${r}
                                     preserves backup refs; ${fl}--dry-run${r} previews.
 
 ${b}Branch-level subcommands:${r}
@@ -2916,7 +2917,27 @@ cmd_clean() {
     fi
     local n_survive=$(( ${#branches[@]} - ${#gone[@]} ))
     log ""
-    log "${C_BOLD}dry run${C_RESET}: would reflow ${n_survive} survivor(s) onto origin/${default_branch}; rerun without --dry-run to apply"
+    # Mirror step 8's gate against the bottom *surviving* branch (the first not
+    # in gone): no prune + base unchanged => the reflow would be a no-op; a moved
+    # base is the loud reason to reflow.
+    local d_bsurv="" d_b d_g d_is_gone
+    for d_b in "${branches[@]}"; do
+      d_is_gone=0
+      for d_g in "${gone[@]}"; do [[ "$d_b" == "$d_g" ]] && { d_is_gone=1; break; }; done
+      (( d_is_gone )) || { d_bsurv="$d_b"; break; }
+    done
+    local d_onto_ok=0 d_base_moved=0
+    if [[ -n "$d_bsurv" ]] && git rev-parse --verify --quiet "origin/${default_branch}^{commit}" >/dev/null 2>&1; then
+      d_onto_ok=1
+      git merge-base --is-ancestor "origin/${default_branch}" "refs/heads/${d_bsurv}" 2>/dev/null || d_base_moved=1
+    fi
+    if (( d_onto_ok )) && (( ${#gone[@]} == 0 )) && (( ! d_base_moved )); then
+      log "${C_BOLD}dry run${C_RESET}: stack already on origin/${default_branch}; would skip reflow"
+    elif (( d_onto_ok )) && (( d_base_moved )); then
+      log "${C_BOLD}dry run${C_RESET}: origin/${default_branch} has moved; would restack ${n_survive} survivor(s) onto it"
+    else
+      log "${C_BOLD}dry run${C_RESET}: would reflow ${n_survive} survivor(s) onto origin/${default_branch}; rerun without --dry-run to apply"
+    fi
     return 0
   fi
 
@@ -2953,7 +2974,32 @@ cmd_clean() {
     return 0
   fi
   if git rev-parse --verify --quiet "origin/${default_branch}^{commit}" >/dev/null 2>&1; then
-    log "${C_DIM}reflowing ${#survivors[@]} survivor(s) onto origin/${default_branch}...${C_RESET}"
+    # The base "moved" when origin/<default> is no longer an ancestor of the
+    # bottom survivor (it advanced past where the stack forks from it). A commit
+    # is its own ancestor, so an unmoved base reads as not-moved.
+    local onto_sha base_moved=0
+    onto_sha=$(git rev-parse "origin/${default_branch}")
+    git merge-base --is-ancestor "$onto_sha" "refs/heads/${survivors[0]}" 2>/dev/null || base_moved=1
+
+    # Skip the reflow when nothing requires it: no branches were pruned (a
+    # mid-stack prune can orphan a survivor's predecessor, forcing a reflow even
+    # if the base didn't move) and the base didn't move (the rebase is a no-op).
+    if (( ${#gone[@]} == 0 )) && (( ! base_moved )); then
+      log "${C_DIM}stack already on origin/${default_branch}; skipping reflow${C_RESET}"
+      return 0
+    fi
+    if (( base_moved )); then
+      # Make the base advance loud: it's the reason the stack is being rewritten.
+      local old_base advanced range=""
+      old_base=$(git merge-base "refs/heads/${survivors[0]}" "$onto_sha" 2>/dev/null || true)
+      if [[ -n "$old_base" ]]; then
+        advanced=$(git rev-list --count "${old_base}..${onto_sha}" 2>/dev/null || echo "?")
+        range=" ${C_DIM}$(git rev-parse --short "$old_base")..$(git rev-parse --short "$onto_sha")${C_RESET} (+${advanced} commit(s))"
+      fi
+      log "${C_YELLOW}base${C_RESET}    origin/${default_branch} moved${range}; restacking ${C_BOLD}${#survivors[@]}${C_RESET} survivor(s) onto it"
+    else
+      log "${C_DIM}reflowing ${#survivors[@]} survivor(s) onto origin/${default_branch}...${C_RESET}"
+    fi
     cmd_restack --prefix "$prefix" --onto "origin/${default_branch}"
   else
     warn "clean: 'origin/${default_branch}' not found; skipped reflow"
