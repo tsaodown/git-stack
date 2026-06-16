@@ -88,6 +88,7 @@ _emit_pr_json() {
   local review="${7-}"      # empty by default (REVIEW_REQUIRED / null)
   local n_comments="${8:-0}"
   local head="${9-}"        # headRefName (the PR's source branch)
+  local commenters="${10-}" # csv logins of COMMENTED reviews (for activity tests)
   local is_draft_json
   if [ "$draft" = "1" ] || [ "$draft" = "true" ]; then
     is_draft_json="true"
@@ -104,6 +105,7 @@ _emit_pr_json() {
     --arg review "$review" \
     --argjson nc "$n_comments" \
     --arg head "$head" \
+    --arg commenters "$commenters" \
     '{
        number: $n,
        title: $t,
@@ -113,7 +115,8 @@ _emit_pr_json() {
        baseRefName: $base,
        headRefName: $head,
        reviewDecision: $review,
-       comments: (if $nc > 0 then [range(0; $nc) | {id: ., body: "stub"}] else [] end)
+       comments: (if $nc > 0 then [range(0; $nc) | {id: ., body: "stub"}] else [] end),
+       latestReviews: ($commenters | split(",") | map(select(. != "")) | map({state: "COMMENTED", author: {login: .}}))
      }'
 }
 
@@ -134,10 +137,11 @@ _lookup_pr() {
     local seed_base=$(_envget "GH_PR_${safe}__BASE")
     local seed_review=$(_envget "GH_PR_${safe}__REVIEW")
     local seed_comments=$(_envget "GH_PR_${safe}__COMMENTS")
+    local seed_commenters=$(_envget "GH_PR_${safe}__COMMENTERS")
     _emit_pr_json \
       "$seed_num" "$seed_title" "$seed_body" \
       "${seed_state:-OPEN}" "${seed_draft:-1}" "${seed_base:-main}" \
-      "$seed_review" "${seed_comments:-0}"
+      "$seed_review" "${seed_comments:-0}" "" "$seed_commenters"
     return 0
   fi
   local nf="$_stub_dir/by-branch/$safe.num"
@@ -314,6 +318,17 @@ case "$_sub1 $_sub2" in
     fi
     exit 0
     ;;
+  "pr close")
+    # gh pr close <num> --repo R. Flip a persisted PR's state to CLOSED so a
+    # later inspect/idempotent re-run observes it. Env-seeded PRs (no persisted
+    # JSON) just succeed silently, like `pr edit`.
+    _num="${3-}"
+    _jf="$_stub_dir/by-num/$_num.json"
+    if [ -f "$_jf" ]; then
+      jq '.state = "CLOSED"' "$_jf" > "$_jf.tmp" && mv "$_jf.tmp" "$_jf"
+    fi
+    exit 0
+    ;;
   "pr view")
     _num="${3-}"
     _jq=$(_flagval --jq "$@" || true)
@@ -334,6 +349,28 @@ case "$_sub1 $_sub2" in
       printf '%s' "$_vobj" | jq -r "$_jq"
     else
       printf '%s\n' "$_vobj"
+    fi
+    exit 0
+    ;;
+  "api "*"/comments"*)
+    # gh api repos/OWNER/REPO/issues/<n>/comments?... --paginate --jq EXPR
+    # Emit <human> User-type comment objects so the production bot filter
+    # (`select(.user.type != "Bot") | length`) counts exactly that many. Keyed
+    # by PR number via GH_PR_NUM_<n>__HUMANCOMMENTS. When unset, behave like an
+    # unhandled api call (exit 2) so production falls back to the raw comment
+    # count — preserving the existing `pr list` (Nc) tests.
+    _cpath="$_sub2"
+    _cn="${_cpath#*/issues/}"; _cn="${_cn%%/comments*}"
+    _human=$(_envget "GH_PR_NUM_${_cn}__HUMANCOMMENTS")
+    if [ -z "$_human" ]; then
+      exit 2
+    fi
+    _cjq=$(_flagval --jq "$@" || true)
+    _carr=$(jq -nc --argjson h "$_human" '[range(0; $h) | {user: {type: "User"}}]')
+    if [ -n "$_cjq" ]; then
+      printf '%s' "$_carr" | jq -r "$_cjq"
+    else
+      printf '%s\n' "$_carr"
     fi
     exit 0
     ;;

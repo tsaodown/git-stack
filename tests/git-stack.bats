@@ -1174,6 +1174,196 @@ $old_footer"
   [[ "$baz_line" == *"#102"* ]]
 }
 
+# ---------- pr desync ----------
+
+@test "pr desync: clean stack closes every PR" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "close   #101 feat/01-foo"
+  assert_output_contains "close   #102 feat/02-bar"
+  assert_output_contains "close   #103 feat/03-baz"
+  assert_eq "$(gh_log_count 'pr close')" 3 "pr close calls"
+  # Each persisted PR is now CLOSED.
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/101.json")" CLOSED "101 state"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/102.json")" CLOSED "102 state"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/103.json")" CLOSED "103 state"
+  assert_output_contains "3 closed"
+}
+
+@test "pr desync: idempotent re-run closes nothing" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  git stack pr desync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_eq "$(gh_log_count 'pr close')" 0 "pr close calls"
+  assert_output_contains "already closed"
+  assert_output_contains "0 closed"
+}
+
+@test "pr desync: merged PR is skipped, others close" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__STATE=MERGED
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "skip    #102 feat/02-bar"
+  assert_output_contains "merged"
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+  refute grep -q '^gh pr close 102 ' "$GH_STUB_LOG"
+}
+
+@test "pr desync: already-closed PR is a no-op skip" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__STATE=CLOSED
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "already closed"
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+  refute grep -q '^gh pr close 102 ' "$GH_STUB_LOG"
+}
+
+@test "pr desync: PR with a human comment prompts and is skipped off a TTY" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__COMMENTS=1
+  export GH_PR_NUM_102__HUMANCOMMENTS=1
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  # No tty in the harness -> _confirm returns 1 -> the active PR is kept.
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "has activity: 1 comment"
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+  refute grep -q '^gh pr close 102 ' "$GH_STUB_LOG"
+}
+
+@test "pr desync: bot-only comments are not activity, PR closes" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__COMMENTS=2
+  export GH_PR_NUM_102__HUMANCOMMENTS=0
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_eq "$(gh_log_count 'pr close')" 3 "pr close calls"
+}
+
+@test "pr desync --yes: closes an active PR without prompting" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__COMMENTS=1
+  export GH_PR_NUM_102__HUMANCOMMENTS=1
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --yes --no-color
+  assert_status 0
+  assert_eq "$(gh_log_count 'pr close')" 3 "pr close calls"
+  assert_output_contains "has activity: 1 comment"
+}
+
+@test "pr desync: an approval counts as activity and is kept off a TTY" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__REVIEW=APPROVED
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "approved"
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+  refute grep -q '^gh pr close 102 ' "$GH_STUB_LOG"
+}
+
+@test "pr desync: a commented-only review counts as activity and is kept off a TTY" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  # A review submitted as "Comment" (no approve/changes) -> COMMENTED, with no
+  # reviewDecision and no conversation comment. Must still count as activity.
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__COMMENTERS=alice
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "commented by alice"
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+  refute grep -q '^gh pr close 102 ' "$GH_STUB_LOG"
+}
+
+@test "pr desync --delete-remote: closes PRs and deletes their remote branches" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "delete  remote feat/01-foo"
+  assert_eq "$(gh_log_count 'pr close')" 3 "pr close calls"
+  refute git ls-remote --exit-code --heads origin feat/01-foo
+  refute git ls-remote --exit-code --heads origin feat/02-bar
+  refute git ls-remote --exit-code --heads origin feat/03-baz
+  assert_output_contains "3 closed, 3 remote deleted"
+}
+
+@test "pr desync --delete-remote: keeps the remote that bases a kept-open PR" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B
+  # Leaf has activity -> kept open (non-TTY decline). Its base (02) must survive.
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C GH_PR_feat_03_baz__REVIEW=APPROVED
+  run git stack pr desync --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "kept — has activity"
+  assert_output_contains "keeping remote feat/02-bar"
+  # 01 deleted; 02 kept (bases the open #103); 03 kept (the active PR itself).
+  refute git ls-remote --exit-code --heads origin feat/01-foo
+  assert git ls-remote --exit-code --heads origin feat/02-bar
+  assert git ls-remote --exit-code --heads origin feat/03-baz
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+}
+
+@test "pr desync --dry-run: previews and mutates nothing" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync --dry-run --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "(dry-run)"
+  assert_eq "$(gh_log_count 'pr close')" 0 "pr close calls"
+  # PRs untouched and remote branches all still present.
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/101.json")" OPEN "101 state"
+  assert git ls-remote --exit-code --heads origin feat/01-foo
+  assert git ls-remote --exit-code --heads origin feat/02-bar
+  assert git ls-remote --exit-code --heads origin feat/03-baz
+}
+
+@test "pr desync: a branch with no PR is reported and skipped" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  # feat/02-bar deliberately has no seeded PR.
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  run git stack pr desync --no-color
+  assert_status 0
+  assert_output_contains "(no PR) feat/02-bar"
+  assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
+}
+
 # ---------- default-branch ----------
 
 @test "default-branch: returns main when on main" {

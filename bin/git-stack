@@ -1890,6 +1890,17 @@ _gh_pr_edit() {
   fi
 }
 
+# Close an open PR without merging. Args: <num>. Returns 1 on failure (output
+# captured + echoed to stderr). Does not touch the branch — the --delete-remote
+# path in cmd_pr_desync handles remote deletion separately.
+_gh_pr_close() {
+  local num="$1" out
+  out=$(gh pr close "$num" --repo "$GH_REPO" 2>&1) || {
+    printf '%s\n' "$out" >&2
+    return 1
+  }
+}
+
 # Emit an OSC 8 hyperlink escape sequence wrapping <text> with <url>, when
 # colors are on. Falls back to plain <text> when --no-color / non-TTY (i.e.
 # whenever color_init left $C_RESET empty). Same gate as ANSI colors.
@@ -1940,7 +1951,7 @@ _gh_pr_inspect() {
   local b="$1"
   gh pr list --repo "$GH_REPO" --head "$b" --state all --limit 1 \
     --json number,title,state,isDraft,baseRefName,reviewDecision,comments,latestReviews,reviewRequests,statusCheckRollup,mergedAt,mergedBy \
-    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.reviewRequests // []) | map(if .__typename == "Team" then .name else .login end) | join(",")) as $req_rev | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($req_rev)\($checks)\u001f\(.mergedAt // "")\u001f\(.mergedBy.login // "")"' \
+    --jq '.[] | ((.latestReviews // []) | map(select(.state == "APPROVED")) | map(.author.login) | join(",")) as $appr | ((.latestReviews // []) | map(select(.state == "CHANGES_REQUESTED")) | map(.author.login) | join(",")) as $chg | ((.latestReviews // []) | map(select(.state == "COMMENTED")) | map(.author.login) | join(",")) as $cmt | ((.reviewRequests // []) | map(if .__typename == "Team" then .name else .login end) | join(",")) as $req_rev | ((.statusCheckRollup // []) | map(if .__typename == "CheckRun" then (if .status != "COMPLETED" then "PENDING" elif (.conclusion == "SUCCESS" or .conclusion == "NEUTRAL" or .conclusion == "SKIPPED") then "PASS" else "FAIL" end) else (if .state == "SUCCESS" then "PASS" elif .state == "PENDING" then "PENDING" else "FAIL" end) end)) as $cs | "\($cs | map(select(. == "PASS")) | length),\($cs | map(select(. == "FAIL")) | length),\($cs | map(select(. == "PENDING")) | length)" as $checks | "\(.number)\(.title // "")\(.state // "")\(if .isDraft then "1" else "0" end)\(.baseRefName // "")\(.reviewDecision // "")\(.comments | length)\($appr)\($chg)\($req_rev)\($checks)\u001f\(.mergedAt // "")\u001f\(.mergedBy.login // "")\u001f\($cmt)"' \
     2>/dev/null
 }
 
@@ -2064,6 +2075,19 @@ ${b}Branch-level subcommands:${r}
                                     comment count. Runs \`git fetch --all
                                     --prune\` by default; pass ${fl}--no-fetch${r}
                                     to skip. Requires \`gh\`.
+  ${sub}pr desync${r} [${fl}--delete-remote${r}] [${fl}--yes${r}] [${fl}--dry-run${r}]
+                                    Tear down the stack's PR chain (inverse of
+                                    ${sub}pr sync${r}) so branches can be reordered and
+                                    re-synced clean: closes each branch's open
+                                    PR. Skips merged and already-closed PRs. An
+                                    open PR with human activity (a non-bot
+                                    comment, an approval, or a changes-requested
+                                    review) prompts ${fl}y/N${r} per PR on a TTY —
+                                    skipped non-interactively unless ${fl}--yes${r}.
+                                    ${fl}--delete-remote${r} also deletes the remote
+                                    branch of each PR closed (but never one
+                                    still serving as the base of a PR you kept
+                                    open). ${fl}--dry-run${r} previews. Requires \`gh\`.
   ${sub}history${r}                           List snapshots taken before each restack/
                                     amend. Subcommands: \`history show <id>\`,
                                     \`history restore <id> [--yes]\`. Run-id may
@@ -5558,8 +5582,7 @@ cmd_sync() {
   fi
 }
 
-# Sub-dispatcher for `git stack pr <verb>`. Only `sync` is implemented; the
-# structure leaves room for future verbs (pr list, pr close, etc.).
+# Sub-dispatcher for `git stack pr <verb>`. Verbs: sync (default), list, desync.
 cmd_pr() {
   local sub="${1-}"
   if [[ -z "$sub" || "$sub" == -* ]]; then
@@ -5569,9 +5592,10 @@ cmd_pr() {
   fi
   shift
   case "$sub" in
-    sync) cmd_pr_sync "$@" ;;
-    list) cmd_pr_list "$@" ;;
-    *) die "unknown pr subcommand: $sub (try 'sync' or 'list')" ;;
+    sync)   cmd_pr_sync "$@" ;;
+    list)   cmd_pr_list "$@" ;;
+    desync) cmd_pr_desync "$@" ;;
+    *) die "unknown pr subcommand: $sub (try 'sync', 'list', or 'desync')" ;;
   esac
 }
 
@@ -5919,6 +5943,196 @@ cmd_pr_sync() {
   log "${C_GREEN}done${C_RESET}    pr sync complete (${C_BOLD}${N}${C_RESET} branches)"
 }
 
+# Tear down the stack's PR chain so the branches can be reordered and re-synced
+# cleanly — the inverse of `pr sync`. For each branch, close its open PR.
+# Merged and already-closed PRs are left alone. OPEN PRs carrying human activity
+# (a non-bot comment, an approval, or a changes-requested review) prompt per-PR
+# on a TTY — skipped non-interactively unless --yes. With --delete-remote, also
+# delete the remote branch of each PR closed, except one still serving as the
+# base of a PR we kept open (deleting it would retarget that PR on GitHub).
+# --dry-run previews without mutating.
+cmd_pr_desync() {
+  OPT_PREFIX=""
+  local opt_delete_remote=0 opt_yes=0 opt_dry_run=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --delete-remote) opt_delete_remote=1; shift ;;
+      --yes|-y)        opt_yes=1; shift ;;
+      --dry-run)       opt_dry_run=1; shift ;;
+      -*) die "unknown pr desync flag: $1" ;;
+      *)  die "pr desync: unexpected arg '$1'" ;;
+    esac
+  done
+
+  require_in_repo
+  _gh_preflight
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under $prefix"
+  local M=${#branches[@]}
+
+  # --- Phase 1: inspect + classify + (interactively) confirm. No mutations.
+  # One plan entry per branch, index-aligned with branches[], so the Phase 2
+  # base-branch guard can consult a branch's immediate successor by index.
+  # OPEN_AFTER[i] tracks whether branch i's PR is still open (1) so a delete of
+  # its base can be vetoed; it flips to 0 once we (would) close it.
+  local PLAN_NUM=() PLAN_ACTION=() PLAN_NOTE=() OPEN_AFTER=()
+  local data num title state is_draft base_ref review_dec comments approvers change_reqs req_reviewers checks merged_at merged_by commenters
+  local i b
+  for ((i = 0; i < M; i++)); do
+    b="${branches[$i]}"
+    data=$(_gh_pr_inspect "$b")
+    if [[ -z "$data" ]]; then
+      # No PR for this branch — the "(no PR)" id cell already says it, so no note.
+      PLAN_NUM[i]=""; PLAN_ACTION[i]="skip"; PLAN_NOTE[i]=""; OPEN_AFTER[i]=0
+      continue
+    fi
+    num="${data%%$'\x1f'*}";        data="${data#*$'\x1f'}"
+    title="${data%%$'\x1f'*}";      data="${data#*$'\x1f'}"
+    state="${data%%$'\x1f'*}";      data="${data#*$'\x1f'}"
+    is_draft="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    base_ref="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    review_dec="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
+    comments="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    approvers="${data%%$'\x1f'*}";  data="${data#*$'\x1f'}"
+    change_reqs="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
+    req_reviewers="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
+    checks="${data%%$'\x1f'*}";       data="${data#*$'\x1f'}"
+    merged_at="${data%%$'\x1f'*}";    data="${data#*$'\x1f'}"
+    merged_by="${data%%$'\x1f'*}";    commenters="${data#*$'\x1f'}"
+
+    PLAN_NUM[i]="$num"
+
+    case "$state" in
+      MERGED)
+        PLAN_ACTION[i]="skip"; OPEN_AFTER[i]=0
+        if [[ -n "$merged_by" ]]; then
+          PLAN_NOTE[i]="merged by ${merged_by}"
+        else
+          PLAN_NOTE[i]="merged"
+        fi
+        continue ;;
+      CLOSED)
+        PLAN_ACTION[i]="skip"; PLAN_NOTE[i]="already closed"; OPEN_AFTER[i]=0
+        continue ;;
+    esac
+
+    # OPEN — classify human activity (non-bot comment / approval / changes).
+    OPEN_AFTER[i]=1
+    local human_comments=0 hc=""
+    if [[ "$comments" =~ ^[0-9]+$ ]] && (( comments > 0 )); then
+      hc=$(gh api "repos/${GH_REPO}/issues/${num}/comments?per_page=100" --paginate \
+        --jq '[.[] | select(.user.type != "Bot")] | length' 2>/dev/null) || hc=""
+      if [[ "$hc" =~ ^[0-9]+$ ]]; then human_comments="$hc"; else human_comments="$comments"; fi
+    fi
+    local act_notes=""
+    if (( human_comments == 1 )); then
+      act_notes="1 comment"
+    elif (( human_comments > 1 )); then
+      act_notes="${human_comments} comments"
+    fi
+    if [[ -n "$approvers" ]]; then
+      act_notes="${act_notes:+$act_notes, }approved by ${approvers//,/, }"
+    elif [[ "$review_dec" == "APPROVED" ]]; then
+      act_notes="${act_notes:+$act_notes, }approved"
+    fi
+    if [[ -n "$change_reqs" ]]; then
+      act_notes="${act_notes:+$act_notes, }changes by ${change_reqs//,/, }"
+    elif [[ "$review_dec" == "CHANGES_REQUESTED" ]]; then
+      act_notes="${act_notes:+$act_notes, }changes requested"
+    fi
+    # A review submitted as "Comment" (no approve / changes-requested) shows up
+    # as a COMMENTED review, not in reviewDecision — surface its author too.
+    if [[ -n "$commenters" ]]; then
+      act_notes="${act_notes:+$act_notes, }commented by ${commenters//,/, }"
+    fi
+
+    if [[ -z "$act_notes" ]]; then
+      PLAN_ACTION[i]="close"
+      continue
+    fi
+    # Has activity — decide whether to close it.
+    if (( opt_yes )); then
+      PLAN_ACTION[i]="close"; PLAN_NOTE[i]="has activity: ${act_notes}"
+    elif (( opt_dry_run )); then
+      PLAN_ACTION[i]="skip"; PLAN_NOTE[i]="has activity: ${act_notes} (would prompt)"
+    elif _confirm "$(_pr_link "$num") ${b} — ${act_notes}. close anyway?"; then
+      PLAN_ACTION[i]="close"; PLAN_NOTE[i]="has activity: ${act_notes}"
+    else
+      PLAN_ACTION[i]="skip"; PLAN_NOTE[i]="kept — has activity: ${act_notes}"
+    fi
+  done
+
+  # --- Phase 2: execute, leaf -> base. Close a branch's PR, then (with
+  # --delete-remote) delete its remote — unless the branch still backs an open
+  # PR (a kept-active successor, or one whose close failed), since deleting it
+  # would retarget/disrupt that PR on GitHub.
+  local DESYNC_FAILURES=()
+  local closed=0 deleted=0 skipped=0
+  for ((i = M - 1; i >= 0; i--)); do
+    b="${branches[$i]}"
+    num="${PLAN_NUM[i]-}"
+    local action="${PLAN_ACTION[i]-}"
+    local note="${PLAN_NOTE[i]-}"
+    local note_sfx=""
+    [[ -n "$note" ]] && note_sfx=" ${C_DIM}[${note}]${C_RESET}"
+
+    if [[ "$action" == "skip" ]]; then
+      local id_cell="(no PR)"
+      [[ -n "$num" ]] && id_cell="$(_pr_link "$num")"
+      log "${C_DIM}skip${C_RESET}    ${id_cell} ${C_CYAN}${b}${C_RESET}${note_sfx}"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # action == close
+    if (( opt_dry_run )); then
+      log "${C_YELLOW}close${C_RESET}   $(_pr_link "$num") ${C_CYAN}${b}${C_RESET} ${C_DIM}(dry-run)${C_RESET}${note_sfx}"
+    elif _gh_pr_close "$num"; then
+      log "${C_YELLOW}close${C_RESET}   $(_pr_link "$num") ${C_CYAN}${b}${C_RESET}${note_sfx}"
+    else
+      warn "could not close $(_pr_link "$num") (${b})"
+      DESYNC_FAILURES+=("$b")
+      continue   # leave its remote in place
+    fi
+    OPEN_AFTER[i]=0
+    closed=$((closed + 1))
+
+    # --delete-remote: drop the remote branch unless it still backs an open PR.
+    if (( opt_delete_remote )); then
+      if (( i + 1 < M )) && [[ "${OPEN_AFTER[i+1]-}" == "1" ]]; then
+        warn "keeping remote ${b} — base of still-open $(_pr_link "${PLAN_NUM[i+1]-}")"
+      elif (( opt_dry_run )); then
+        log "${C_RED}delete${C_RESET}  remote ${C_CYAN}${b}${C_RESET} ${C_DIM}(dry-run)${C_RESET}"
+        deleted=$((deleted + 1))
+      elif git ls-remote --exit-code --heads origin "$b" >/dev/null 2>&1; then
+        if git push --quiet origin --delete "$b" 2>/dev/null; then
+          log "${C_RED}delete${C_RESET}  remote ${C_CYAN}${b}${C_RESET}"
+          deleted=$((deleted + 1))
+        else
+          warn "could not delete remote branch '${b}'"
+          DESYNC_FAILURES+=("$b")
+        fi
+      fi
+    fi
+  done
+
+  log "${C_BOLD}desynced:${C_RESET} ${closed} closed, ${deleted} remote deleted, ${skipped} skipped"
+  if (( ${#DESYNC_FAILURES[@]} > 0 )); then
+    local s="" x
+    for x in "${DESYNC_FAILURES[@]}"; do s="${s:+$s }$x"; done
+    warn "failed: $s"
+    return 3
+  fi
+}
+
 # List the stack's PRs one per line. Mirrors `git stack view`'s look: parent
 # header, per-branch row, fetches by default. Adds PR-specific badges:
 # state, draft, base-mismatch, review decision, plus a comment count.
@@ -5990,7 +6204,7 @@ cmd_pr_list() {
     (( ${#b} > max_w )) && max_w=${#b}
   done
 
-  local data num title state is_draft base_ref review_dec comments approvers change_reqs req_reviewers checks merged_at merged_by
+  local data num title state is_draft base_ref review_dec comments approvers change_reqs req_reviewers checks merged_at merged_by commenters
   local marker branch_color flags expected_base pr_cell
   for b in "${branches[@]}"; do
     if [[ "$b" == "$current" ]]; then
@@ -6020,7 +6234,8 @@ cmd_pr_list() {
     change_reqs="${data%%$'\x1f'*}";   data="${data#*$'\x1f'}"
     req_reviewers="${data%%$'\x1f'*}"; data="${data#*$'\x1f'}"
     checks="${data%%$'\x1f'*}";       data="${data#*$'\x1f'}"
-    merged_at="${data%%$'\x1f'*}";    merged_by="${data#*$'\x1f'}"
+    merged_at="${data%%$'\x1f'*}";    data="${data#*$'\x1f'}"
+    merged_by="${data%%$'\x1f'*}";    commenters="${data#*$'\x1f'}"
 
     # Strip the [N/M] prefix from the displayed title — the row order already
     # conveys position, so showing the prefix here is just visual noise.
@@ -6355,7 +6570,7 @@ _complete_verbs() {
     amend     "Amend the current branch and reflow upper branches" \
     continue  "Resume a paused reflow after resolving conflicts" \
     abort     "Abort a paused reflow and restore original SHAs" \
-    pr        "Sync or list GitHub PRs for the stack" \
+    pr        "Sync, list, or close GitHub PRs for the stack" \
     history   "Show or restore stack snapshots" \
     rename    "Rename every branch in the stack to a new prefix" \
     move      "Move a branch to a different position in the stack" \
@@ -6368,8 +6583,9 @@ _complete_subverbs() {
   case "${1-}" in
     pr)
       printf '%s\t%s\n' \
-        sync "Create/update PRs for the stack" \
-        list "List the stack's PRs"
+        sync   "Create/update PRs for the stack" \
+        list   "List the stack's PRs" \
+        desync "Close the stack's PRs to reorder/re-sync clean"
       ;;
     history)
       printf '%s\t%s\n' \

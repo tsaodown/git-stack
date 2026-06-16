@@ -137,4 +137,44 @@ A branch with no open PR collapses to a single `(no PR)` line.
 The review, check, and merge badges reflect live GitHub state, so they only
 appear once a PR exists and reviewers/CI have acted.
 
+## `git stack pr desync`
+
+The inverse of `pr sync`: tear the chain back down. Once a stack is published,
+reordering it churns every PR (bases, `[N/M]` titles, nav footers) and renamed
+heads auto-close their PRs. `pr desync` takes the stack *off* GitHub so you can
+reorder freely and re-publish with a clean `pr sync`.
+
+```sh
+git stack pr desync                  # close each branch's open PR
+git stack pr desync --delete-remote  # also delete the remote branches
+git stack pr desync --yes            # close active PRs too, without prompting
+git stack pr desync --dry-run        # show planned actions, make no changes
+```
+
+For each branch it inspects the PR and acts by state:
+
+| PR state | Action |
+|----------|--------|
+| open, no activity | **closed** |
+| open, with activity | **prompt** `y/N` per PR on a TTY; kept if declined. Skipped (kept) non-interactively unless `--yes` |
+| merged | **skipped** — can't be closed |
+| already closed | **skipped** — no-op |
+| no PR | **skipped** |
+
+**Activity** is a *human* signal on the PR — a non-bot comment, or any review a
+person left (an approval, a changes-requested, or a plain *Comment* review). CI
+checks are **not** activity (they run on nearly every PR). The check exists so
+you don't silently close a PR someone has engaged with; everything quiet closes
+without ceremony.
+
+### `--delete-remote`
+
+Also deletes the remote branch of each PR closed. (Closing a PR leaves its branch
+on origin; deleting the branch is what gives a fully clean slate.) Branches are
+processed leaf→base, and a branch is **never** deleted while it still serves as
+the base of a PR that was kept open — deleting it would retarget that PR to the
+default branch on GitHub. Such a branch is reported `keeping remote <branch>` and
+left in place. Branches without a PR (and the branches of merged or kept PRs) are
+left alone; use [`clean`](workflows.md) for broader remote pruning.
+
 **See also:** [concepts: PR chain](concepts.md#pr-chain) · [workflows §6](workflows.md#6-publish-and-refresh-the-pr-chain) · [workflows §7: bottom PR merged](workflows.md#7-the-bottom-pr-merged)

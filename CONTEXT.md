@@ -106,6 +106,18 @@ A PR once in this **PR chain**, now merged and no longer an **active branch**,
 still shown struck-through in the **nav footer**.
 _Avoid_: landed PR, closed PR (a merged predecessor is specifically merged).
 
+**Desync**:
+Tear down the **PR chain** — close each branch's open PR (inverse of **pr
+sync**) so the **stack** can be reordered and re-synced clean. Merged/closed PRs
+are left alone; PRs with **activity** prompt before closing.
+_Avoid_: teardown, unsync, delete-PRs.
+
+**Activity**:
+A *human* signal on a PR — a non-bot comment, or any review a person left
+(approval, changes-requested, or a plain **Comment** review). CI checks are
+**not** activity. Gates whether **desync** closes a PR outright or prompts first.
+_Avoid_: traffic, engagement, interaction.
+
 ### Doctor
 
 **Squash** (doctor issue kind):
@@ -230,7 +242,9 @@ multi-commit fix and the tree-equals-predecessor case, respectively).
 `move`, `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
 and `pr sync` / `pr list` keep their current meanings. **move** additionally
 **renumbers in place** when the chosen position is the branch's current slot —
-a pure leaf rename, no reflow (ADR 0002).
+a pure leaf rename, no reflow (ADR 0002). **pr desync** closes the chain's PRs
+to take a stack off GitHub for clean reordering (the inverse of **pr sync**;
+ADR 0005).
 
 ### Removed verbs
 
