@@ -193,18 +193,47 @@ local↔origin sync state, a one-line paused-operation banner, and the last
 per-stack `list` and `status`.
 
 **clean**:
-Janitorial teardown of the current stack, in order: prune local `[gone]`
-branches; delete extraneous **remote** branches under the prefix
-(confirmation-gated — on decline, skip *only* the remote deletion and continue);
-then fetch and **reflow** survivors onto `origin/<default>`. A reflow, so it can
-pause on **conflict** and resume via `continue`. The reflow is **skipped** when
-nothing was pruned *and* `origin/<default>` is already an ancestor of the bottom
-survivor (base unchanged — the rebase would be a no-op, only churning SHAs);
-any prune still forces it (a removed mid-stack branch orphans its successor's
-predecessor). When the base *has* moved, `clean` announces it loudly
-(`base origin/<default> moved <range>; restacking …`). Replaces `close` and the
-`gstkcl`/`gstkrom`/`gstkromp` shell helpers.
+The one-stop "make this stack correct, locally and remotely" verb. Janitorial
+teardown of the current stack, in order: fetch; prune local `[gone]` branches;
+delete extraneous **remote** branches under the prefix (confirmation-gated — on
+decline, skip *only* the remote deletion and continue); then **reflow** the
+survivors. A reflow, so it can pause on **conflict** and resume via `continue`.
+
+The reflow decision is a single **ancestor walk** over the survivors and is the
+sole driver (ADR 0007): `pred_tip(0)` is the resolved base, `pred_tip(i)` is the
+predecessor's tip; the reflow starts at the lowest branch that is no longer an
+ancestor-descendant of its predecessor. This unifies three drift sources —
+**moved base**, **local drift** (you edited or inserted a mid-stack branch), and
+**mid-stack prune orphans** — into one check. Outcomes: drift at the bottom
+(`from_idx == 0`, base moved or bottom branch diverged) → whole stack
+`restack --onto <base>`; drift above (`from_idx > 0`) → minimal
+`restack --from <branch>`, leaving branches below untouched (their SHAs/PRs
+preserved); no drift → **skip** (as before). Prune is thus demoted to a
+non-reflow concern — it no longer force-churns the whole stack when the survivors
+are already threaded. When the base advanced, `clean` still announces it loudly
+(`base <base> moved <range>; restacking …`).
+
+The base is resolved with the **shared resolver** (`_resolve_parent_*`), so
+`clean` honors `stack.base` like every other verb, returns `origin/<base>` when a
+remote exists, and falls back to a local trunk when offline (no `--local` flag
+needed). With no trunk resolvable at all, it skips the bottom check and
+re-threads internal drift only, warning that it did not rebase onto a trunk.
+
+Mutation order is plan-then-guard-then-mutate: the read-only walk computes the
+whole plan first; a planned reflow then requires a clean tree **before** any
+mutation (a prune-only run does not); one up-front **snapshot** covers prune +
+reflow so a single `history restore` undoes both (local refs only — remote
+deletions stay deleted). A branch that goes content-empty during the reflow
+(absorbed into its predecessor) earns a **non-mutating advisory** pointing at
+`doctor`/`fold` — `clean` deletes by remote-gone signal only, never by content.
+Replaces `close` and the `gstkcl`/`gstkrom`/`gstkromp` shell helpers.
 _Avoid_: "close" (the prune-only predecessor).
+
+clean vs **restack**: reach for `clean` to fix the whole stack (prune + remote
+cleanup + re-thread). Reach for `restack` for the surgical / offline cases it
+keeps exclusively: re-thread with **no network**, `--from <branch>` for a partial
+reflow, `--onto <ref>` to re-root onto an **arbitrary** ref (not the base), and
+`--push`. `restack` is also the internal primitive `amend` calls (ADR 0007).
 
 ### Branch-level
 

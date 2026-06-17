@@ -549,6 +549,10 @@ require_branch_not_in_worktree() {
 #
 # Usage: snapshot_stack <action> <prefix> <branch>...
 snapshot_stack() {
+  # Callers that already took a covering up-front snapshot (e.g. clean, before it
+  # prunes) suppress the redundant inner snapshot a nested reflow would take, so
+  # a single `history restore` lands on the one pre-mutation anchor.
+  [[ "${_SNAPSHOT_SUPPRESS:-0}" == 1 ]] && return 0
   local action="$1" prefix="$2"
   shift 2
   local prefix_path="${prefix%/}"
@@ -2825,6 +2829,31 @@ _confirm() {
 # branches under the prefix that have no local counterpart (confirm-gated —
 # declining skips only that step), then reflow the survivors onto
 # origin/<default>. Replaces `close` + the old `gstkcl`/`gstkrom` helpers.
+# Walk the survivors and report the lowest index at which a branch is no longer
+# threaded on its predecessor's tip (pred_tip(0)=base_ref, pred_tip(i)=tip of
+# survivor[i-1]). Echoes that index, or nothing when the whole stack is threaded.
+# An empty base_ref skips the i=0 check (offline/degenerate — no trunk to anchor
+# the bottom branch against), so only internal drift (i >= 1) is reported.
+# This single walk unifies moved-base, mid-stack prune orphans, and local drift.
+_clean_drift_from_idx() {
+  local base_ref="$1"; shift
+  local survivors=("$@")
+  local n=${#survivors[@]} i pred
+  for ((i = 0; i < n; i++)); do
+    if (( i == 0 )); then
+      [[ -n "$base_ref" ]] || continue
+      pred="$base_ref"
+    else
+      pred="refs/heads/${survivors[i-1]}"
+    fi
+    if ! git merge-base --is-ancestor "$pred" "refs/heads/${survivors[i]}" 2>/dev/null; then
+      printf '%s\n' "$i"
+      return 0
+    fi
+  done
+  return 0
+}
+
 cmd_clean() {
   OPT_PREFIX=""
   local opt_dry_run=0 opt_keep_history=0
@@ -2934,39 +2963,87 @@ cmd_clean() {
     git show-ref -q --verify "refs/heads/$lname" || remote_orphans+=("$lname")
   done < <(git for-each-ref --format='%(refname:short)' "refs/remotes/origin/${prefix}*")
 
-  # 5. Dry-run: print the plan (incl. reflow note) and stop.
+  # 5. Compute the reflow plan (read-only) before any mutation.
+  #    Survivors = branches that remain after the prune, in stack order.
+  local survivors=() s_b s_g s_is_gone
+  for s_b in "${branches[@]}"; do
+    s_is_gone=0
+    for s_g in "${gone[@]+"${gone[@]}"}"; do [[ "$s_b" == "$s_g" ]] && { s_is_gone=1; break; }; done
+    (( s_is_gone )) || survivors+=("$s_b")
+  done
+
+  # Resolve the base via the shared resolver: honors stack.base (fixes a clean-
+  # only inconsistency vs other verbs), returns origin/<base> when a remote
+  # exists, falls back to a local trunk when offline, and is empty only when no
+  # trunk resolves at all.
+  local base_name="" base_ref=""
+  base_name=$(_resolve_parent_name 2>/dev/null) || base_name=""
+  if [[ -n "$base_name" ]]; then
+    base_ref=$(_resolve_parent_ref "$base_name" 2>/dev/null) || base_ref=""
+  fi
+
+  # The ancestor walk is the sole reflow driver: the lowest survivor index that
+  # drifted off its predecessor's tip. Empty => the stack is threaded.
+  local from_idx=""
+  if (( ${#survivors[@]} > 0 )); then
+    from_idx=$(_clean_drift_from_idx "$base_ref" "${survivors[@]}")
+  fi
+
+  # When the bottom branch drifted off the base (from_idx==0), distinguish an
+  # advanced trunk (loud) from a locally-diverged bottom branch (quiet).
+  local base_advanced=0 b_old_base="" b_onto_sha="" b_range=""
+  if [[ "$from_idx" == 0 && -n "$base_ref" ]]; then
+    b_onto_sha=$(git rev-parse "$base_ref" 2>/dev/null || true)
+    b_old_base=$(git merge-base "refs/heads/${survivors[0]}" "$base_ref" 2>/dev/null || true)
+    if [[ -n "$b_old_base" && -n "$b_onto_sha" ]]; then
+      local b_adv
+      b_adv=$(git rev-list --count "${b_old_base}..${b_onto_sha}" 2>/dev/null || echo 0)
+      if (( b_adv > 0 )); then
+        base_advanced=1
+        b_range=" ${C_DIM}$(git rev-parse --short "$b_old_base")..$(git rev-parse --short "$b_onto_sha")${C_RESET} (+${b_adv} commit(s))"
+      fi
+    fi
+  fi
+
+  # 6. Dry-run: print the plan (incl. the walk-driven reflow forecast) and stop.
   if (( opt_dry_run )); then
     if (( ${#remote_orphans[@]} > 0 )); then
       log "${C_YELLOW}remote${C_RESET}  ${#remote_orphans[@]} remote branch(es) under '${prefix}' with no local counterpart:"
       for lname in "${remote_orphans[@]}"; do log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}origin/${lname}${C_RESET}"; done
     fi
-    local n_survive=$(( ${#branches[@]} - ${#gone[@]} ))
     log ""
-    # Mirror step 8's gate against the bottom *surviving* branch (the first not
-    # in gone): no prune + base unchanged => the reflow would be a no-op; a moved
-    # base is the loud reason to reflow.
-    local d_bsurv="" d_b d_g d_is_gone
-    for d_b in "${branches[@]}"; do
-      d_is_gone=0
-      for d_g in "${gone[@]+"${gone[@]}"}"; do [[ "$d_b" == "$d_g" ]] && { d_is_gone=1; break; }; done
-      (( d_is_gone )) || { d_bsurv="$d_b"; break; }
-    done
-    local d_onto_ok=0 d_base_moved=0
-    if [[ -n "$d_bsurv" ]] && git rev-parse --verify --quiet "origin/${default_branch}^{commit}" >/dev/null 2>&1; then
-      d_onto_ok=1
-      git merge-base --is-ancestor "origin/${default_branch}" "refs/heads/${d_bsurv}" 2>/dev/null || d_base_moved=1
-    fi
-    if (( d_onto_ok )) && (( ${#gone[@]} == 0 )) && (( ! d_base_moved )); then
-      log "${C_BOLD}dry run${C_RESET}: stack already on origin/${default_branch}; would skip reflow"
-    elif (( d_onto_ok )) && (( d_base_moved )); then
-      log "${C_BOLD}dry run${C_RESET}: origin/${default_branch} has moved; would restack ${n_survive} survivor(s) onto it"
+    if [[ -z "$from_idx" ]]; then
+      log "${C_BOLD}dry run${C_RESET}: stack threaded on ${base_ref:-the base}; would skip reflow"
+    elif [[ "$from_idx" == 0 ]]; then
+      if (( base_advanced )); then
+        log "${C_BOLD}dry run${C_RESET}: ${base_ref} has moved${b_range}; would reflow ${#survivors[@]} survivor(s) onto it"
+      else
+        log "${C_BOLD}dry run${C_RESET}: bottom branch diverged from ${base_ref:-the base}; would reflow ${#survivors[@]} survivor(s)"
+      fi
     else
-      log "${C_BOLD}dry run${C_RESET}: would reflow ${n_survive} survivor(s) onto origin/${default_branch}; rerun without --dry-run to apply"
+      log "${C_BOLD}dry run${C_RESET}: drift at ${survivors[$from_idx]}; would reflow from ${survivors[$from_idx]} up; rerun without --dry-run to apply"
     fi
     return 0
   fi
 
-  # 6. Apply the local prune.
+  # 7. Guard: a reflow rewrites refs, so require a clean tree *now* — before any
+  #    mutation (incl. the snapshot below) — so a dirty tree bails with nothing
+  #    touched. A prune-only run does not need a clean tree, so the guard is
+  #    conditional on a planned reflow.
+  if [[ -n "$from_idx" ]]; then
+    require_clean_tree
+  fi
+
+  # 8. Up-front snapshot: one anchor covering prune + reflow, taken before any
+  #    branch mutation, so a single `history restore` undoes both. Local refs
+  #    only — remote deletions are not snapshotted and stay deleted across a
+  #    restore. The nested reflow's own snapshot is suppressed (see step 11) so
+  #    this one is the sole restore point.
+  if (( ${#gone[@]} > 0 )) || [[ -n "$from_idx" ]]; then
+    snapshot_stack clean "$prefix" "${branches[@]}"
+  fi
+
+  # 9. Apply the local prune.
   if (( ${#gone[@]} > 0 )); then
     if ! printf '%s' "$stdin" | git update-ref --stdin -m "git-stack clean" 2>/dev/null; then
       die "git update-ref batch failed; refs unchanged (atomic)"
@@ -2974,7 +3051,7 @@ cmd_clean() {
     log "${C_GREEN}pruned${C_RESET}  ${#gone[@]} local branch(es)"
   fi
 
-  # 7. Delete remote orphans (confirm-gated; declining skips only this step).
+  # 10. Delete remote orphans (confirm-gated; declining skips only this step).
   if (( ${#remote_orphans[@]} > 0 )); then
     log "${C_YELLOW}remote${C_RESET}  ${#remote_orphans[@]} remote branch(es) under '${prefix}' with no local counterpart:"
     for lname in "${remote_orphans[@]}"; do log "  ${C_CYAN}origin/${lname}${C_RESET}"; done
@@ -2991,44 +3068,49 @@ cmd_clean() {
     fi
   fi
 
-  # 8. Reflow the survivors onto origin/<default>.
-  local survivors=()
-  _load_stack_branches "$prefix" survivors
+  # 11. Reflow per the walk. from_idx==0 => whole stack onto base; >0 => minimal
+  #     reflow from the drift point up (branches below keep their SHAs/PRs).
   if (( ${#survivors[@]} == 0 )); then
     log "${C_DIM}no branches remain under '${prefix}'; nothing to reflow${C_RESET}"
     return 0
   fi
-  if git rev-parse --verify --quiet "origin/${default_branch}^{commit}" >/dev/null 2>&1; then
-    # The base "moved" when origin/<default> is no longer an ancestor of the
-    # bottom survivor (it advanced past where the stack forks from it). A commit
-    # is its own ancestor, so an unmoved base reads as not-moved.
-    local onto_sha base_moved=0
-    onto_sha=$(git rev-parse "origin/${default_branch}")
-    git merge-base --is-ancestor "$onto_sha" "refs/heads/${survivors[0]}" 2>/dev/null || base_moved=1
-
-    # Skip the reflow when nothing requires it: no branches were pruned (a
-    # mid-stack prune can orphan a survivor's predecessor, forcing a reflow even
-    # if the base didn't move) and the base didn't move (the rebase is a no-op).
-    if (( ${#gone[@]} == 0 )) && (( ! base_moved )); then
-      log "${C_DIM}stack already on origin/${default_branch}; skipping reflow${C_RESET}"
+  if [[ -z "$from_idx" ]]; then
+    log "${C_DIM}stack already on ${base_ref:-the base}; skipping reflow${C_RESET}"
+    return 0
+  fi
+  # The up-front snapshot (step 8) already covers this reflow, so suppress the
+  # redundant inner one cmd_restack would take.
+  _SNAPSHOT_SUPPRESS=1
+  if [[ "$from_idx" == 0 ]]; then
+    if [[ -z "$base_ref" ]]; then
+      warn "clean: base unresolved; cannot reflow the whole stack onto a trunk"
       return 0
     fi
-    if (( base_moved )); then
-      # Make the base advance loud: it's the reason the stack is being rewritten.
-      local old_base advanced range=""
-      old_base=$(git merge-base "refs/heads/${survivors[0]}" "$onto_sha" 2>/dev/null || true)
-      if [[ -n "$old_base" ]]; then
-        advanced=$(git rev-list --count "${old_base}..${onto_sha}" 2>/dev/null || echo "?")
-        range=" ${C_DIM}$(git rev-parse --short "$old_base")..$(git rev-parse --short "$onto_sha")${C_RESET} (+${advanced} commit(s))"
-      fi
-      log "${C_YELLOW}base${C_RESET}    origin/${default_branch} moved${range}; restacking ${C_BOLD}${#survivors[@]}${C_RESET} survivor(s) onto it"
+    if (( base_advanced )); then
+      log "${C_YELLOW}base${C_RESET}    ${base_ref} moved${b_range}; restacking ${C_BOLD}${#survivors[@]}${C_RESET} survivor(s) onto it"
     else
-      log "${C_DIM}reflowing ${#survivors[@]} survivor(s) onto origin/${default_branch}...${C_RESET}"
+      log "${C_DIM}reflowing ${#survivors[@]} survivor(s) onto ${base_ref}...${C_RESET}"
     fi
-    cmd_restack --prefix "$prefix" --onto "origin/${default_branch}"
+    cmd_restack --prefix "$prefix" --onto "$base_ref"
   else
-    warn "clean: 'origin/${default_branch}' not found; skipped reflow"
+    if [[ -z "$base_ref" ]]; then
+      warn "clean: base unresolved; re-threaded internally, did not rebase onto a trunk"
+    fi
+    log "${C_DIM}reflowing from ${C_RESET}${C_CYAN}${survivors[$from_idx]}${C_RESET}${C_DIM} up (drift detected)...${C_RESET}"
+    cmd_restack --prefix "$prefix" --from "${survivors[$from_idx]}"
   fi
+  _SNAPSHOT_SUPPRESS=0
+
+  # 12. Advisory only (never mutating): a survivor whose tree now equals its
+  #     predecessor's was absorbed during the reflow. clean deletes by remote-
+  #     gone signal only, so point at doctor/fold rather than dropping it.
+  local adv=() av_i
+  _load_stack_branches "$prefix" adv
+  for ((av_i = 1; av_i < ${#adv[@]}; av_i++)); do
+    if git diff --quiet "refs/heads/${adv[av_i-1]}" "refs/heads/${adv[av_i]}" 2>/dev/null; then
+      log "${C_YELLOW}note${C_RESET}    ${C_CYAN}${adv[av_i]}${C_RESET} is now empty (absorbed into ${C_CYAN}${adv[av_i-1]}${C_RESET}) — run ${C_BOLD}doctor${C_RESET} to drop it, or ${C_BOLD}fold${C_RESET} to collapse"
+    fi
+  done
 }
 
 cmd_rename() {

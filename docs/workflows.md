@@ -28,6 +28,7 @@ Output blocks are captured from real runs; commit SHAs will differ for you.
 | [12](#12-sharing-a-stack-with-someone-else) | Sharing a stack with someone else *(advanced)* |
 | [13](#13-a-branchs-change-is-obsolete-fold-it-away) | A branch's change is obsolete: fold it away |
 | [14](#14-reorganize-a-stack-thats-already-on-github) | Reorganize a stack that's already on GitHub |
+| [15](#15-you-edited-a-mid-stack-branch-by-hand) | You edited a mid-stack branch by hand |
 
 ---
 
@@ -682,3 +683,51 @@ because you have open PRs, this is the workflow it's pointing you at. For the fu
 deletion order — see [pr-sync.md](pr-sync.md#git-stack-pr-desync).
 
 **See also:** [pr-sync.md](pr-sync.md#git-stack-pr-desync) · [reorder branches](#5-the-branches-are-in-the-wrong-order) · [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
+
+---
+
+## 15. You edited a mid-stack branch by hand
+
+**Situation.** You changed a branch in the *middle* of the stack without going
+through `amend` — you committed straight onto `feat/020-login`, cherry-picked a
+hunk into it, or slipped a brand-new branch in below `feat/030-profile`. Whatever
+the route, the branches above are now sitting on a stale parent: `030-profile` no
+longer threads onto the new `020-login`. You don't have to remember which branch
+drifted or which reflow flag to use — reach for `clean`.
+
+```sh
+git stack checkout 20
+# ...commit a fix straight onto feat/020-login (no amend)...
+
+git stack clean
+```
+
+```
+fetching all remotes...
+no local branches under 'feat/' have a gone upstream
+reflowing from feat/030-profile up (drift detected)...
+restack feat/030-profile onto feat/020-login
+done    reflow complete (1 branch restacked)
+```
+
+**What happened.** `clean` walks the stack from the base up and finds the *lowest*
+branch that no longer threads onto its predecessor — here `030-profile`. It
+reflows from there up and leaves everything below untouched, so `010-auth` and
+`020-login` keep their exact SHAs (and any open PRs). The same walk is what
+catches a **moved base** and a freshly **inserted** branch, so `clean` is the
+single "make this stack correct" verb — pruning merged branches, tidying remotes,
+*and* re-threading local drift in one shot. (Before, `clean` only reflowed on a
+prune or a moved base and would no-op here.)
+
+If the hand-edit duplicated work that's already above it, the reflow can hit a
+**conflict** — resolve it and run `git stack continue`, exactly as in
+[scenario 2](#2-review-feedback-lands-on-the-bottom-branch). And if a branch ends
+up empty (its change was fully absorbed by your edit), `clean` says so and points
+at `doctor`/`fold` — it never deletes a branch by content, only by a gone remote.
+
+**No network handy?** `git stack restack` does the same local re-thread without
+the fetch/prune/remote-cleanup — it's the surgical counterpart (and the one to use
+for `--from`, an arbitrary `--onto <ref>`, or `--push`). `clean` is the
+batteries-included version; `restack` is the scalpel.
+
+**See also:** [feedback on the bottom branch](#2-review-feedback-lands-on-the-bottom-branch) · [a branch grew a second commit](#10-a-branch-grew-a-second-commit) · [concepts: reflow](concepts.md#reflow)

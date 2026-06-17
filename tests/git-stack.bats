@@ -416,7 +416,7 @@ HOOK
   git ls-remote --exit-code origin refs/heads/feat/099-orphan
 }
 
-@test "clean: non-TTY declines remote deletion but still reflows survivors" {
+@test "clean: non-TTY declines remote deletion but continues" {
   # NOTE: the accept branch (_confirm -> y -> `git push origin --delete`) is
   # intentionally uncovered here — _confirm reads from /dev/tty, which the bats
   # harness has no controlling terminal for, so it always returns 1 (decline).
@@ -429,11 +429,35 @@ HOOK
   git checkout -q feat/02-b
   # No tty in the test harness -> _confirm returns 1 -> remote deletion skipped.
   run git stack clean --no-color
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"skipped remote deletion"* ]]
-  # Orphan survives on origin; survivors still got reflowed.
+  assert_status 0
+  assert_output_contains "skipped remote deletion"
+  # Orphan survives on origin; the stack is threaded so the reflow is a no-op.
   git ls-remote --exit-code origin refs/heads/feat/099-orphan
-  [[ "$output" == *"reflow"* ]]
+  assert_output_contains "skipping reflow"
+}
+
+@test "clean: bottom PR merged + base advanced reflows survivors onto the new base" {
+  # The bread-and-butter flow (scenario 3/7): the bottom branch merges (so its
+  # local branch goes [gone]) and origin/main advances to include its squashed
+  # content. clean prunes the merged branch and reflows the survivor onto the
+  # advanced base, dropping the now-duplicated bottom commit.
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  # Simulate a squash-merge of feat/01-a into main: a new main commit, then the
+  # branch deleted on origin so it reads [gone] locally.
+  git checkout -q main
+  printf '01-a\n' >> file              # main now carries 01-a's content
+  git add file
+  git commit -q -m "merge 01-a (squashed)"
+  git push -q origin main
+  git push -q origin --delete feat/01-a
+  git fetch -q --prune
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/01-a       # merged branch pruned
+  assert_output_contains "origin/main moved"
+  # Survivor re-rooted directly onto the advanced base, no duplicated 01-a commit.
+  assert_branch_parent_is feat/02-b "$(git rev-parse origin/main)"
 }
 
 @test "clean: skips reflow when nothing pruned and base unchanged" {
@@ -447,21 +471,24 @@ HOOK
   [[ "$output" != *"reflowing"* ]] || { echo "expected no reflow; got:" >&2; echo "$output" >&2; false; }
 }
 
-@test "clean: still reflows after a prune even if base unchanged" {
-  # Guard for the "skip only when nothing pruned" rule: a prune can require a
-  # reflow (a removed middle branch orphans its successor's predecessor), so the
-  # gate must run the reflow whenever anything was pruned — even though
-  # origin/main never moved here.
+@test "clean: a prune that leaves survivors threaded skips the reflow" {
+  # ADR 0007: the ancestor walk is the sole reflow driver, so prune is demoted to
+  # a non-reflow concern. Removing the top branch leaves the survivor still
+  # threaded on the base, so clean prunes but skips the (no-op) reflow rather than
+  # churning every survivor's SHA as the old prune-forces-reflow gate did.
   make_stack_branches feat 01-a 02-b
   make_remote_origin
+  local a_sha
+  a_sha=$(git rev-parse refs/heads/feat/01-a)
   git push -q origin --delete feat/02-b
   git fetch -q --prune
   git checkout -q main
   run git stack clean --prefix feat/ --no-color
   assert_status 0
   assert_branch_absent feat/02-b
-  [[ "$output" != *"skipping reflow"* ]] || { echo "expected a reflow, not a skip:" >&2; echo "$output" >&2; false; }
-  assert_output_contains "reflowing"
+  assert_output_contains "skipping reflow"
+  # Survivor untouched (no churn).
+  assert_sha_eq refs/heads/feat/01-a "$a_sha"
 }
 
 @test "clean: announces a moved base when origin/<default> advanced" {
@@ -505,6 +532,171 @@ HOOK
   run git stack clean --prefix feat/ --dry-run --no-color
   assert_status 0
   assert_output_contains "would skip reflow"
+}
+
+@test "clean: reflows from a drifted mid-stack branch up, lower SHAs preserved" {
+  make_stack_branches feat 01-a 02-b 03-c
+  make_remote_origin
+  git fetch -q --prune
+  local a_sha
+  a_sha=$(git rev-parse refs/heads/feat/01-a)
+  # Edit the middle branch (message-only amend): its tip changes but it stays
+  # threaded on 01-a, so 03-c is no longer threaded on 02-b -> drift at i=2.
+  git checkout -q feat/02-b
+  git commit -q --amend -m "02-b edited"
+  local b_sha_new
+  b_sha_new=$(git rev-parse refs/heads/feat/02-b)
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  # 01-a and 02-b are below/at the drift point -> untouched.
+  assert_sha_eq refs/heads/feat/01-a "$a_sha"
+  assert_sha_eq refs/heads/feat/02-b "$b_sha_new"
+  # 03-c re-threaded onto the new 02-b tip.
+  assert_branch_parent_is feat/03-c "$b_sha_new"
+}
+
+@test "clean: reflows onto a non-default base set via stack.base" {
+  git checkout -q -b develop main
+  git config stack.base develop
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  # Advance the configured base.
+  git checkout -q develop
+  printf 'd\n' >> base.txt
+  git add base.txt
+  git commit -q -m "advance develop"
+  git push -q origin develop
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "origin/develop moved"
+  # Bottom branch re-rooted onto the advanced configured base, not origin/main.
+  assert_branch_parent_is feat/01-a "$(git rev-parse origin/develop)"
+}
+
+@test "clean: offline (no origin) still re-threads internal drift" {
+  make_stack_branches feat 01-a 02-b 03-c
+  # No remote at all — base resolves to the local trunk.
+  git checkout -q feat/02-b
+  git commit -q --amend -m "02-b edited"
+  local b_new
+  b_new=$(git rev-parse refs/heads/feat/02-b)
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_parent_is feat/03-c "$b_new"
+  # Base resolved locally, so no "unresolved" warning.
+  [[ "$output" != *"base unresolved"* ]] || { echo "did not expect unresolved warning:" >&2; echo "$output" >&2; false; }
+}
+
+@test "clean: degenerate base (no trunk) re-threads internally and warns" {
+  make_stack_branches feat 01-a 02-b 03-c
+  git checkout -q feat/02-b
+  git commit -q --amend -m "02-b edited"
+  local b_new
+  b_new=$(git rev-parse refs/heads/feat/02-b)
+  # Drop every resolvable trunk so the i=0 base check is skipped.
+  git checkout -q feat/01-a
+  git branch -q -D main 2>/dev/null || true
+  git branch -q -D master 2>/dev/null || true
+  git config --unset stack.base 2>/dev/null || true
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "base unresolved"
+  assert_branch_parent_is feat/03-c "$b_new"
+}
+
+@test "clean: dirty tree + drift bails before pruning anything" {
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  git push -q origin --delete feat/04-d
+  # Drift among survivors (edit 02-b -> 03-c no longer threaded).
+  git checkout -q feat/02-b
+  git commit -q --amend -m "02-b edited"
+  git fetch -q --prune
+  git checkout -q main
+  # Dirty the working tree.
+  printf 'dirt\n' >> file
+  run git stack clean --prefix feat/ --no-color
+  assert_status 1
+  assert_output_contains "uncommitted changes"
+  # Bailed before any mutation: the gone branch was NOT pruned.
+  assert_branch_exists feat/04-d
+}
+
+@test "clean: dirty tree + prune-only still proceeds" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git push -q origin --delete feat/02-b
+  git fetch -q --prune
+  git checkout -q main
+  printf 'dirt\n' >> file
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_output_contains "skipping reflow"
+}
+
+@test "clean: partial-duplicate drift pauses on conflict; continue completes" {
+  make_stack_branches feat 01-a 02-b 03-c
+  make_remote_origin
+  git fetch -q --prune
+  # Edit 02-b with a conflicting content change so 03-c's pick conflicts.
+  git checkout -q feat/02-b
+  printf '01-a\nchanged-b\n' > file
+  git add file
+  git commit -q --amend -m "02-b changed"
+  local b_new
+  b_new=$(git rev-parse refs/heads/feat/02-b)
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 2
+  assert_output_contains "conflict"
+  # Resolve and resume — clean inherits the reflow's paused path.
+  printf '01-a\nchanged-b\n03-c\n' > file
+  git add file
+  run git stack continue --no-color
+  assert_status 0
+  assert_branch_parent_is feat/03-c "$b_new"
+}
+
+@test "clean: one history restore undoes the prune and the reflow together" {
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  git push -q origin --delete feat/04-d
+  git checkout -q feat/02-b
+  git commit -q --amend -m "02-b edited"
+  local c_old
+  c_old=$(git rev-parse refs/heads/feat/03-c)
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/04-d
+  # One restore brings back the pruned branch AND the pre-reflow 03-c SHA.
+  run git stack history restore @0 --yes --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_exists feat/04-d
+  assert_sha_eq refs/heads/feat/03-c "$c_old"
+}
+
+@test "clean: advises (without deleting) when a branch is absorbed during reflow" {
+  make_stack_branches feat 01-a 02-b 03-c
+  make_remote_origin
+  git fetch -q --prune
+  # Make 02-b absorb exactly what 03-c adds, then drift it: 03-c's pick goes empty.
+  git checkout -q feat/02-b
+  printf '03-c\n' >> file
+  git add file
+  git commit -q --amend -m "02-b absorbs 03-c"
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "is now empty (absorbed into"
+  # Advisory only — never auto-deleted by content signal.
+  assert_branch_exists feat/03-c
 }
 
 # ---------- pr sync ----------
