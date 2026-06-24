@@ -1668,14 +1668,14 @@ $old_footer"
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches the verb map (24, no shell functions)" {
-  # 24 simple aliases; no compound shell functions after the redesign.
+@test "init bash: alias count matches the verb map (25, no shell functions)" {
+  # 25 simple aliases; no compound shell functions after the redesign.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count func_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk' || true)
   func_count=$(printf '%s\n' "$output" | grep -c '^gstk.*()' || true)
-  [ "$alias_count" -eq 24 ]
+  [ "$alias_count" -eq 25 ]
   [ "$func_count" -eq 0 ]
 }
 
@@ -2628,6 +2628,265 @@ $old_footer"
   assert_branch_exists feat/010-merged
   assert_output_contains "010-merged"
   assert_output_contains "doctor"
+}
+
+# ---------- drop ----------
+
+# Build a stack whose branches touch separate files, so reflowing a child past
+# a dropped branch does not conflict on shared context.
+make_disjoint_stack() {
+  local prefix="$1"; shift
+  local leaf
+  for leaf in "$@"; do
+    git checkout -q -b "${prefix}/${leaf}"
+    printf '%s\n' "$leaf" > "${leaf}-file"
+    git add "${leaf}-file"
+    git commit -q -m "$leaf"
+  done
+}
+
+@test "drop: middle branch is discarded; child reflows onto predecessor" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  local pred_sha
+  pred_sha=$(git rev-parse feat/01-a)
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/03-c
+  # 03-c re-threads onto the predecessor (01-a), discarding 02-b's commit.
+  assert_branch_parent_is feat/03-c "$pred_sha"
+  # 03-c keeps its own file but 02-b's work is gone from its tree.
+  assert git cat-file -e "feat/03-c:03-c-file"
+  refute git cat-file -e "feat/03-c:02-b-file"
+}
+
+@test "drop: bottom branch is discarded; child reflows onto base" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  local base_sha
+  base_sha=$(git rev-parse main)
+  run git stack drop feat/01-a --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/01-a
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+  # 02-b re-threads onto base (main), discarding 01-a's commit.
+  assert_branch_parent_is feat/02-b "$base_sha"
+  refute git cat-file -e "feat/02-b:01-a-file"
+  assert git cat-file -e "feat/03-c:03-c-file"
+}
+
+@test "drop: tip branch is a pure delete; HEAD lands on predecessor" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  local pred_sha
+  pred_sha=$(git rev-parse feat/02-b)
+  run git stack drop feat/03-c --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/03-c
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/02-b
+  # No reflow — the survivors are untouched and HEAD lands on the predecessor.
+  assert_sha_eq feat/02-b "$pred_sha"
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" "feat/02-b"
+}
+
+@test "drop: lone branch is deleted; HEAD lands on base, stack empty" {
+  make_disjoint_stack feat 01-a
+  run git stack drop feat/01-a --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/01-a
+  # Stack is empty and HEAD lands on the base branch.
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" "main"
+}
+
+@test "drop: run from a different branch leaves HEAD on that (reflowed) branch" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  # Stand on the tip, drop a middle branch below us.
+  git checkout -q feat/03-c
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  # HEAD returns to 03-c, which was reflowed onto 01-a.
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" "feat/03-c"
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+}
+
+@test "drop: child-reflow conflict halts; continue completes the reflow" {
+  # Shared-file stack: dropping 02-b and replaying 03-c onto 01-a conflicts
+  # because 03-c's commit expected 02-b's line as context.
+  make_stack_branches feat 01-a 02-b 03-c
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 2
+  assert_output_contains "conflict"
+
+  # Resolve: keep 01-a and 03-c's lines, drop 02-b's.
+  printf '01-a\n03-c\n' > file
+  git add file
+  run git stack continue --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_exists feat/01-a
+  assert_branch_exists feat/03-c
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+}
+
+@test "drop: abort after a child-reflow conflict restores children and clears state" {
+  make_stack_branches feat 01-a 02-b 03-c
+  local sha_01 sha_03
+  sha_01=$(git rev-parse feat/01-a)
+  sha_03=$(git rev-parse feat/03-c)
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 2
+
+  run git stack abort --no-color
+  assert_status 0
+  # The engine restores the reflowed children to their original SHAs. The
+  # victim stays deleted (abort resets STACK_BRANCHES only; full undo is via
+  # 'history restore', covered by the snapshot round-trip test).
+  assert_sha_eq feat/01-a "$sha_01"
+  assert_sha_eq feat/03-c "$sha_03"
+  # State file gone — continue should now fail.
+  run git stack continue --no-color
+  assert_status 1
+}
+
+@test "drop: multi-commit child without --force dies; --force replays tip only" {
+  # Build 01-a, 02-b, then a child 03-c carrying TWO commits beyond 02-b.
+  make_disjoint_stack feat 01-a 02-b
+  git checkout -q -b feat/03-c
+  printf 'c1\n' > c1-file && git add c1-file && git commit -q -m '03-c part 1'
+  printf 'c2\n' > c2-file && git add c2-file && git commit -q -m '03-c part 2'
+
+  # Without --force: the tip-only reflow would drop all but the tip → refuse.
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 1
+  assert_output_contains "commits beyond"
+  assert_branch_exists feat/02-b
+
+  # With --force: tip-only replay onto the predecessor succeeds.
+  run git stack drop feat/02-b --yes --force --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+  # Tip replayed; the non-tip commit's file is lost (documented --force cost).
+  assert git cat-file -e "feat/03-c:c2-file"
+  refute git cat-file -e "feat/03-c:c1-file"
+}
+
+@test "drop: refuses when the victim has an open PR, pointing at pr desync" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_b__NUM=42
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 1
+  assert_output_contains "pr desync"
+  # Hard block: nothing dropped.
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+}
+
+@test "drop: an open PR on a child does NOT block the drop" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  # The PR is on the child, not the victim — the gate inspects the victim only.
+  export GH_PR_feat_03_c__NUM=43
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
+}
+
+@test "drop: is fully local — no PR mutations, orphaned remote left intact" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  # No PR create/edit/close and no remote branch rename/delete.
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
+  # The victim's remote branch is left orphaned for a later 'clean' to reap.
+  run git ls-remote --heads origin feat/02-b
+  assert_output_contains "feat/02-b"
+}
+
+@test "drop: a child that goes content-empty after reflow earns an advisory, not a delete" {
+  # 03-c's tip reverts 02-b's change, so replaying it onto 01-a is a no-op →
+  # 03-c becomes tree-equal to 01-a (absorbed).
+  git checkout -q -b feat/01-a
+  printf 'common\n' > file && git add file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'common\nb\n' > file && git add file && git commit -q -m '02-b'
+  git checkout -q -b feat/03-c
+  printf 'common\n' > file && git add file && git commit -q -m '03-c reverts b'
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_output_contains "is now empty (absorbed into"
+  # Advisory only — never auto-deleted by content signal.
+  assert_branch_exists feat/03-c
+}
+
+@test "drop: newest snapshot restores the dropped branch" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  local orig_b
+  orig_b=$(git rev-parse feat/02-b)
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  # The pre-drop snapshot is the newest (@0); restoring it brings the victim
+  # back at its original SHA.
+  git checkout -q main
+  run git stack history restore @0 --yes --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_exists feat/02-b
+  assert_sha_eq feat/02-b "$orig_b"
+}
+
+@test "drop --dry-run: previews the plan and mutates nothing" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  local before_a before_b before_c
+  before_a=$(git rev-parse feat/01-a)
+  before_b=$(git rev-parse feat/02-b)
+  before_c=$(git rev-parse feat/03-c)
+  run git stack drop feat/02-b --dry-run --no-color
+  assert_status 0
+  assert_output_contains "02-b"
+  assert_output_contains "reflow 1 child"
+  # Nothing mutated.
+  assert_branch_exists feat/02-b
+  assert_sha_eq feat/01-a "$before_a"
+  assert_sha_eq feat/02-b "$before_b"
+  assert_sha_eq feat/03-c "$before_c"
+}
+
+@test "drop: non-TTY without --yes refuses and mutates nothing" {
+  make_disjoint_stack feat 01-a 02-b
+  run git stack drop feat/02-b --no-color
+  assert_status 1
+  assert_output_contains "--yes"
+  assert_branch_exists feat/02-b
+}
+
+@test "drop: refuses on a dirty working tree and mutates nothing" {
+  make_disjoint_stack feat 01-a 02-b
+  printf 'dirty\n' >> 02-b-file
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 1
+  assert_branch_exists feat/02-b
+}
+
+@test "drop: with no argument targets the current branch" {
+  make_disjoint_stack feat 01-a 02-b 03-c
+  git checkout -q feat/02-b
+  run git stack drop --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_parent_is feat/03-c "$(git rev-parse feat/01-a)"
 }
 
 # ---------- doctor ----------

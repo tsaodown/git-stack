@@ -2156,6 +2156,23 @@ ${b}Branch-level subcommands:${r}
                                     then deletes the remote victim, re-syncs PRs,
                                     and breadcrumbs the closed PR to the
                                     superseding one. ${fl}--dry-run${r} previews.
+  ${sub}drop${r} [<branch>] [${fl}--force${r}] [${fl}--dry-run${r}] [${fl}--yes${r}]
+                                    Discard a branch and reflow its children onto
+                                    its predecessor — the destructive sibling of
+                                    ${sub}fold${r} (fold keeps the diff; ${sub}drop${r} throws it
+                                    away). Defaults to the current branch. Degrades
+                                    at every position: middle → children onto the
+                                    predecessor; bottom → onto base; tip → pure
+                                    delete; lone → delete + land on base. Children
+                                    are cherry-picked tip-only, so one that built
+                                    on the dropped work surfaces a normal conflict
+                                    to resolve and ${sub}continue${r}; ${fl}--force${r} waives the
+                                    multi-commit guard. Fully local (no push/
+                                    rename/${sub}pr sync${r}). Destructive: snapshots first
+                                    (undo via ${sub}history restore${r}), refuses a dirty
+                                    tree, needs ${fl}--yes${r} off a TTY. Refuses only when
+                                    the victim has an open PR (run ${sub}pr desync${r}
+                                    first). ${fl}--dry-run${r} previews.
   ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}]
           [${fl}--no-rename${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
                                     Detect and offer to fix problems in the
@@ -5021,6 +5038,214 @@ fold: no <branch> given and HEAD is detached"
   _doctor_finish "$prefix" "$((survivor_post_idx + 1))" "${post[@]}"
 }
 
+# Discard a branch's diff and reflow its children onto the predecessor — the
+# destructive sibling of fold (fold keeps the work; drop throws it away). Fully
+# local (ADR 0008): no push / rename / pr sync; the orphaned remote is left for
+# a later clean to reap. Carries fold's destructive ceremony and move's
+# multi-commit pre-check / STACK_FORCE.
+cmd_drop() {
+  OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0
+  local victim_arg="" opt_force=0 opt_dry_run=0 opt_yes=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then shift "$_FLAG_SHIFT"; continue; fi
+    case "$1" in
+      --force)   opt_force=1; shift ;;
+      --dry-run) opt_dry_run=1; shift ;;
+      --yes|-y)  opt_yes=1; shift ;;
+      -*)        die "unknown drop flag: $1" ;;
+      *)         [[ -z "$victim_arg" ]] || die "drop: extra arg '$1'"; victim_arg="$1"; shift ;;
+    esac
+  done
+
+  require_in_repo
+  require_clean_tree
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+  _require_valid_leaf_nums "${branches[@]}"
+
+  # Default victim to the current branch.
+  if [[ -z "$victim_arg" ]]; then
+    victim_arg=$(current_branch) \
+      || die "usage: git stack drop [<branch>] [--force] [--dry-run] [--yes]
+drop: no <branch> given and HEAD is detached"
+  fi
+  local victim rc=0
+  victim=$(_resolve_branch_ref "$victim_arg" "${branches[@]}") || rc=$?
+  (( rc == 0 )) || die "drop: '$victim_arg' not in stack '$prefix'"
+  local victim_idx
+  victim_idx=$(branch_index "$victim" "${branches[@]}")
+
+  local n=${#branches[@]}
+  local n_children=$(( n - 1 - victim_idx ))
+
+  # Resolve the landing ref for the children + HEAD: the predecessor branch, or
+  # the base when the victim is the bottom (or lone) branch.
+  local pred_ref pred_label is_base=0
+  if (( victim_idx == 0 )); then
+    local parent_name
+    parent_name=$(_resolve_parent_name) \
+      || die "drop: cannot determine parent branch (set stack.base or create main/master)"
+    pred_ref=$(_resolve_parent_ref "$parent_name") \
+      || die "drop: cannot resolve parent ref for '$parent_name'"
+    pred_label="$parent_name"
+    is_base=1
+  else
+    pred_label="${branches[$((victim_idx - 1))]}"
+    pred_ref="refs/heads/${pred_label}"
+  fi
+
+  # Dry run: describe the plan (victim, landing ref, child count, PR-gate
+  # forecast) and stop before any mutation — always previews, even when a
+  # multi-commit child would later force the run. No --yes / TTY needed.
+  if (( opt_dry_run )); then
+    log "${C_BOLD}dry run${C_RESET}: would drop ${C_BOLD}${C_CYAN}${victim}${C_RESET} (discards its work)"
+    if (( n_children > 0 )); then
+      log "  ${C_DIM}reflow ${n_children} child(ren) onto ${pred_label}${C_RESET}"
+    else
+      log "  ${C_DIM}no children — pure delete; HEAD lands on ${pred_label}${C_RESET}"
+    fi
+    if _check_no_open_prs "$victim"; then
+      log "  ${C_YELLOW}would refuse: ${victim} has open PR #${_ORPHAN_PR_NUM}${C_RESET} (run 'pr desync' first)"
+    fi
+    log "  ${C_DIM}rerun without --dry-run to apply${C_RESET}"
+    return 0
+  fi
+
+  # Multi-commit pre-check: each reflowed child must be ≤1 commit beyond its
+  # *current* predecessor (the same shape move uses), else its tip-only reflow
+  # would silently drop all but the tip. --force waives. The victim itself is
+  # discarded wholesale, so it needs no guard.
+  if (( ! opt_force )); then
+    local i pb cnt_b cnt_prev nc
+    for ((i = victim_idx + 1; i < n; i++)); do
+      pb="${branches[$i]}"
+      cnt_b=$(git rev-list --count "refs/heads/$pb" 2>/dev/null || echo 0)
+      cnt_prev=$(git rev-list --count "refs/heads/${branches[$((i - 1))]}" 2>/dev/null || echo 0)
+      nc=$((cnt_b - cnt_prev))
+      if (( nc > 1 )); then
+        die "branch '$pb' has $nc commits beyond its current predecessor; drop would reflow it tip-only and lose all but the tip. Pass --force to proceed (cherry-picks tip only) or rebase the branch manually first."
+      fi
+    done
+  fi
+
+  # PR gate — victim only. Deleting the victim's head branch closes its PR on
+  # GitHub with no reattach and (unlike fold) no superseding PR to breadcrumb
+  # to. Children keep their names, so their PRs survive a later 'pr sync' and
+  # pass through ungated. Checked unconditionally (like move); the only escape
+  # is the desync workflow.
+  if _check_no_open_prs "$victim"; then
+    die "drop: '${victim}' has an open PR (#${_ORPHAN_PR_NUM}); deleting its head branch closes the PR on GitHub with no reattach and no superseding PR to breadcrumb to. Run 'git stack pr desync' to take the stack offline first, then 'git stack drop', then 'git stack pr sync' to re-publish cleanly."
+  fi
+
+  # Destructive op: confirm on a TTY, refuse non-interactively without --yes.
+  if (( ! opt_yes )); then
+    if [[ -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
+      local _v="${victim#"$prefix"}" _p="${pred_label#"$prefix"}"
+      local _hl="${C_RESET}${C_BOLD}${C_CYAN}" _fr="${C_RESET}${C_DIM}"
+      if (( n_children > 0 )); then
+        printf '%sdrop %s%s%s\n  discards its work; reflow %d child(ren) onto %s%s%s. proceed?%s [Y/n] ' \
+          "$C_DIM" "$_hl" "$_v" "$_fr" "$n_children" "$_hl" "$_p" "$_fr" "$C_RESET" >&2
+      else
+        printf '%sdrop %s%s%s\n  discards its work (pure delete). proceed?%s [Y/n] ' \
+          "$C_DIM" "$_hl" "$_v" "$_fr" "$C_RESET" >&2
+      fi
+      local _ans
+      read -r _ans < /dev/tty || die "drop: aborted"
+      _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')
+      [[ "${_ans:0:1}" == "n" ]] && die "drop: aborted"
+    else
+      die "drop: refusing to drop '${victim}' non-interactively; pass --yes"
+    fi
+  fi
+
+  # Snapshot the full pre-drop state (including the victim, which we delete
+  # below) so 'history restore' can undo the whole drop. This single snapshot is
+  # the restore point.
+  snapshot_stack drop "$prefix" "${branches[@]}"
+
+  # If HEAD is on the victim, move off it to the landing ref before we delete it
+  # — both so the delete succeeds and so the engine's end-of-run restore (to
+  # STACK_STARTING_BRANCH, captured just below) lands on the predecessor/base.
+  # When HEAD is on another branch, leave it: that branch reflows and HEAD
+  # returns to it.
+  local cur
+  cur=$(current_branch 2>/dev/null || echo "")
+  if [[ "$cur" == "$victim" ]]; then
+    if (( is_base )) && ! git rev-parse --verify --quiet "refs/heads/${pred_label}" >/dev/null; then
+      git checkout --quiet --detach "$pred_ref"
+    else
+      git checkout --quiet "$pred_label"
+    fi
+  fi
+  git update-ref -d "refs/heads/${victim}"
+
+  log "${C_GREEN}done${C_RESET}    dropped ${C_BOLD}${C_CYAN}${victim}${C_RESET}"
+
+  # Reflow the children onto the landing ref via the resumable engine. Build the
+  # plan inline (reflow-pick only, no remote phase) — unlike fold, the bottom
+  # case reflows the first child at post-index 0, which needs STACK_ONTO set to
+  # the base (something _doctor_finish never does).
+  if (( n_children > 0 )); then
+    local post=() i
+    for ((i = 0; i < n; i++)); do
+      (( i == victim_idx )) && continue
+      post+=("${branches[$i]}")
+    done
+    local first_affected=$victim_idx   # children start here in post-space
+
+    STACK_BRANCHES=("${post[@]}")
+    STACK_ORIG_SHAS=()
+    for ((i = 0; i < ${#STACK_BRANCHES[@]}; i++)); do
+      if (( i >= first_affected )); then
+        STACK_ORIG_SHAS+=("$(git rev-parse "refs/heads/${STACK_BRANCHES[$i]}")")
+      else
+        STACK_ORIG_SHAS+=("")
+      fi
+    done
+    STACK_STARTED_AT=$(date +%s)
+    STACK_STARTING_BRANCH=$(current_branch 2>/dev/null || echo "")
+    STACK_PREFIX="$prefix"
+    STACK_PUSH=0
+    # move's pre-check verified each child is ≤1 commit beyond its current
+    # predecessor; do_one_step's guard compares against the *new* predecessor,
+    # which false-positives because the child's history still contains the
+    # dropped branch's commit. STACK_FORCE=1 suppresses that guard.
+    STACK_FORCE=1
+    STACK_ONTO=""
+    STACK_ONTO_REF=""
+    STACK_FROM_IDX="$first_affected"
+    STACK_PUSH_FAILURES=()
+    STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
+    STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
+    if (( first_affected == 0 )); then
+      STACK_ONTO=$(git rev-parse "$pred_ref")
+      STACK_ONTO_REF="$pred_label"
+    fi
+    STACK_PHASES=(reflow-pick)
+    STACK_PHASE_IDX=0
+    STACK_UNIT_IDX=0
+    save_engine_state
+    _engine_run
+  fi
+
+  # Advisory only (never mutating): a survivor whose tree now equals its
+  # predecessor's was absorbed during the reflow. drop deletes exactly the one
+  # named branch — never a second one by content — so point at doctor/fold.
+  local adv=() av_i
+  _load_stack_branches "$prefix" adv
+  for ((av_i = 1; av_i < ${#adv[@]}; av_i++)); do
+    if git diff --quiet "refs/heads/${adv[av_i-1]}" "refs/heads/${adv[av_i]}" 2>/dev/null; then
+      log "${C_YELLOW}note${C_RESET}    ${C_CYAN}${adv[av_i]}${C_RESET} is now empty (absorbed into ${C_CYAN}${adv[av_i-1]}${C_RESET}) — run ${C_BOLD}doctor${C_RESET} to drop it, or ${C_BOLD}fold${C_RESET} to collapse"
+    fi
+  done
+}
+
 cmd_doctor() {
   OPT_PREFIX=""; OPT_NO_SYNC=0; OPT_NO_PUSH=0; OPT_FORCE=0
   STACK_SUPPRESS_REFLOW_SNAPSHOT=0
@@ -6659,6 +6884,7 @@ _complete_verbs() {
     rename    "Rename every branch in the stack to a new prefix" \
     move      "Move a branch to a different position in the stack" \
     fold      "Fold one branch's commits into another" \
+    drop      "Discard a branch and reflow its children onto the predecessor" \
     doctor    "Diagnose stack health"
 }
 
@@ -6750,6 +6976,7 @@ alias gstkhs='git stack history show'
 alias gstkhr='git stack history restore'
 alias gstkmv='git stack move'
 alias gstkfo='git stack fold'
+alias gstkdr='git stack drop'
 alias gstkrn='git stack rename'
 alias gstkd='git stack doctor'
 POSIX_EOF
@@ -6781,6 +7008,7 @@ abbr -a -g gstkhs git stack history show
 abbr -a -g gstkhr git stack history restore
 abbr -a -g gstkmv git stack move
 abbr -a -g gstkfo git stack fold
+abbr -a -g gstkdr git stack drop
 abbr -a -g gstkrn git stack rename
 abbr -a -g gstkd git stack doctor
 FISH_EOF
@@ -6845,6 +7073,7 @@ _git-stack() {
   # Positional dispatch keyed on the verb.
   case ${words[2]} in
     checkout|co) _gs_leaves; return ;;
+    drop) _gs_leaves; return ;;
     view) _gs_complete prefixes; _describe -t prefixes 'prefix' _gs_items; return ;;
     pr|history)
       if (( CURRENT == 3 )); then
@@ -6881,12 +7110,13 @@ _emit_completion_fish() {
 complete -c git-stack -f
 complete -c git-stack -n 'contains -- -- (commandline -xpc)' -F
 # Top-level verbs: only when no verb has been typed yet.
-complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcommand_from list view pick checkout co create add sync clean restack amend continue abort pr history rename move mv fold doctor' -a '(git stack __complete verbs)'
+complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcommand_from list view pick checkout co create add sync clean restack amend continue abort pr history rename move mv fold drop doctor' -a '(git stack __complete verbs)'
 # Sub-verbs.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from pr' -a '(git stack __complete subverbs pr)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from history' -a '(git stack __complete subverbs history)'
 # checkout → leaves; view → prefixes.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from checkout co' -a '(git stack __complete leaves)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from drop' -a '(git stack __complete leaves)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from view' -a '(git stack __complete prefixes)'
 # Option-value slots (-x binds the candidates to the option's argument).
 complete -c git -n '__fish_git_using_command stack' -l prefix -x -a '(git stack __complete prefixes)'
@@ -6936,6 +7166,7 @@ main() {
     rename)            shift; cmd_rename "$@" ;;
     move|mv)           shift; cmd_move "$@" ;;
     fold)              shift; cmd_fold "$@" ;;
+    drop)              shift; cmd_drop "$@" ;;
     doctor)            shift; cmd_doctor "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;

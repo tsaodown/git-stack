@@ -268,6 +268,32 @@ chain, and breadcrumbs the closed PR to the superseding one (ADR 0003).
 _Avoid_: "squash"/"absorb" — **doctor** already owns those words (the
 multi-commit fix and the tree-equals-predecessor case, respectively).
 
+**drop** `[branch]`:
+**Discard** a branch and reflow its children onto its **predecessor** — the
+destructive sibling of **fold** (fold *keeps* the branch's diff by squashing it
+into a neighbor; `drop` *throws it away*). Reflows children tip-only via the
+**reflow-pick** phase, so a child that built on the dropped branch surfaces a
+normal **conflict** to resolve and `continue`. Optional leaf/name, defaults to
+the current branch, single target. Degrades cleanly at every position: middle →
+children onto **predecessor**; bottom → children onto **base**; tip → pure
+delete; **lone branch → delete + land on base** (not deferred to **clean**,
+which only prunes `[gone]` branches, never a live lone one). HEAD lands on the
+predecessor (base when bottom/lone). Destructive: snapshots first (undo via
+`history restore`), refuses a dirty tree, prompts `[Y/n]` (default yes), needs
+`--yes` off a TTY. Carries **fold**'s ceremony and **move**'s multi-commit
+handling — pre-checks each child is ≤1 commit beyond its current predecessor
+(`--force` waives), then forces the engine guard. **Fully local** (ADR 0008,
+like **move**): no push/rename/`pr sync`, leaves the orphaned remote for
+**clean** to reap. PR gate is narrower than move's — `drop` does *not* rename
+children, so their PRs survive a later `pr sync`; only the **victim**'s head-PR
+closes irreversibly (no superseding PR to breadcrumb to). So it refuses only
+when the **victim** has an open PR, pointing at the **pr desync** → drop →
+**pr sync** trio. A child that goes content-empty after the reflow earns a
+**non-mutating advisory** (→ `doctor`/`fold`); `drop` deletes only the named
+branch, never by content (ADR 0008).
+_Avoid_: "remove"/"delete" (the generic words — **clean** already "removes"
+`[gone]` branches; `drop` discards a live branch's work).
+
 `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
 and `pr sync` / `pr list` keep their current meanings. **move** is **fully
 local** — it reorders/renumbers branches touching only local refs, never pushing
@@ -288,8 +314,8 @@ than a bare unknown-subcommand.
 ### Aliases
 
 `gstkcr` create · `gstkad` add · `gstkp` pick · `gstkl` list · `gstkv` view ·
-`gstkco` checkout · `gstks` sync · `gstkcl` clean · `gstkab` abort ·
-`gstkcon` continue. Dropped: `gstkn` (was new), `gstkpa` (push --all),
+`gstkco` checkout · `gstks` sync · `gstkcl` clean · `gstkdr` drop ·
+`gstkab` abort · `gstkcon` continue. Dropped: `gstkn` (was new), `gstkpa` (push --all),
 `gstkrom`/`gstkromp`, and the `gstkcl` *shell function* (now the `clean` verb).
 `gstkp` moves from push to pick; `gstks` moves from status to sync.
 
