@@ -489,7 +489,7 @@ branch accumulates more than one commit, a plain `restack` refuses rather than
 silently dropping work:
 
 ```
-git-stack: error: branch 'feat/030-profile' has 2 commits beyond its predecessor; restack would drop all but the tip. Pass --force to proceed (cherry-picks tip only) or rebase the branch manually first.
+git-stack: error: branch 'feat/030-profile' has 2 commit(s) beyond its predecessor; restack would drop all but the tip. Squash/rebase 'feat/030-profile' to a single commit and retry, or pass --force to cherry-pick the tip and deliberately drop them.
 ```
 
 **How to navigate it.** You have three options:

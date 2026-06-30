@@ -226,6 +226,18 @@ reflow so a single `history restore` undoes both (local refs only — remote
 deletions stay deleted). A branch that goes content-empty during the reflow
 (absorbed into its predecessor) earns a **non-mutating advisory** pointing at
 `doctor`/`fold` — `clean` deletes by remote-gone signal only, never by content.
+
+A survivor that still threads a just-pruned (merged) range reads to the reflow
+engine as a **multi-commit branch** and would trip the guard (a merge-queue
+squash-down leaves this shape: the top PR's branch still carries the merged
+middle). `clean` auto-resolves it (ADR 0009): it passes the pruned SHAs as the
+engine's **safe-to-drop set**, and a survivor whose only extra commits — measured
+against its *original* predecessor — are in that set is cherry-picked tip-only,
+dropping the proven-merged ancestors (`absorb … tip-only restack`). A survivor
+with extras it can't prove merged (genuinely unmerged own work) makes `clean`
+**refuse atomically in the pre-flight**, before any prune — pointing at
+squash/rebase-then-retry, with `restack --onto <base> --force` as the explicit
+deliberate-drop escape. There is no `clean --force`; force stays in `restack`.
 Replaces `close` and the `gstkcl`/`gstkrom`/`gstkromp` shell helpers.
 _Avoid_: "close" (the prune-only predecessor).
 
@@ -355,7 +367,11 @@ One adapter in a **plan**, satisfying a three-operation contract — `advance`
 (do one unit; report `unit-done` / `paused` / `phase-complete`), `resume`
 (finish an in-flight unit, then advance), `abort` (undo this phase's effects as
 far as it can). Phase types: **reflow-pick** (cherry-pick one branch;
-can pause on **conflict**; carries an **absorbed-policy**), **rename-batch**
+can pause on **conflict**; carries an **absorbed-policy**, and consults a
+**safe-to-drop set** — commit SHAs a caller proved merged, so a multi-commit
+branch whose only extras-over-its-original-predecessor are in that set is
+cherry-picked tip-only instead of refused; `clean` populates it from the gone
+branches it pruned, ADR 0009), **rename-batch**
 (atomic local ref rename), **remote-sync** (remote rename + PR sync; idempotent —
 used by **rename**/**fold**/**doctor**, but *not* **move**, which is fully local;
 ADR 0006). _Avoid_: step, stage, pass.

@@ -66,6 +66,9 @@ color_init() {
 #   STACK_PREFIX           stack prefix, including trailing /
 #   STACK_PUSH             1 if --push, else 0
 #   STACK_FORCE            1 if --force (allow multi-commit branches), else 0
+#   STACK_SAFE_DROP        commit SHAs the engine may drop during a tip-only
+#                          cherry-pick without --force — commits proven merged
+#                          (clean populates from the gone branches it pruned)
 #   STACK_FROM_IDX         index of the bottom branch we touch
 #   STACK_ONTO             resolved SHA of --onto target (if any)
 #   STACK_ONTO_REF         original --onto ref name (for display)
@@ -81,6 +84,7 @@ STACK_STARTING_BRANCH=""
 STACK_PREFIX=""
 STACK_PUSH=0
 STACK_FORCE=0
+STACK_SAFE_DROP=()
 STACK_FROM_IDX=0
 STACK_ONTO=""
 STACK_ONTO_REF=""
@@ -99,6 +103,11 @@ STACK_RENAME_PAIRS=()       # alternating old/new branch names for rename-batch
 STACK_FOLD_VICTIM=""        # fold: remote branch to delete + breadcrumb in remote-sync
 STACK_FOLD_SURVIVOR_NEW=""  # fold: survivor's (post-fold) name, for the breadcrumb target
 _PHASE_OUTCOME=""           # set by a phase op: unit-done|phase-complete|paused
+
+# Side channel: a caller (clean) sets this to the safe-to-drop SHA set before
+# invoking cmd_restack, which transfers it into STACK_SAFE_DROP and clears it so
+# it never leaks into an unrelated reflow.
+REFLOW_SAFE_DROP=()
 
 # ---------- helpers ----------
 
@@ -496,6 +505,7 @@ load_state() {
   STACK_BRANCHES=()
   STACK_ORIG_SHAS=()
   STACK_PUSH_FAILURES=()
+  STACK_SAFE_DROP=()
   STACK_PHASES=()
   STACK_PHASE_IDX=0
   STACK_UNIT_IDX=0
@@ -769,6 +779,7 @@ save_engine_state() {
     _emit_array STACK_ORIG_SHAS STACK_ORIG_SHAS
     _emit_array STACK_PUSH_FAILURES STACK_PUSH_FAILURES
     _emit_array STACK_RENAME_PAIRS STACK_RENAME_PAIRS
+    _emit_array STACK_SAFE_DROP STACK_SAFE_DROP
   } > "$out"
 }
 
@@ -1105,6 +1116,27 @@ _engine_finalize() {
 
 # Reflow the branch at index $1.
 # Return 0 on success, 2 on cherry-pick conflict.
+# Decide whether a tip-only cherry-pick of <head> drops only safe commits.
+# <anchor> is <head>'s ORIGINAL predecessor tip (pre-reflow): everything between
+# it and <head>, minus <head>'s own tip, is the work that would be dropped.
+# `--not <safe-drop tips>` removes the commits the caller proved merged AND their
+# ancestors — so a survivor that threads only just-pruned branches collapses to
+# exactly its tip. Safe iff nothing but the tip remains. Anchoring on the
+# *original* predecessor (not the restacked one) keeps this immune to patch
+# changes from conflict resolution. With no safe-drop tips, any extra commit is
+# unsafe (the empty set never auto-resolves). Returns 0 if safe, 1 otherwise.
+_reflow_own_only() {
+  local anchor="$1" head="$2"; shift 2
+  local head_sha leftover
+  head_sha=$(git rev-parse "$head" 2>/dev/null) || return 1
+  if (( $# > 0 )); then
+    leftover=$(git rev-list "${anchor}..${head}" --not "$@" 2>/dev/null)
+  else
+    leftover=$(git rev-list "${anchor}..${head}" 2>/dev/null)
+  fi
+  [[ "$leftover" == "$head_sha" ]]
+}
+
 do_one_step() {
   local cursor=$1
   local B="${STACK_BRANCHES[$cursor]}"
@@ -1159,7 +1191,22 @@ do_one_step() {
   count_b=$(git rev-list --count "$B_orig" 2>/dev/null || echo 0)
   n_commits=$((count_b - count_prev))
   if (( n_commits > 1 )) && (( ! STACK_FORCE )); then
-    die "branch '$B' has $n_commits commits beyond its predecessor; restack would drop all but the tip. Pass --force to proceed (cherry-picks tip only) or rebase the branch manually first."
+    # Auto-resolve the proven-merged case before refusing. B's "own" commits are
+    # those above its ORIGINAL predecessor (prev_orig in-stack, or the fork point
+    # with the onto-base); everything else it threads is predecessor territory
+    # the reflow supersedes. If, after excluding the just-pruned merged branches
+    # (STACK_SAFE_DROP), B has only its tip left, tip-only is safe.
+    local own_base
+    if [[ -n "$prev_orig" ]]; then
+      own_base="$prev_orig"
+    else
+      own_base=$(git merge-base "$B_orig" "$prev_new" 2>/dev/null || echo "")
+    fi
+    if [[ -n "$own_base" ]] && _reflow_own_only "$own_base" "$B_orig" ${STACK_SAFE_DROP[@]+"${STACK_SAFE_DROP[@]}"}; then
+      log "${C_YELLOW}absorb${C_RESET}  ${C_CYAN}$B${C_RESET} ${C_DIM}tip-only restack, dropping $((n_commits - 1)) superseded commit(s)${C_RESET}"
+    else
+      die "branch '$B' has $n_commits commit(s) beyond its predecessor; restack would drop all but the tip. Squash/rebase '$B' to a single commit and retry, or pass --force to cherry-pick the tip and deliberately drop them."
+    fi
   fi
 
   # Skip when B's tip already equals the new predecessor head — nothing to
@@ -2932,12 +2979,13 @@ cmd_clean() {
     fi
   done
 
-  local stdin="" sha
+  local stdin="" sha gone_shas=()
   if (( ${#gone[@]} > 0 )); then
     for b in "${gone[@]}"; do
       [[ "$b" == "$current" ]] && die "branch '$b' is current HEAD; checkout away first"
       require_branch_not_in_worktree "$b"
       sha=$(git rev-parse "refs/heads/$b")
+      gone_shas+=("$sha")
       stdin+="delete refs/heads/${b} ${sha}"$'\n'
     done
     local removed_history=0
@@ -3022,6 +3070,40 @@ cmd_clean() {
     fi
   fi
 
+  # Pre-flight resolvability: a survivor we'd reflow may thread commits beyond its
+  # predecessor. Those are safe to drop only when they're branches clean just
+  # pruned (merged). Detect an *unmergeable* extra here — current SHAs vs the gone
+  # set — so the run refuses atomically (before prune/snapshot) instead of dying
+  # mid-reflow. Mirrors the engine's multi-commit guard; the engine stays the
+  # backstop for restack/move/drop. (Extras shared with the predecessor are
+  # masked, but those are either merged-safe or the predecessor's own problem;
+  # an unmerged commit unique to this survivor is never in the predecessor.)
+  local pf_msg="" pf_i pf_pred pf_s pf_total pf_collapse=()
+  if [[ -n "$from_idx" ]]; then
+    for ((pf_i = from_idx; pf_i < ${#survivors[@]}; pf_i++)); do
+      if (( pf_i == 0 )); then
+        [[ -n "$base_ref" ]] || continue
+        pf_pred="$base_ref"
+      else
+        pf_pred="refs/heads/${survivors[$((pf_i - 1))]}"
+      fi
+      pf_s="refs/heads/${survivors[$pf_i]}"
+      # Gate on the engine's own multi-commit condition (reachable-count diff, not
+      # a two-dot range — see do_one_step). A single-commit branch never trips the
+      # guard, even with an amended predecessor whose pick goes empty (absorbed).
+      pf_total=$(( $(git rev-list --count "$pf_s" 2>/dev/null || echo 0) \
+                 - $(git rev-list --count "$pf_pred" 2>/dev/null || echo 0) ))
+      (( pf_total > 1 )) || continue
+      if ! _reflow_own_only "$pf_pred" "$pf_s" ${gone_shas[@]+"${gone_shas[@]}"}; then
+        pf_msg="clean: branch '${survivors[$pf_i]}' has commit(s) beyond '${pf_pred#refs/heads/}' that aren't in the branches it just pruned — clean won't drop work it didn't prune. Squash/rebase '${survivors[$pf_i]}' to a single commit and retry, or run 'git stack restack --onto ${base_ref:-<base>} --force' to cherry-pick tips and deliberately drop them."
+        break
+      fi
+      # Resolvable multi-commit => the reflow tip-only-collapses it. Record the
+      # dropped count for the live note / dry-run forecast.
+      pf_collapse+=("${survivors[$pf_i]}:$((pf_total - 1))")
+    done
+  fi
+
   # 6. Dry-run: print the plan (incl. the walk-driven reflow forecast) and stop.
   if (( opt_dry_run )); then
     if (( ${#remote_orphans[@]} > 0 )); then
@@ -3029,7 +3111,9 @@ cmd_clean() {
       for lname in "${remote_orphans[@]}"; do log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}origin/${lname}${C_RESET}"; done
     fi
     log ""
-    if [[ -z "$from_idx" ]]; then
+    if [[ -n "$pf_msg" ]]; then
+      log "${C_BOLD}dry run${C_RESET}: would refuse — ${pf_msg#clean: }"
+    elif [[ -z "$from_idx" ]]; then
       log "${C_BOLD}dry run${C_RESET}: stack threaded on ${base_ref:-the base}; would skip reflow"
     elif [[ "$from_idx" == 0 ]]; then
       if (( base_advanced )); then
@@ -3040,8 +3124,16 @@ cmd_clean() {
     else
       log "${C_BOLD}dry run${C_RESET}: drift at ${survivors[$from_idx]}; would reflow from ${survivors[$from_idx]} up; rerun without --dry-run to apply"
     fi
+    local pf_c
+    for pf_c in ${pf_collapse[@]+"${pf_collapse[@]}"}; do
+      log "  ${C_DIM}would reflow ${pf_c%%:*} tip-only, dropping ${pf_c##*:} superseded commit(s)${C_RESET}"
+    done
     return 0
   fi
+
+  # Refuse atomically: an unresolvable survivor would otherwise die mid-reflow
+  # with the prune already applied. Bail here, before any ref is touched.
+  [[ -n "$pf_msg" ]] && die "$pf_msg"
 
   # 7. Guard: a reflow rewrites refs, so require a clean tree *now* — before any
   #    mutation (incl. the snapshot below) — so a dirty tree bails with nothing
@@ -3098,6 +3190,10 @@ cmd_clean() {
   # The up-front snapshot (step 8) already covers this reflow, so suppress the
   # redundant inner one cmd_restack would take.
   _SNAPSHOT_SUPPRESS=1
+  # A survivor that still threads a just-pruned (merged) branch reads as a multi-
+  # commit branch to the engine guard. Pass the pruned SHAs as the safe-to-drop
+  # set so the reflow cherry-picks the tip and drops the proven-merged ancestors.
+  REFLOW_SAFE_DROP=("${gone_shas[@]+"${gone_shas[@]}"}")
   if [[ "$from_idx" == 0 ]]; then
     if [[ -z "$base_ref" ]]; then
       warn "clean: base unresolved; cannot reflow the whole stack onto a trunk"
@@ -5768,6 +5864,8 @@ cmd_restack() {
   STACK_PREFIX="$prefix"
   STACK_PUSH="$OPT_PUSH"
   STACK_FORCE="$OPT_FORCE"
+  STACK_SAFE_DROP=("${REFLOW_SAFE_DROP[@]+"${REFLOW_SAFE_DROP[@]}"}")
+  REFLOW_SAFE_DROP=()
   STACK_ONTO="$onto_sha"
   STACK_ONTO_REF="$OPT_ONTO"
   STACK_FROM_IDX="$from_idx"

@@ -699,6 +699,200 @@ HOOK
   assert_branch_exists feat/03-c
 }
 
+@test "clean: auto-resolves a survivor threading squash-merged ancestors (tip-only)" {
+  # ADR 0009: a contiguous middle range (02-b, 03-c) is squash-merged down into
+  # 01-a and goes [gone]. The top survivor 04-d still threads the *original*
+  # 02-b/03-c commits, so its reflow trips the multi-commit guard. But those
+  # extras are exactly the branches clean just pruned (merged, by the gone
+  # signal), so clean cherry-picks 04-d's tip and drops them — no --force.
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  # Squash 02-b + 03-c down into 01-a as a single commit; delete their remotes.
+  git checkout -q feat/01-a
+  printf '02-b\n03-c\n' >> file
+  git add file
+  git commit -q -m "squash 02-b+03-c into 01-a"
+  git push -q origin --delete feat/02-b
+  git push -q origin --delete feat/03-c
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_absent feat/03-c
+  # 04-d collapsed to a single commit on the rewritten 01-a, merged ancestors gone.
+  assert_branch_parent_is feat/04-d "$(git rev-parse refs/heads/feat/01-a)"
+  assert_output_contains "superseded commit"
+  # Content is correct: 01-a's squashed body + 04-d's own line, no dup of 02-b/03-c.
+  run git show feat/04-d:file
+  assert_output_contains "04-d"
+  [[ "$(git show feat/04-d:file | grep -c '^02-b$')" -eq 1 ]] || { echo "02-b duplicated:" >&2; git show feat/04-d:file >&2; false; }
+}
+
+@test "clean: refuses atomically when a survivor has unmerged commits beyond the merged set" {
+  # ADR 0009: 04-d threads the squash-merged 02-b/03-c (safe to drop) but ALSO
+  # carries a second commit of its own. clean can't prove that one merged, so it
+  # refuses BEFORE pruning anything — no half-done state, no paused reflow.
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  git checkout -q feat/01-a
+  printf '02-b\n03-c\n' >> file
+  git add file
+  git commit -q -m "squash 02-b+03-c into 01-a"
+  git checkout -q feat/04-d
+  printf '04-d-2\n' >> file
+  git add file
+  git commit -q -m "04-d second commit"
+  git push -q origin --delete feat/02-b
+  git push -q origin --delete feat/03-c
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 1
+  # Atomic: nothing pruned, no paused reflow left behind.
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
+  assert_output_contains "didn't prune"
+}
+
+@test "clean: a [gone] branch is the safe-drop anchor — closed-unmerged is dropped too (recoverable)" {
+  # The safe-drop set is anchored on the [gone] signal, which fires for a
+  # closed-UNMERGED PR (branch deleted without merging) just as for a merged one —
+  # its content is NOT in any predecessor. When a reflow is triggered (here a base
+  # advance), a survivor threading the closed-unmerged branches is tip-only'd, the
+  # commits dropped. clean already prunes [gone] branches destructively, so this is
+  # the same accepted, recoverable risk (one history restore brings it back). This
+  # encodes that deliberate choice (accept, not refuse) and the honest wording.
+  make_stack_branches feat 01-a 02-b 03-c
+  # 04-d's own change lands in a SEPARATE file, so dropping 02-b/03-c (which only
+  # touched `file`) leaves 04-d's tip cherry-pickable without conflict. (When a
+  # survivor's own work *does* depend on a dropped commit, the tip pick conflicts
+  # and pauses instead — the safety net; not exercised here.)
+  git checkout -q -b feat/04-d feat/03-c
+  printf 'd\n' > other
+  git add other
+  git commit -q -m "04-d"
+  make_remote_origin
+  # 02-b/03-c "closed unmerged": deleted on origin, content merged nowhere.
+  git push -q origin --delete feat/02-b
+  git push -q origin --delete feat/03-c
+  # Advance the base so the stack reflows (without a trigger 04-d stays threaded).
+  git checkout -q main
+  printf 'trunk\n' >> trunk.txt
+  git add trunk.txt
+  git commit -q -m "advance trunk"
+  git push -q origin main
+  git fetch -q --prune
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  # 04-d collapsed tip-only onto 01-a, dropping the closed-unmerged commits.
+  assert_branch_parent_is feat/04-d "$(git rev-parse refs/heads/feat/01-a)"
+  # Honest wording: never claims "merged".
+  [[ "$output" != *"merged commit"* ]] || { echo "must not claim 'merged':" >&2; echo "$output" >&2; false; }
+  # Recoverable: one restore brings the pruned branches and pre-reflow 04-d back.
+  run git stack history restore @0 --yes --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_exists feat/02-b
+}
+
+@test "clean: auto-resolves a multi-commit top survivor when the base also advanced (whole-stack reflow)" {
+  # The user's real shape: the bottom survivor is itself restacked onto a moved
+  # base, so the top survivor threads the predecessor's *old* SHA (a patch
+  # duplicate) plus a pruned-merged middle. Tip-only is still correct — the old
+  # predecessor commit is already applied in the restacked one, and the middle is
+  # merged — so clean must not mistake the duplicate for unmerged work.
+  make_stack_branches feat 01-a 02-b 03-c
+  make_remote_origin
+  # Squash 02-b into 01-a (01-a absorbs it; 02-b's PR merges and goes [gone]).
+  git checkout -q feat/01-a
+  printf '01-a\n02-b\n' > file
+  git add file
+  git commit -q --amend -m "01-a + 02-b squashed"
+  git push -q origin --delete feat/02-b
+  # Advance origin/main so the whole stack reflows onto it (from_idx == 0).
+  git checkout -q main
+  printf 'trunk\n' >> trunk.txt
+  git add trunk.txt
+  git commit -q -m "advance trunk"
+  git push -q origin main
+  git fetch -q --prune
+  run git stack clean --prefix feat/ --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  # 03-c collapsed to a single commit on the restacked 01-a.
+  assert_branch_parent_is feat/03-c "$(git rev-parse refs/heads/feat/01-a)"
+}
+
+@test "clean: conflict mid-reflow, then continue auto-resolves an upper survivor (safe-drop survives the pause)" {
+  # 02-b is squash-merged into 01-a (gone) with a line that makes 03-c's reflow
+  # conflict. 04-d sits above 03-c and threads 03-c's *old* (patch-duplicate)
+  # commit. On `continue` (a fresh process), the safe-drop set must survive the
+  # pause AND the engine must recognize the restacked-predecessor duplicate as
+  # safe — otherwise 04-d's tip-only reflow refuses.
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  git checkout -q feat/01-a
+  printf '01-a\n02-b\nzzz\n' > file
+  git add file
+  git commit -q --amend -m "01-a+02-b squashed (conflicting)"
+  git push -q origin --delete feat/02-b
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --no-color
+  assert_status 2
+  assert_output_contains "conflict"
+  # Resolve 03-c's conflict, keeping its line.
+  printf '01-a\n02-b\nzzz\n03-c\n' > file
+  git add file
+  run git stack continue --no-color
+  assert_status 0
+  assert_branch_parent_is feat/04-d "$(git rev-parse refs/heads/feat/03-c)"
+}
+
+@test "clean --dry-run: forecasts a tip-only collapse without mutating" {
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  git checkout -q feat/01-a
+  printf '02-b\n03-c\n' >> file
+  git add file
+  git commit -q -m "squash 02-b+03-c into 01-a"
+  git push -q origin --delete feat/02-b
+  git push -q origin --delete feat/03-c
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --dry-run --no-color
+  assert_status 0
+  assert_output_contains "tip-only"
+  assert_output_contains "superseded commit"
+  # Nothing mutated.
+  assert_branch_exists feat/02-b
+  assert_branch_exists feat/03-c
+}
+
+@test "clean --dry-run: forecasts the refusal for an unmergeable survivor" {
+  make_stack_branches feat 01-a 02-b 03-c 04-d
+  make_remote_origin
+  git checkout -q feat/01-a
+  printf '02-b\n03-c\n' >> file
+  git add file
+  git commit -q -m "squash 02-b+03-c into 01-a"
+  git checkout -q feat/04-d
+  printf '04-d-2\n' >> file
+  git add file
+  git commit -q -m "04-d second commit"
+  git push -q origin --delete feat/02-b
+  git push -q origin --delete feat/03-c
+  git fetch -q --prune
+  git checkout -q main
+  run git stack clean --prefix feat/ --dry-run --no-color
+  assert_status 0
+  assert_output_contains "would refuse"
+  assert_output_contains "didn't prune"
+  assert_branch_exists feat/02-b
+}
+
 # ---------- pr sync ----------
 
 @test "pr sync: fresh 3-branch stack creates draft PRs with correct bases" {
