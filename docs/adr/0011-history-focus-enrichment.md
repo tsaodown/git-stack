@@ -74,9 +74,15 @@ alone doesn't.
 
 ### 3. Display
 
-`cmd_history_list` drops the `branches` count, adds a flexible-width `focus`
-column, and moves `run-id` to **last** (it is the widest, least-scanned field —
-rows are addressed by `@N`). The subject stays only in `history show`.
+`cmd_history_list` drops the `branches` count and adds `focus` as the **last**
+column: `ref  age  action  run-id  focus`. Focus is variable-width and may carry
+multi-byte glyphs (`− ← →` are 3 bytes / 1 display column each), so `printf`'s
+byte-based `%-Ns` padding would shift anything to its right. Putting it last means
+it needs no padding and can't misalign a trailing column — and `run-id` is
+fixed-width ASCII that aligns trivially in any position. (This reverses the
+draft's "run-id last"; the draft hadn't weighed the multi-byte padding problem.
+The change is cosmetic — rows are addressed by `@N`, not `run-id`.) The subject
+stays only in `history show`.
 
 ### 4. `@meta` is not a branch
 

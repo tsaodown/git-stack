@@ -559,6 +559,10 @@ require_branch_not_in_worktree() {
 #
 # Usage: snapshot_stack <action> <prefix> <branch>...
 snapshot_stack() {
+  # Consume the caller's per-op focus descriptor and clear the global at once, so
+  # it never leaks to a later snapshot — even when this one is suppressed below.
+  local focus="${_SNAPSHOT_FOCUS:-}"
+  _SNAPSHOT_FOCUS=""
   # Callers that already took a covering up-front snapshot (e.g. clean, before it
   # prunes) suppress the redundant inner snapshot a nested reflow would take, so
   # a single `history restore` lands on the one pre-mutation anchor.
@@ -579,6 +583,15 @@ snapshot_stack() {
     stdin+="create refs/stack-backup/${prefix_path}/${run_id}/${leaf} ${sha}"$'\n'
   done
   [[ -n "$stdin" ]] || return 0
+  # Focus metadata: a sibling @meta ref pointing at a blob of key=value lines
+  # (a blob, not a ref-path, because a compound clean focus carries spaces/:/→
+  # that are illegal in ref names). Same atomic batch as the branch refs, and
+  # @meta is filtered everywhere a branch list is read (ADR 0011).
+  if [[ -n "$focus" ]]; then
+    local blob
+    blob=$(printf '%s\n' "$focus" | git hash-object -w --stdin 2>/dev/null) || blob=""
+    [[ -n "$blob" ]] && stdin+="create refs/stack-backup/${prefix_path}/${run_id}/@meta ${blob}"$'\n'
+  fi
   if printf '%s' "$stdin" | git update-ref --stdin -m "git-stack ${action}" 2>/dev/null; then
     log_v "snapshot ${run_id} (${n} branches)"
   else
@@ -632,6 +645,7 @@ list_snapshots() {
           if (index($0, strip) == 1) {
             rest = substr($0, length(strip) + 1)
             n = split(rest, parts, "/")
+            if (parts[2] == "@meta") next
             run_id = parts[1]
             count[run_id]++
           }
@@ -656,10 +670,67 @@ snapshot_branches_for() {
         {
           if (index($1, strip) == 1) {
             leaf = substr($1, length(strip) + 1)
+            if (leaf == "@meta") next
             printf "%s\t%s\n", leaf, $2
           }
         }
       '
+}
+
+# Print the raw key=value focus descriptor stored for <run-id>, or nothing.
+snapshot_focus_for() {
+  local prefix_path="${1%/}" run_id="$2"
+  local blob
+  blob=$(git rev-parse --verify --quiet "refs/stack-backup/${prefix_path}/${run_id}/@meta" 2>/dev/null) \
+    || return 0
+  git cat-file blob "$blob" 2>/dev/null
+}
+
+# _kv_get <kv-text> <key> : first value for <key>, or empty.
+_kv_get() {
+  printf '%s\n' "$1" | sed -n "s/^${2}=//p" | head -1
+}
+
+# Render a one-line focus token from an action and its key=value descriptor.
+# Empty when the descriptor is missing or an expected key is absent — callers
+# substitute an em dash. Glyphs: + add, − drop, ← fold (result←victim),
+# → move (leaf→pos). See ADR 0011 for the per-verb schema.
+_render_focus() {
+  local action="$1" kv="$2"
+  [[ -n "$kv" ]] || return 0
+  local leaf pos result victim pruned base from onto repaired segs
+  case "$action" in
+    amend|create)
+      _kv_get "$kv" leaf ;;
+    add)
+      leaf=$(_kv_get "$kv" leaf); [[ -n "$leaf" ]] && printf '+%s' "$leaf" ;;
+    drop)
+      leaf=$(_kv_get "$kv" leaf); [[ -n "$leaf" ]] && printf '−%s' "$leaf" ;;
+    move)
+      leaf=$(_kv_get "$kv" leaf); pos=$(_kv_get "$kv" pos)
+      if [[ -n "$leaf" && -n "$pos" ]]; then printf '%s→%s' "$leaf" "$pos"
+      else printf '%s' "$leaf"; fi ;;
+    fold)
+      result=$(_kv_get "$kv" result); victim=$(_kv_get "$kv" victim)
+      if [[ -n "$result" && -n "$victim" ]]; then printf '%s←%s' "$result" "$victim"
+      else printf '%s' "$result"; fi ;;
+    restack)
+      onto=$(_kv_get "$kv" onto); from=$(_kv_get "$kv" from)
+      if [[ -n "$onto" ]]; then printf 'onto:%s' "$onto"
+      elif [[ -n "$from" ]]; then printf 'from:%s' "$from"; fi ;;
+    clean)
+      pruned=$(_kv_get "$kv" pruned); base=$(_kv_get "$kv" base); from=$(_kv_get "$kv" from)
+      segs=""
+      [[ -n "$pruned" ]] && segs="pruned:${pruned}"
+      if [[ -n "$base" ]]; then segs="${segs:+$segs }base→${base}"
+      elif [[ -n "$from" ]]; then segs="${segs:+$segs }from:${from}"; fi
+      printf '%s' "$segs" ;;
+    doctor|doctor-reflow)
+      repaired=$(_kv_get "$kv" repaired); [[ -n "$repaired" ]] && printf 'repaired:%s' "$repaired" ;;
+  esac
+  # A missing/partial key leaves a branch's last command non-zero; never let that
+  # abort the caller under `set -e` — an empty render falls back to an em dash.
+  return 0
 }
 
 # Resolve user-supplied id (full, action-tagged, bare ts, or @N) to canonical
@@ -2728,7 +2799,7 @@ cmd_history() {
 
 cmd_history_list() {
   local prefix_path="$1"
-  local snaps now idx ts action run_id count age
+  local snaps now idx ts action run_id count age focus
   snaps=$(list_snapshots "$prefix_path")
   if [[ -z "$snaps" ]]; then
     log "${C_DIM}(no snapshots for ${prefix_path}/)${C_RESET}"
@@ -2736,15 +2807,19 @@ cmd_history_list() {
   fi
   now=$(date +%s)
   printf '%sprefix:%s %s/\n\n' "$C_DIM" "$C_RESET" "$prefix_path"
+  # focus is the last column (variable-width, may carry multi-byte glyphs), so it
+  # needs no padding and never shifts the columns before it.
   printf '  %s%-4s  %-7s  %-8s  %-32s  %s%s\n' \
-    "$C_BOLD" "ref" "age" "action" "run-id" "branches" "$C_RESET"
+    "$C_BOLD" "ref" "age" "action" "run-id" "focus" "$C_RESET"
   idx=0
   while IFS=$'\t' read -r ts action run_id count; do
     [[ -z "$run_id" ]] && continue
     age=$(_human_age $((now - ts)))
-    printf '  %s@%-3d%s %-7s  %-8s  %s%-32s%s  %d\n' \
+    focus=$(_render_focus "$action" "$(snapshot_focus_for "$prefix_path" "$run_id")")
+    [[ -n "$focus" ]] || focus="—"
+    printf '  %s@%-3d%s %-7s  %-8s  %s%-32s%s  %s\n' \
       "$C_GREEN" "$idx" "$C_RESET" \
-      "$age" "$action" "$C_CYAN" "$run_id" "$C_RESET" "$count"
+      "$age" "$action" "$C_CYAN" "$run_id" "$C_RESET" "$focus"
     idx=$((idx + 1))
   done <<< "$snaps"
 }
@@ -3149,6 +3224,19 @@ cmd_clean() {
   #    restore. The nested reflow's own snapshot is suppressed (see step 11) so
   #    this one is the sole restore point.
   if (( ${#gone[@]} > 0 )) || [[ -n "$from_idx" ]]; then
+    # Compound focus: clean can prune and reflow in one run. base→ when the
+    # bottom reflows onto an advanced trunk; from: for an internal-drift reflow.
+    # NL outside the quotes — $'\n' inside "${:+…}" is version-dependent.
+    local _cf="" NL=$'\n'
+    (( ${#gone[@]} > 0 )) && _cf="pruned=${#gone[@]}"
+    if [[ "$from_idx" == 0 && -n "$base_ref" ]] && (( base_advanced )); then
+      [[ -n "$_cf" ]] && _cf="$_cf$NL"
+      _cf="${_cf}base=${base_ref##*/}"
+    elif [[ -n "$from_idx" ]] && (( from_idx > 0 )); then
+      [[ -n "$_cf" ]] && _cf="$_cf$NL"
+      _cf="${_cf}from=${survivors[$from_idx]##*/}"
+    fi
+    _SNAPSHOT_FOCUS="$_cf"
     snapshot_stack clean "$prefix" "${branches[@]}"
   fi
 
@@ -3920,6 +4008,7 @@ cmd_add() {
   _carry_begin "$predecessor_sha" "git-stack add → $new_branch"
 
   # Snapshot before mutation.
+  _SNAPSHOT_FOCUS="leaf=${new_branch##*/}"
   if (( ${#branches[@]} > 0 )); then
     snapshot_stack add "$prefix" "${branches[@]}"
   else
@@ -4033,6 +4122,7 @@ cmd_create() {
     _carry_begin "$predecessor_sha" "git-stack create → $new_branch"
   fi
 
+  _SNAPSHOT_FOCUS="leaf=${new_branch##*/}"
   snapshot_stack create "$prefix"
 
   if ! git update-ref "refs/heads/${new_branch}" "${predecessor_sha}" ""; then
@@ -4266,6 +4356,7 @@ move: no <branch> given and HEAD is detached"
       die "move: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); reordering would desync it from GitHub. Run 'git stack pr desync' to take the stack offline first, then reorder, then 'git stack pr sync'."
     fi
 
+    _SNAPSHOT_FOCUS="leaf=${src_branch##*/}"$'\n'"pos=${new_num}"
     snapshot_stack move "$prefix" "${branches[@]}"
 
     # Pure rename: local rename batch only — move is fully local. No reflow-pick
@@ -4361,6 +4452,7 @@ move: no <branch> given and HEAD is detached"
   fi
 
   # Snapshot before mutation.
+  _SNAPSHOT_FOCUS="leaf=${src_branch##*/}"$'\n'"pos=$((dst_idx + 1))"
   snapshot_stack move "$prefix" "${branches[@]}"
 
   # Plan: reflow-pick (rebase affected branches onto new predecessors) →
@@ -5093,6 +5185,7 @@ fold: no <branch> given and HEAD is detached"
   # Snapshot the full pre-fold state (including the victim, which the apply step
   # deletes) so 'history restore' can undo the whole fold. The inner reflow
   # snapshot is suppressed so this stays the newest one.
+  _SNAPSHOT_FOCUS="result=${new_survivor##*/}"$'\n'"victim=${victim##*/}"
   snapshot_stack fold "$prefix" "${branches[@]}"
   STACK_SUPPRESS_REFLOW_SNAPSHOT=1
 
@@ -5281,6 +5374,7 @@ drop: no <branch> given and HEAD is detached"
   # Snapshot the full pre-drop state (including the victim, which we delete
   # below) so 'history restore' can undo the whole drop. This single snapshot is
   # the restore point.
+  _SNAPSHOT_FOCUS="leaf=${victim##*/}"
   snapshot_stack drop "$prefix" "${branches[@]}"
 
   # If HEAD is on the victim, move off it to the landing ref before we delete it
@@ -5898,6 +5992,14 @@ cmd_restack() {
   STACK_PHASE_IDX=0
   STACK_UNIT_IDX=0
 
+  # Focus: an explicit re-root (onto:) or a partial reflow (from:); a plain
+  # whole-stack restack leaves it unset and renders as an em dash. Suppressed
+  # when invoked from amend/clean, so this only surfaces for direct `restack`.
+  if [[ -n "$OPT_ONTO" ]]; then
+    _SNAPSHOT_FOCUS="onto=${OPT_ONTO##*/}"
+  elif [[ -n "$OPT_FROM" ]]; then
+    _SNAPSHOT_FOCUS="from=${OPT_FROM##*/}"
+  fi
   snapshot_stack restack "$STACK_PREFIX" "${STACK_BRANCHES[@]}"
   save_engine_state
   _engine_run
@@ -5963,6 +6065,9 @@ cmd_amend() {
     local _amend_branches=()
     _load_stack_branches "$_amend_prefix" _amend_branches
     if (( ${#_amend_branches[@]} > 0 )); then
+      local _amend_cur
+      _amend_cur=$(current_branch 2>/dev/null || echo "")
+      [[ -n "$_amend_cur" ]] && _SNAPSHOT_FOCUS="leaf=${_amend_cur##*/}"
       snapshot_stack amend "$_amend_prefix" "${_amend_branches[@]}"
       _amend_snapped=1
     fi

@@ -303,6 +303,89 @@ HOOK
   [[ "$output" == *"restack"* ]]
 }
 
+@test "history focus: amend row shows the amended leaf (ADR 0011)" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  git stack amend -m "reworded" --no-color
+  run git stack history --no-color
+  assert_status 0
+  assert_output_contains "amend"
+  assert_output_contains "01-a"
+}
+
+@test "history focus: add row shows the new leaf with a + glyph" {
+  make_stack_branches feat 01-a
+  git checkout -q feat/01-a
+  git stack add b --no-color
+  run git stack history --no-color
+  assert_status 0
+  assert_output_contains "add"
+  assert_output_contains "+02-b"
+}
+
+@test "history focus: drop row shows the discarded leaf" {
+  # Distinct files per branch so the post-drop reflow doesn't content-conflict.
+  git checkout -q -b feat/01-a; echo a > fa; git add fa; git commit -q -m 01-a
+  git checkout -q -b feat/02-b; echo b > fb; git add fb; git commit -q -m 02-b
+  git checkout -q -b feat/03-c; echo c > fc; git add fc; git commit -q -m 03-c
+  git stack drop feat/02-b --yes --no-color
+  run git stack history --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "drop"
+  assert_output_contains "−02-b"
+}
+
+@test "history focus: fold row shows result and victim" {
+  # fold --down folds 02-b into 01-a; the result keeps the survivor's leaf (01)
+  # but the victim's slug (b) -> feat/01-b, so the focus reads 01-b←02-b.
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/02-b
+  git stack fold --down --yes --no-color
+  run git stack history --no-color
+  assert_status 0
+  assert_output_contains "fold"
+  assert_output_contains "01-b←02-b"
+}
+
+@test "history focus: move row shows leaf and destination position" {
+  # Distinct files per branch so reordering reflows without a content conflict.
+  git checkout -q -b feat/01-a; echo a > fa; git add fa; git commit -q -m 01-a
+  git checkout -q -b feat/02-b; echo b > fb; git add fb; git commit -q -m 02-b
+  git checkout -q -b feat/03-c; echo c > fc; git add fc; git commit -q -m 03-c
+  run git stack move feat/01-a --last --no-color
+  assert_status 0
+  run git stack history --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "move"
+  assert_output_contains "01-a→3"
+}
+
+@test "history focus: clean captures prune and base reflow together (ADR 0011)" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git checkout -q main
+  printf '01-a\n' >> file
+  git add file
+  git commit -q -m "merge 01-a (squashed)"
+  git push -q origin main
+  git push -q origin --delete feat/01-a
+  git fetch -q --prune
+  git stack clean --prefix feat/ --no-color
+  run git stack history --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "pruned:1"
+  assert_output_contains "base→"
+}
+
+@test "history focus: legacy snapshot without metadata renders an em dash" {
+  make_stack_branches feat 01-a 02-b
+  # Hand-write a snapshot ref with no @meta blob, mimicking a pre-ADR-0011 entry.
+  git update-ref "refs/stack-backup/feat/9999999999-amend-1/01-a" "$(git rev-parse feat/01-a)"
+  run git stack history --prefix feat/ --no-color
+  assert_status 0
+  assert_output_contains "—"
+}
+
 # ---------- rename ----------
 
 @test "rename --dry-run: prints batch and changes nothing" {

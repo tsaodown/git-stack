@@ -82,6 +82,13 @@ before a mutating operation, so the stack can be rolled back via
 _Avoid_: backup-ref, checkpoint — and do not reuse "snapshot" for any other
 captured state.
 
+**Focus**:
+The per-snapshot descriptor of what an operation was *about* — the `focus` column
+in `git stack history` (`amend auth-guard`, `clean pruned:2 base→main`). Stored as
+a `key=value` blob behind a sibling `@meta` ref in the snapshot, set by the verb
+via `_SNAPSHOT_FOCUS` and rendered per-verb at display time (ADR 0011). `@meta` is
+not a branch — it is filtered wherever a snapshot's branches are enumerated.
+
 ### PR sync
 
 **PR chain**:
