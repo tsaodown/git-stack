@@ -1,6 +1,9 @@
 .DS_Store
 *.swp
 
+# Machine/checkout-local Claude instructions (auto-loaded, never shared)
+CLAUDE.local.md
+
 # Claude Code: track only shareable config; ignore per-session/local state
 # (locks, caches, local overrides). Default-deny so new state never leaks.
 .claude/*
