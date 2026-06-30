@@ -129,7 +129,8 @@ placement() {
 }
 
 # --- candidate list (interactive picker entry point) ---
-# Output: "<predecessor>\t<leaf> <leaf> ..." (empty predecessor = base).
+# Output: "<predecessor>\t<lo>\t<hi>\t<leaf> <leaf> ..." (empty predecessor =
+# base; hi == -1 = open-ended append). The bounds feed manual-entry validation.
 
 candidates() {
   run bash -c "source '$GIT_STACK_BIN'; _placement_candidates \"\$@\"" _ "$@"
@@ -138,25 +139,25 @@ candidates() {
 @test "candidates after last: open-ended, multiples of 10" {
   candidates feat/020-b after feat/010-a feat/020-b
   [ "$status" -eq 0 ]
-  [ "$output" == $'feat/020-b\t30 40 50' ]
+  [ "$output" == $'feat/020-b\t20\t-1\t30 40 50' ]
 }
 
 @test "candidates before a branch: midpoint first, then ascending fill" {
   candidates feat/020-b before feat/010-a feat/020-b
   [ "$status" -eq 0 ]
-  [ "$output" == $'feat/010-a\t15 11 12 13 14 16 17 18 19' ]
+  [ "$output" == $'feat/010-a\t10\t20\t15 11 12 13 14 16 17 18 19' ]
 }
 
 @test "candidates before the lowest branch: base predecessor" {
   candidates feat/010-a before feat/010-a feat/020-b
   [ "$status" -eq 0 ]
-  [ "$output" == $'\t5 1 2 3 4 6 7 8 9' ]
+  [ "$output" == $'\t0\t10\t5 1 2 3 4 6 7 8 9' ]
 }
 
 @test "candidates for a wide gap: curated midpoint + quartiles + eighths" {
   candidates feat/200-b before feat/010-a feat/200-b
   [ "$status" -eq 0 ]
-  [ "$output" == $'feat/010-a\t105 58 152 82 128' ]
+  [ "$output" == $'feat/010-a\t10\t200\t105 58 152 82 128' ]
 }
 
 @test "candidates refuses when the gap is exhausted" {
@@ -198,10 +199,174 @@ renumber_cands() {
   [ -z "$output" ]
 }
 
+# --- manual leaf entry validation (_validate_leaf_entry) ---
+# Bounds mirror the --at flag path: open gap (lo,hi); hi == -1 = open-ended
+# append (999 ceiling only when width >= 3). <exclude> rejects a no-op leaf.
+# Output: the normalized int on success, else an error kind.
+# Usage: validate_leaf <value> <lo> <hi> <width> <exclude>
+
+validate_leaf() {
+  run bash -c "source '$GIT_STACK_BIN'; _validate_leaf_entry \"\$@\"" _ "$@"
+}
+
+@test "validate leaf: in-gap value accepted and normalized" {
+  validate_leaf 015 10 20 3 ""
+  [ "$status" -eq 0 ]
+  [ "$output" == "15" ]
+}
+
+@test "validate leaf: at or below lower bound rejected" {
+  validate_leaf 10 10 20 3 ""
+  [ "$status" -ne 0 ]
+  [ "$output" == $'low\t10' ]
+}
+
+@test "validate leaf: at or above upper bound rejected" {
+  validate_leaf 20 10 20 3 ""
+  [ "$status" -ne 0 ]
+  [ "$output" == $'high\t20' ]
+}
+
+@test "validate leaf: non-numeric rejected" {
+  validate_leaf abc 10 20 3 ""
+  [ "$status" -ne 0 ]
+  [ "$output" == "nan" ]
+}
+
+@test "validate leaf: open-ended append accepts any value above lo" {
+  validate_leaf 500 20 -1 3 ""
+  [ "$status" -eq 0 ]
+  [ "$output" == "500" ]
+}
+
+@test "validate leaf: open-ended append rejects above 999 ceiling at width 3" {
+  validate_leaf 1000 20 -1 3 ""
+  [ "$status" -ne 0 ]
+  [ "$output" == $'ceiling\t999' ]
+}
+
+@test "validate leaf: 2-digit append has no explicit ceiling (mirrors --at)" {
+  validate_leaf 1000 20 -1 2 ""
+  [ "$status" -eq 0 ]
+  [ "$output" == "1000" ]
+}
+
+@test "validate leaf: exclude rejects the current leaf as a no-op" {
+  validate_leaf 12 10 20 3 12
+  [ "$status" -ne 0 ]
+  [ "$output" == $'noop\t12' ]
+}
+
+@test "validate leaf: a different in-gap value passes despite exclude" {
+  validate_leaf 13 10 20 3 12
+  [ "$status" -eq 0 ]
+  [ "$output" == "13" ]
+}
+
+# --- fzf intent resolution (_resolve_fzf_leaf) ---
+# fzf --print-query emits the query on line 1 and any accepted selection on
+# line 2. The typed query is authoritative for this numeric picker.
+
+resolve_fzf() {
+  run bash -c "source '$GIT_STACK_BIN'; _resolve_fzf_leaf \"\$1\"" _ "$1"
+}
+
+@test "resolve fzf: typed query wins over a fuzzy-matched selection" {
+  # Typing "15" against curated candidates fuzzy-matches "152"; the literal
+  # typed leaf must win, not the highlighted suggestion.
+  resolve_fzf $'15\n152'
+  [ "$status" -eq 0 ]
+  [ "$output" == "15" ]
+}
+
+@test "resolve fzf: empty query falls back to the arrow-key selection" {
+  resolve_fzf $'\n30'
+  [ "$status" -eq 0 ]
+  [ "$output" == "30" ]
+}
+
+@test "resolve fzf: query-only (no match line) returns the query" {
+  resolve_fzf $'17'
+  [ "$status" -eq 0 ]
+  [ "$output" == "17" ]
+}
+
+# --- interactive leaf picker loop (_pick_or_enter_leaf) ---
+# fzf is stubbed as a shell function (command -v finds functions), letting the
+# real loop, validation, and re-prompt run without a TTY. The stub drains the
+# candidate list on stdin and emits canned --print-query output; a call counter
+# returns different values across re-prompts.
+
+@test "pick-or-enter (fzf): a valid in-gap typed leaf is accepted" {
+  run bash -c '
+    source "'"$GIT_STACK_BIN"'"
+    fzf() { cat >/dev/null; printf "15\n"; }
+    _pick_or_enter_leaf "leaf number:" 10 20 3 "" "" 15 11 12
+  '
+  [ "$status" -eq 0 ]
+  [ "${lines[-1]}" == "15" ]
+}
+
+@test "pick-or-enter (fzf): typed query wins over fuzzy-matched selection" {
+  run bash -c '
+    source "'"$GIT_STACK_BIN"'"
+    fzf() { cat >/dev/null; printf "15\n152\n"; }
+    _pick_or_enter_leaf "leaf number:" 10 200 3 "" "" 105 58 152 82 128
+  '
+  [ "$status" -eq 0 ]
+  [ "${lines[-1]}" == "15" ]
+}
+
+@test "pick-or-enter (fzf): out-of-gap entry re-prompts then accepts" {
+  # File-backed counter: fzf runs in a command-substitution subshell, so an
+  # in-memory counter would not survive across re-prompts.
+  local ctr="$BATS_TEST_TMPDIR/ctr"; echo 0 > "$ctr"
+  run bash -c '
+    source "'"$GIT_STACK_BIN"'"
+    fzf() { cat >/dev/null; local n; n=$(cat "'"$ctr"'"); echo $((n+1)) > "'"$ctr"'"; if (( n == 0 )); then printf "999\n"; else printf "15\n"; fi; }
+    _pick_or_enter_leaf "leaf number:" 10 20 3 "" "" 15
+  '
+  [ "$status" -eq 0 ]
+  [ "${lines[-1]}" == "15" ]
+  [[ "$output" == *"less than 20"* ]]
+}
+
+@test "pick-or-enter (fzf): empty input takes the default when one is given" {
+  run bash -c '
+    source "'"$GIT_STACK_BIN"'"
+    fzf() { cat >/dev/null; printf "\n"; }
+    _pick_or_enter_leaf "leaf number:" 10 20 3 15 "" 15 11 12
+  '
+  [ "$status" -eq 0 ]
+  [ "${lines[-1]}" == "15" ]
+}
+
+@test "pick-or-enter (fzf): renumber excludes the current leaf, re-prompts" {
+  local ctr="$BATS_TEST_TMPDIR/ctr"; echo 0 > "$ctr"
+  run bash -c '
+    source "'"$GIT_STACK_BIN"'"
+    fzf() { cat >/dev/null; local n; n=$(cat "'"$ctr"'"); echo $((n+1)) > "'"$ctr"'"; if (( n == 0 )); then printf "12\n"; else printf "13\n"; fi; }
+    _pick_or_enter_leaf "renumber:" 10 20 3 "" 12 11 13 14
+  '
+  [ "$status" -eq 0 ]
+  [ "${lines[-1]}" == "13" ]
+  [[ "$output" == *"already at 12"* ]]
+}
+
+@test "pick-or-enter (fzf): abort (Esc/rc 130) returns non-zero" {
+  run bash -c '
+    source "'"$GIT_STACK_BIN"'"
+    fzf() { cat >/dev/null; return 130; }
+    _pick_or_enter_leaf "leaf number:" 10 20 3 "" "" 15
+  '
+  [ "$status" -ne 0 ]
+}
+
 # --- picker wiring (_pick_position_for_new) ---
-# Stubs _pick_one with canned selections to exercise the wiring end-to-end:
-# prompt dispatch, "<pred>\t<candidates>" parsing, the empty-predecessor (base)
-# case, and setting _PICKED_LEAF_NUM / _PICKED_PREDECESSOR.
+# Stubs _pick_one (ref + before/after steps) and _pick_or_enter_leaf (step 3)
+# with canned selections to exercise the wiring end-to-end: prompt dispatch,
+# "<pred>\t<lo>\t<hi>\t<candidates>" parsing, the empty-predecessor (base) case,
+# and setting _PICKED_LEAF_NUM / _PICKED_PREDECESSOR.
 
 pick_position() {
   local ref="$1" pos="$2" leaf="$3"; shift 3
@@ -212,9 +377,9 @@ pick_position() {
         case "$1" in
           "branch to insert"*)  printf "%s\n" "$STUB_REF" ;;
           "position relative"*) printf "%s\n" "$STUB_POS" ;;
-          *)                    printf "%s\n" "$STUB_LEAF" ;;
         esac
       }
+      _pick_or_enter_leaf() { printf "%s\n" "$STUB_LEAF"; }
       _pick_position_for_new "$@"
       printf "LEAF=%s PRED=%s\n" "$_PICKED_LEAF_NUM" "$_PICKED_PREDECESSOR"
     ' _ "$@"

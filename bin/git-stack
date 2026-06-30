@@ -2141,7 +2141,9 @@ ${b}Branch-level subcommands:${r}
                                     calls GitHub. <ref> is a numeric leaf or
                                     full branch name; <num> is a leaf to place
                                     at exactly. With no position flag, opens an
-                                    interactive picker. New stacks get sparse
+                                    interactive picker; its leaf step accepts a
+                                    suggested number or any leaf you type in the
+                                    gap. New stacks get sparse
                                     3-digit leaves stepping by 10; insert flags
                                     pick the midpoint of the gap (refuses, no
                                     cascade, if exhausted). Errors outside a
@@ -3683,8 +3685,10 @@ _resolve_placement() {
 # Pure candidate-list generator for the interactive picker. Given the chosen
 # reference branch, a before|after position, and the ordered branch list,
 # produce the predecessor and a ranked list of insertable leaf numbers. No git,
-# no die. On success prints "<predecessor><TAB><leaf> <leaf> ..." (empty
-# predecessor = use the stack base) and returns 0. On a too-tight gap prints
+# no die. On success prints "<predecessor><TAB><lo><TAB><hi><TAB><leaf> <leaf>
+# ..." (empty predecessor = use the stack base; hi == -1 = open-ended append)
+# and returns 0 — the bounds let the interactive picker validate free manual
+# entry against the same open gap. On a too-tight gap prints
 # "gap-exhausted<TAB><lo><TAB><hi>" and returns 1.
 # Usage: _placement_candidates <ref_branch> <before|after> <branch>...
 _placement_candidates() {
@@ -3747,7 +3751,7 @@ _placement_candidates() {
       (( mid + eighth < hi && mid + eighth != mid + quart )) && candidates+=("$((mid + eighth))")
     fi
   fi
-  printf '%s\t%s\n' "$pred" "${candidates[*]}"
+  printf '%s\t%d\t%d\t%s\n' "$pred" "$lo" "$hi" "${candidates[*]}"
   return 0
 }
 
@@ -3776,6 +3780,31 @@ _renumber_candidates() {
   local sorted
   sorted=$(printf '%s\n' "${out[@]}" | sort -n)
   printf '%s\n' "${sorted//$'\n'/ }"
+}
+
+# Pure validator for a manually-entered leaf in the interactive leaf pickers.
+# No git, no tty. Bounds mirror _placement_resolve: the valid slot is the open
+# gap (lo,hi); hi == -1 is an open-ended append where only the 999 ceiling
+# applies, and only when width >= 3 (2-digit stacks get no explicit upper bound,
+# same as the --at flag path). <exclude> (may be empty) is a leaf to reject as a
+# no-op — the branch's current leaf on move's renumber path. On success prints
+# the normalized integer and returns 0. On failure prints an error kind and
+# returns 1: "nan" | "low<TAB><lo>" | "high<TAB><hi>" | "ceiling<TAB>999" |
+# "noop<TAB><exclude>".
+# Usage: _validate_leaf_entry <value> <lo> <hi> <width> <exclude>
+_validate_leaf_entry() {
+  local value="$1" lo="$2" hi="$3" width="$4" exclude="$5"
+  [[ "$value" =~ ^[0-9]+$ ]] || { printf 'nan\n'; return 1; }
+  local x=$((10#$value))
+  (( x > lo )) || { printf 'low\t%d\n' "$lo"; return 1; }
+  if (( hi == -1 )); then
+    if (( width >= 3 )) && (( x > 999 )); then printf 'ceiling\t999\n'; return 1; fi
+  else
+    (( x < hi )) || { printf 'high\t%d\n' "$hi"; return 1; }
+  fi
+  if [[ -n "$exclude" ]] && (( x == exclude )); then printf 'noop\t%d\n' "$exclude"; return 1; fi
+  printf '%d\n' "$x"
+  return 0
 }
 
 # Three-step interactive position picker for `cmd_add` and `cmd_move`. Drives
@@ -3823,13 +3852,20 @@ _pick_position_for_new() {
         die "internal: placement candidates failed: $out" ;;
     esac
   fi
+  # Parse "<pred>\t<lo>\t<hi>\t<cands>" by hand: a leading empty predecessor
+  # (base-insert) would be eaten by read's IFS-whitespace trimming of the tab.
   _PICKED_PREDECESSOR="${out%%$'\t'*}"
+  local rest="${out#*$'\t'}"
+  local lo="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  local hi="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
   local candidates=() c
-  for c in ${out#*$'\t'}; do candidates+=("$c"); done
+  for c in $rest; do candidates+=("$c"); done
 
-  # Step 3: pick a leaf from the candidate list.
-  local picked_leaf
-  picked_leaf=$(_pick_one "leaf number:" "${candidates[@]}") \
+  # Step 3: pick a suggested leaf or type any leaf valid for the gap. The
+  # midpoint (first candidate) is the empty-input default.
+  local width picked_leaf
+  width=$(_leaf_width_for "${branches[@]}")
+  picked_leaf=$(_pick_or_enter_leaf "leaf number:" "$lo" "$hi" "$width" "${candidates[0]}" "" "${candidates[@]}") \
     || return 1
 
   _PICKED_LEAF_NUM="$picked_leaf"
@@ -4316,7 +4352,10 @@ move: no <branch> given and HEAD is detached"
         local _cands=($(_renumber_candidates "$cur_leaf" "$_lo" "$_hi"))
         (( ${#_cands[@]} > 0 )) \
           || die "move: no free leaf to renumber '$src_branch' into here; pass --at <num>"
-        new_num=$(_pick_one "renumber ${src_branch} to leaf:" "${_cands[@]}") \
+        # No default: renumber is invoked to land a specific number, and the
+        # current leaf sits inside the gap, so <exclude> rejects it as a no-op.
+        local _w; _w=$(_leaf_width_for "${branches[@]}")
+        new_num=$(_pick_or_enter_leaf "renumber ${src_branch} to leaf:" "$_lo" "$_hi" "$_w" "" "$cur_leaf" "${_cands[@]}") \
           || die "move: no leaf selected"
       else
         local _rel="before" _ref="$before_branch"
@@ -6941,6 +6980,73 @@ _pick_one() {
   read -r n < /dev/tty || return 1
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )) || return 1
   printf '%s\n' "${!n}"
+}
+
+# Resolve the user's intent from fzf --print-query output (query on line 1, any
+# accepted selection on line 2). For a numeric picker the query is
+# authoritative: a non-empty query is the leaf the user typed, so we ignore the
+# selection — otherwise fzf would fuzzy-match the typed digits to a curated
+# candidate (typing "15" matches "152"/"105") and silently return the wrong
+# leaf. An empty query means a pure arrow-key pick, so use the selection. Prints
+# the resolved value (may be empty -> caller applies the default / re-prompts).
+# Usage: _resolve_fzf_leaf <two-line-fzf-output>
+_resolve_fzf_leaf() {
+  local q="" s=""
+  # A query-only fzf result (no-match free entry) has no second line, so the
+  # second read hits EOF (rc 1); `|| :` keeps set -e from aborting the function.
+  { IFS= read -r q || :; IFS= read -r s || :; } <<< "$1"
+  if [[ -n "$q" ]]; then printf '%s\n' "$q"; else printf '%s\n' "$s"; fi
+}
+
+# Interactive leaf picker with free manual entry. Shows <candidate>... as
+# selectable suggestions (fzf) or as hints (numbered fallback) and accepts any
+# leaf valid for the open gap per _validate_leaf_entry. Re-prompts on invalid
+# input; returns 1 on abort (Esc/Ctrl-C/EOF). <default> (may be empty) is
+# returned on empty input — placement passes the midpoint, renumber passes none.
+# <exclude> (may be empty) is rejected as a no-op. Prints the chosen integer.
+# Usage: _pick_or_enter_leaf <prompt> <lo> <hi> <width> <default> <exclude> <candidate>...
+_pick_or_enter_leaf() {
+  local prompt="$1" lo="$2" hi="$3" width="$4" default="$5" exclude="$6"; shift 6
+  local cands=("$@")
+  local value out rc kind rest
+  while :; do
+    if command -v fzf >/dev/null 2>&1; then
+      out=$(printf '%s\n' "${cands[@]}" \
+        | fzf --print-query --prompt="${prompt} > " --height=40% --reverse --no-multi)
+      rc=$?
+      # 0 = match selected, 1 = no match (free-entry via the typed query);
+      # >= 2 covers fzf errors and 130 (Esc/Ctrl-C) — treat as abort.
+      (( rc >= 2 )) && return 1
+      value=$(_resolve_fzf_leaf "$out")
+    else
+      [[ -e /dev/tty ]] || return 1
+      printf '%s\n' "$prompt" >&2
+      printf '  suggested: %s\n' "${cands[*]}" >&2
+      if [[ -n "$default" ]]; then
+        printf '  enter a leaf [default %s]: ' "$default" >&2
+      else
+        printf '  enter a leaf: ' >&2
+      fi
+      read -r value < /dev/tty || return 1
+    fi
+    [[ -z "$value" && -n "$default" ]] && value="$default"
+    if [[ -z "$value" ]]; then
+      printf '  please enter a leaf number\n' >&2
+      continue
+    fi
+    if out=$(_validate_leaf_entry "$value" "$lo" "$hi" "$width" "$exclude"); then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    kind="${out%%$'\t'*}"; rest="${out#*$'\t'}"
+    case "$kind" in
+      nan)     printf "  '%s' is not a number\n" "$value" >&2 ;;
+      low)     printf '  leaf must be greater than %s\n' "$rest" >&2 ;;
+      high)    printf '  leaf must be less than %s\n' "$rest" >&2 ;;
+      ceiling) printf '  leaf exceeds the maximum (%s)\n' "$rest" >&2 ;;
+      noop)    printf '  already at %s — pick a different leaf\n' "$rest" >&2 ;;
+    esac
+  done
 }
 
 # Interactive branch picker. $1 = prefix label (for the prompt only), $2 =
