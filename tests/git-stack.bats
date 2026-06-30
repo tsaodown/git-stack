@@ -255,6 +255,23 @@ teardown() { teardown_repo; }
   [[ "$output" == *"amend"* ]]
 }
 
+@test "amend: records one snapshot, not a paired restack (ADR 0010)" {
+  # Amending a non-top branch reflows the branch above, so cmd_restack runs and
+  # would have taken its own snapshot pre-ADR-0010. It must now be suppressed:
+  # one amend entry, no restack entry, exactly one snapshot run-id.
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  git stack amend -m "reworded" --no-color
+  run git stack history --no-color
+  assert_status 0
+  assert_output_contains "amend"
+  [[ "$output" != *"restack"* ]]
+  local run_ids
+  run_ids=$(git for-each-ref --format='%(refname)' refs/stack-backup/feat/ \
+    | sed -E 's#^refs/stack-backup/feat/([^/]+)/.*#\1#' | sort -u | wc -l | tr -d ' ')
+  assert_eq "$run_ids" "1" "snapshot run-id count"
+}
+
 @test "amend: refuses early (before pre-commit hook) when nothing staged and tree dirty" {
   make_stack_branches feat 01-a 02-b
   git checkout -q feat/01-a

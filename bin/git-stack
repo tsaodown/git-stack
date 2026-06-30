@@ -5953,9 +5953,10 @@ cmd_amend() {
   fi
 
   # Snapshot the stack BEFORE git commit --amend rewrites the current branch
-  # tip. cmd_restack will take a second 'restack' snapshot — intentional:
-  # the amend snapshot captures pre-amend SHAs, the restack snapshot
-  # captures post-amend SHAs of the upper branches.
+  # tip. This up-front snapshot is the sole restore point; the nested cmd_restack
+  # below would take a redundant post-amend one, so it is suppressed (ADR 0010),
+  # matching clean's covering-snapshot pattern.
+  local _amend_snapped=0
   local _amend_prefix=""
   _amend_prefix=$(detect_prefix "" 2>/dev/null) || _amend_prefix=""
   if [[ -n "$_amend_prefix" ]]; then
@@ -5963,6 +5964,7 @@ cmd_amend() {
     _load_stack_branches "$_amend_prefix" _amend_branches
     if (( ${#_amend_branches[@]} > 0 )); then
       snapshot_stack amend "$_amend_prefix" "${_amend_branches[@]}"
+      _amend_snapped=1
     fi
   fi
 
@@ -5974,7 +5976,15 @@ cmd_amend() {
   local args=()
   (( push )) && args+=("--push")
   (( force )) && args+=("--force")
-  cmd_restack ${args[@]+"${args[@]}"}
+  # Suppress cmd_restack's redundant snapshot — but only when our own up-front
+  # snapshot fired, else the restack snapshot is the only restore point.
+  if (( _amend_snapped )); then
+    _SNAPSHOT_SUPPRESS=1
+    cmd_restack ${args[@]+"${args[@]}"}
+    _SNAPSHOT_SUPPRESS=0
+  else
+    cmd_restack ${args[@]+"${args[@]}"}
+  fi
 }
 
 # Push the whole stack to the remote — additive only: force-with-lease on every
