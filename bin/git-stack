@@ -5177,6 +5177,11 @@ drop: no <branch> given and HEAD is detached"
   local victim_idx
   victim_idx=$(branch_index "$victim" "${branches[@]}")
 
+  # Capture the victim's tip before we delete its ref below — it's the one commit
+  # the child reflow is allowed to drop (see STACK_SAFE_DROP at the reflow setup).
+  local victim_sha
+  victim_sha=$(git rev-parse "refs/heads/${victim}")
+
   local n=${#branches[@]}
   local n_children=$(( n - 1 - victim_idx ))
 
@@ -5213,19 +5218,32 @@ drop: no <branch> given and HEAD is detached"
     return 0
   fi
 
-  # Multi-commit pre-check: each reflowed child must be ≤1 commit beyond its
-  # *current* predecessor (the same shape move uses), else its tip-only reflow
-  # would silently drop all but the tip. --force waives. The victim itself is
+  # Resolvability pre-flight: mirror the engine's multi-commit guard against each
+  # child's *post-drop* predecessor so an unresolvable reflow refuses atomically
+  # — before the victim ref is deleted below — instead of dying mid-reflow with
+  # the delete already applied. The first child lands on the victim's predecessor
+  # (pred_ref); the rest keep their current predecessor (the chain above the
+  # victim is untouched). The victim's tip is the one commit a tip-only reflow may
+  # drop, so it's excluded via --not; a child threading any *other* extra commit
+  # (e.g. a manually-built branch off the victim's middle, which the count diff
+  # alone can't see) still refuses. --force waives the whole pre-flight; the
+  # engine's STACK_FORCE backstop then drops tips knowingly. The victim itself is
   # discarded wholesale, so it needs no guard.
   if (( ! opt_force )); then
-    local i pb cnt_b cnt_prev nc
+    local i pb pf_pred cnt_b cnt_prev nc
     for ((i = victim_idx + 1; i < n; i++)); do
-      pb="${branches[$i]}"
-      cnt_b=$(git rev-list --count "refs/heads/$pb" 2>/dev/null || echo 0)
-      cnt_prev=$(git rev-list --count "refs/heads/${branches[$((i - 1))]}" 2>/dev/null || echo 0)
+      pb="refs/heads/${branches[$i]}"
+      if (( i == victim_idx + 1 )); then
+        pf_pred="$pred_ref"
+      else
+        pf_pred="refs/heads/${branches[$((i - 1))]}"
+      fi
+      cnt_b=$(git rev-list --count "$pb" 2>/dev/null || echo 0)
+      cnt_prev=$(git rev-list --count "$pf_pred" 2>/dev/null || echo 0)
       nc=$((cnt_b - cnt_prev))
-      if (( nc > 1 )); then
-        die "branch '$pb' has $nc commits beyond its current predecessor; drop would reflow it tip-only and lose all but the tip. Pass --force to proceed (cherry-picks tip only) or rebase the branch manually first."
+      (( nc > 1 )) || continue
+      if ! _reflow_own_only "$pf_pred" "$pb" "$victim_sha"; then
+        die "branch '${branches[$i]}' has commits beyond '${pf_pred#refs/heads/}' that drop didn't discard; reflowing it tip-only would lose all but the tip. Squash/rebase '${branches[$i]}' to a single commit and retry, or pass --force to cherry-pick the tip and deliberately drop them."
       fi
     done
   fi
@@ -5308,11 +5326,16 @@ drop: no <branch> given and HEAD is detached"
     STACK_STARTING_BRANCH=$(current_branch 2>/dev/null || echo "")
     STACK_PREFIX="$prefix"
     STACK_PUSH=0
-    # move's pre-check verified each child is ≤1 commit beyond its current
-    # predecessor; do_one_step's guard compares against the *new* predecessor,
-    # which false-positives because the child's history still contains the
-    # dropped branch's commit. STACK_FORCE=1 suppresses that guard.
-    STACK_FORCE=1
+    # do_one_step's guard compares each child against its *new* predecessor and
+    # would false-positive: the child's history still contains the dropped
+    # branch's commit, registering as an extra commit. Rather than waive the
+    # guard wholesale (STACK_FORCE), name exactly what's safe to lose — the
+    # victim's tip. The guard's `--not "$victim_sha"` then excludes it (and its
+    # ancestors), so a legitimate child collapses to just its own tip and passes,
+    # while a child carrying additional unmerged work still refuses. --force
+    # still suppresses the guard outright (and skips the pre-check above).
+    STACK_SAFE_DROP=("$victim_sha")
+    STACK_FORCE="$opt_force"
     STACK_ONTO=""
     STACK_ONTO_REF=""
     STACK_FROM_IDX="$first_affected"

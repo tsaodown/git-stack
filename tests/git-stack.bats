@@ -2967,6 +2967,47 @@ make_disjoint_stack() {
   refute git cat-file -e "feat/03-c:c1-file"
 }
 
+@test "drop: a child carrying its own unmerged work beyond the victim refuses (safe-drop)" {
+  # Defense-in-depth for the runtime guard, distinct from the count-based
+  # pre-check. Out-of-model shape (git-stack never builds it; only manual git
+  # surgery can): the victim 02-b is two commits (b1, b2), and 03-c branches off
+  # 02-b's MIDDLE (b1) with two own commits. count(03-c) - count(02-b) == 1, so
+  # the pre-check is fooled and passes. But 03-c's real work above 01-a is {b1's
+  # change carried forward, x, y} and b2 (the victim tip) isn't even in its
+  # history — so STACK_SAFE_DROP=(b2) can't excuse the extra commit and the
+  # reflow refuses rather than tip-only'ing onto 01-a and silently dropping x.
+  make_disjoint_stack feat 01-a
+  git checkout -q -b feat/02-b
+  printf 'b1\n' > b-file && git add b-file && git commit -q -m '02-b part 1'
+  local b1; b1=$(git rev-parse HEAD)
+  printf 'b2\n' >> b-file && git add b-file && git commit -q -m '02-b part 2'
+  git checkout -q -b feat/03-c "$b1"
+  printf 'x\n' > x-file && git add x-file && git commit -q -m '03-c x'
+  printf 'y\n' > y-file && git add y-file && git commit -q -m '03-c y'
+
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 1
+  assert_output_contains "commits beyond"
+  # Nothing dropped: victim survives and 03-c keeps its own work intact.
+  assert_branch_exists feat/02-b
+  assert git cat-file -e "feat/03-c:x-file"
+  assert git cat-file -e "feat/03-c:y-file"
+}
+
+@test "drop: empty victim sharing its predecessor's tip reflows the child cleanly" {
+  # victim_sha equals the predecessor's tip (empty branch), so it's a harmless
+  # member of STACK_SAFE_DROP. The child must still reflow onto the predecessor.
+  make_disjoint_stack feat 01-a
+  git checkout -q -b feat/02-b   # empty: shares feat/01-a's tip
+  make_disjoint_stack feat 03-c  # 03-c carries its own file atop the empty 02-b
+  local pred_sha; pred_sha=$(git rev-parse feat/01-a)
+  run git stack drop feat/02-b --yes --no-color
+  assert_status 0
+  assert_branch_absent feat/02-b
+  assert_branch_parent_is feat/03-c "$pred_sha"
+  assert git cat-file -e "feat/03-c:03-c-file"
+}
+
 @test "drop: refuses when the victim has an open PR, pointing at pr desync" {
   make_disjoint_stack feat 01-a 02-b 03-c
   make_remote_origin

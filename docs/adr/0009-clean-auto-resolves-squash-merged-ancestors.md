@@ -93,10 +93,11 @@ restack), because the signal is gone-upstream, not merge-verified.
 - Safety is anchored on the gone-upstream signal and structural reachability, never a
   patch-id heuristic — `clean` only ever drops commits it proved merged. Genuinely
   unmerged work makes it refuse, atomically.
-- `STACK_SAFE_DROP` is a **general** engine primitive. Only `clean` populates it today.
-  `drop` (ADR 0008) currently waives the same guard with a blunt `STACK_FORCE=1`; it is a
-  candidate to tighten later — set `STACK_SAFE_DROP=("$victim_sha")` so the guard still
-  protects a child that carries unmerged work of its own. (Deferred; not in this change.)
+- `STACK_SAFE_DROP` is a **general** engine primitive, now populated by both `clean` and
+  `drop`. `drop` (ADR 0008) was tightened to set `STACK_SAFE_DROP=("$victim_sha")` — plus a
+  precise `_reflow_own_only` pre-flight mirroring this one — in place of its old blunt
+  `STACK_FORCE=1` waive, so a child carrying unmerged work of its own still refuses
+  (atomically, before the victim is deleted). `--force` still waives.
 - Behavior change: a survivor that previously died mid-reflow with a `--force` hint now
   either auto-resolves or refuses up front. The engine's refusal message changed wording
   ("…that aren't merged — … Squash/rebase … or pass --force …").

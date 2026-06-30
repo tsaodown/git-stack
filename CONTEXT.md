@@ -292,9 +292,14 @@ delete; **lone branch → delete + land on base** (not deferred to **clean**,
 which only prunes `[gone]` branches, never a live lone one). HEAD lands on the
 predecessor (base when bottom/lone). Destructive: snapshots first (undo via
 `history restore`), refuses a dirty tree, prompts `[Y/n]` (default yes), needs
-`--yes` off a TTY. Carries **fold**'s ceremony and **move**'s multi-commit
-handling — pre-checks each child is ≤1 commit beyond its current predecessor
-(`--force` waives), then forces the engine guard. **Fully local** (ADR 0008,
+`--yes` off a TTY. Carries **fold**'s ceremony and a precise
+multi-commit pre-flight — for each child it runs the engine's own
+`_reflow_own_only` check against the child's *post-drop* predecessor with the
+victim's tip in the **safe-to-drop set** (`--force` waives). So the one commit
+`drop` discards (the victim's) is excused while any *other* unmerged commit a
+child carries makes the run **refuse atomically**, before the victim ref is
+deleted. The engine run carries the same `STACK_SAFE_DROP=("$victim_sha")` as a
+backstop instead of the old blunt force-waive (ADR 0008/0009). **Fully local** (ADR 0008,
 like **move**): no push/rename/`pr sync`, leaves the orphaned remote for
 **clean** to reap. PR gate is narrower than move's — `drop` does *not* rename
 children, so their PRs survive a later `pr sync`; only the **victim**'s head-PR

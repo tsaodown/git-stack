@@ -77,14 +77,23 @@ breadcrumb to.
 So `drop` refuses **only when the victim has an open PR**, pointing at the
 `pr desync → drop → pr sync` trio. Children pass through ungated.
 
-### 5. Multi-commit children — `move`'s pre-check + `STACK_FORCE`
+### 5. Multi-commit children — precise pre-flight + the safe-to-drop set
 
 reflow-pick is tip-only, so a genuinely multi-commit child would lose all but its tip.
-`drop` reuses `move`'s pattern: pre-check each reflowed child is ≤1 commit beyond its
-*current* predecessor (`--force` waives), then set `STACK_FORCE=1` for the engine run so
-the new-predecessor count — which false-positives because the child's history still
-contains the dropped branch's commit — does not abort the reflow. The victim itself needs
-no guard: it is discarded wholesale, so multi-commit / merge-commit victims are fine.
+The child *will* show one extra commit after the drop — the victim's, which it legitimately
+threads and which the reflow is meant to discard. So a blunt count guard against the
+new predecessor false-positives. `drop` names exactly what's safe to lose: it captures the
+victim's tip up front (`victim_sha`, before deleting the ref) and feeds it as the engine's
+`STACK_SAFE_DROP` (ADR 0009's general primitive) instead of waiving the guard with
+`STACK_FORCE`. A resolvability **pre-flight** mirrors the engine's `_reflow_own_only` check
+against each child's *post-drop* predecessor (first child → the victim's predecessor; the
+rest → their current predecessor), excluding `victim_sha` via `--not`. A child whose only
+extra commit is the victim's collapses to its own tip and passes; a child carrying *any
+other* unmerged commit — including out-of-model shapes the count diff alone can't see, e.g.
+a branch built off the victim's middle — makes the run **refuse atomically, before the
+victim ref is deleted**. `--force` waives the pre-flight and sets `STACK_FORCE=1`, knowingly
+dropping tips. The victim itself needs no guard: it is discarded wholesale, so multi-commit /
+merge-commit victims are fine. (Originally `move`'s `STACK_FORCE=1` waive; tightened per ADR 0009.)
 
 ### 6. Destructive ceremony — mirror `fold`
 
@@ -107,8 +116,9 @@ single-target contract.
   discards it, `clean` prunes the already-gone.
 - `drop` is local-only with a single-branch PR gate; the recoverable rest (children's
   stale PRs) is left to `pr sync`, the orphaned remote to `clean`.
-- Implementation reuses `cmd_fold`'s delete + `_doctor_finish` shape and `cmd_move`'s
-  multi-commit pre-check / `STACK_FORCE`; no new engine phases.
+- Implementation reuses `cmd_fold`'s delete + `_doctor_finish` shape; the multi-commit
+  handling is a precise `_reflow_own_only` pre-flight + `STACK_SAFE_DROP=("$victim_sha")`
+  (ADR 0009), not a blunt `STACK_FORCE` waive; no new engine phases.
 - **Deferred:** the lone-branch case empties a stack, leaving its `stack-backup`
   snapshots unreachable from a base HEAD (`git stack history` resolves the prefix from
   HEAD). `drop` still snapshots for undo; reaping/reachability of orphaned history for a
