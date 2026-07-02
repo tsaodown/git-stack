@@ -176,11 +176,12 @@ _carry_finish() {
 }
 
 # create-only: show what's dirty and ask for a single keystroke. 0 = carry.
-_prompt_carry_into_stack() {  # $1 = prefix (for the message)
+# No prefix in the message — this decision runs before the prefix is prompted.
+_prompt_carry_into_stack() {
   printf '%suncommitted changes:%s\n' "$C_DIM" "$C_RESET" >&2
   git status --short --untracked-files=no >&2
-  printf 'carry these into new stack %s%s%s? %s[y/N]%s ' \
-    "$C_CYAN" "$1" "$C_RESET" "$C_DIM" "$C_RESET" >&2
+  printf 'carry these into the new stack? %s[y/N]%s ' \
+    "$C_DIM" "$C_RESET" >&2
   local ans=""
   read -r -n 1 ans < /dev/tty || { echo >&2; return 1; }
   echo >&2
@@ -2107,16 +2108,20 @@ ${b}Stack-level subcommands:${r}
                                     and check out its tip (highest-leaf
                                     branch) — a fast hop, even from inside
                                     another stack.
-  ${sub}create${r} <prefix> <slug> [${fl}--onto${r} <ref>] [${fl}--stash${r}]
+  ${sub}create${r} [<prefix>] [<slug>] [${fl}--onto${r} <ref>] [${fl}--stash${r}]
                                     Start a brand-new stack: first branch
                                     (leaf \`010\`) off the resolved base
                                     (${fl}stack.base${r} → origin/<default> → local
                                     default), or ${fl}--onto${r} <ref>. Errors if the
                                     prefix already has branches (use ${sub}add${r}).
-                                    Checks out the new branch. A dirty tree
-                                    prompts to carry the uncommitted work into
-                                    the new stack; ${fl}--stash${r} carries it without
-                                    prompting (required to carry non-interactively).
+                                    Checks out the new branch. On a TTY, a
+                                    missing <prefix> or <slug> is prompted for
+                                    (re-prompts on invalid input, keeping what
+                                    you typed); off a TTY it's a usage error.
+                                    A dirty tree prompts to carry the
+                                    uncommitted work into the new stack; ${fl}--stash${r}
+                                    carries it without prompting (required to
+                                    carry non-interactively).
   ${sub}sync${r}                              Push the whole stack to the remote, additive
                                     only (force-with-lease on every branch; no
                                     deletes, no PR work). Remote cleanup is
@@ -3466,10 +3471,59 @@ cmd_rename() {
 # Slug validation: permissive — allows letters, digits, underscores, hyphens.
 # Must start with a letter or underscore. Slashes forbidden (they're the
 # branch suffix separator).
+#
+# Returns 0 if valid; else sets _VALIDATE_MSG and returns 1 (no die). Callers on
+# the argument path do `|| die "$cmd: $_VALIDATE_MSG"`; the interactive
+# re-prompt loops show the message and ask again. The message carries no command
+# prefix so either caller can frame it.
 _validate_slug() {
   local s="$1"
-  [[ -n "$s" ]] || die "new: slug is required"
-  [[ "$s" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || die "new: slug '$s' invalid (must match ^[A-Za-z_][A-Za-z0-9_-]*\$)"
+  _VALIDATE_MSG=""
+  if [[ -z "$s" ]]; then _VALIDATE_MSG="slug is required"; return 1; fi
+  if [[ ! "$s" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+    _VALIDATE_MSG="slug '$s' invalid (must match ^[A-Za-z_][A-Za-z0-9_-]*\$)"
+    return 1
+  fi
+  return 0
+}
+
+# Prefix shape validation (mirrors the old bootstrap checks). Takes the raw
+# prefix argument (no trailing slash required). Returns 0 if valid; else sets
+# _VALIDATE_MSG and returns 1. Does NOT check emptiness-of-stack (that needs a
+# repo + ref scan) — cmd_create does that separately.
+_validate_prefix() {
+  local p="${1%/}"
+  _VALIDATE_MSG=""
+  if [[ -z "$p" || "$p" == "/" ]]; then _VALIDATE_MSG="prefix is empty"; return 1; fi
+  if [[ "$p" == /* ]]; then _VALIDATE_MSG="prefix must not start with /"; return 1; fi
+  if [[ "$p" == *' '* ]]; then _VALIDATE_MSG="prefix must not contain spaces"; return 1; fi
+  local first_seg="${p##*/}"
+  if [[ "$first_seg" =~ ^[0-9]+- ]]; then
+    _VALIDATE_MSG="prefix '$p/' would clash with leaf-numbering pattern"
+    return 1
+  fi
+  return 0
+}
+
+# Prompt for a single required value on /dev/tty, re-editing a rejected prior
+# entry in place where the shell supports it.
+#
+#   _prompt_prefill <label> <prev_value> <out_var>
+#
+# On bash 4+ the prior value is pre-filled on the input line (readline `-i`), so
+# the user edits rather than retypes. On bash 3.2 (no `read -i`) it degrades to a
+# blank prompt whose label already carries the rejected value + reason, so the
+# information isn't lost — only the in-place edit is. Returns non-zero on EOF
+# (Ctrl-D) so callers can abort; the read value lands in <out_var>.
+_prompt_prefill() {
+  local label="$1" prev="$2" out="$3" reply=""
+  printf '%s%s%s ' "$C_DIM" "$label" "$C_RESET" >&2
+  if (( BASH_VERSINFO[0] >= 4 )) && [[ -n "$prev" ]]; then
+    read -e -i "$prev" -r reply < /dev/tty || return 1
+  else
+    read -r reply < /dev/tty || return 1
+  fi
+  printf -v "$out" '%s' "$reply"
 }
 
 # Check the stack for an existing branch with the given slug suffix.
@@ -3893,13 +3947,14 @@ cmd_add() {
   done
 
   # If no slug was passed and we have a TTY, prompt for one. Non-TTY callers
-  # still get the existing "slug is required" die from _validate_slug.
+  # still get the existing "slug is required" die from _validate_slug. (A
+  # re-prompt loop here is a tracked follow-up; today this prompt is single-shot.)
   if [[ -z "$slug" ]] && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
     printf '%sslug:%s ' "$C_DIM" "$C_RESET" >&2
     read -r slug < /dev/tty || die "add: aborted"
   fi
 
-  _validate_slug "$slug"
+  _validate_slug "$slug" || die "add: $_VALIDATE_MSG"
 
   # --at requires a non-negative integer (no slugs or branch refs).
   if [[ -n "$opt_at" && ! "$opt_at" =~ ^[0-9]+$ ]]; then
@@ -4066,10 +4121,15 @@ cmd_add() {
   log "${C_GREEN}add${C_RESET}     ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(from ${predecessor_label})${C_RESET}"
 }
 
-# Start a brand-new stack: create the first branch off the resolved base
-# (stack.base → origin/<default> → local default), or --onto <ref>. Errors if
-# the prefix already has branches (use `add` for that). Checks out the new
-# branch. The first leaf is sparse width-3 (010).
+# Start a brand-new stack: the first branch off the resolved base (stack.base →
+# origin/<default> → local default), or --onto <ref>. Errors if the prefix
+# already has branches (use `add` for that). Checks out the new branch. The
+# first leaf is sparse width-3 (010).
+#
+# <prefix> and <slug> may be omitted on a TTY — each missing one is prompted for
+# in a re-prompt loop that preserves what you've already entered (a rejected
+# value is re-edited in place on bash 4+, ADR 0012). Non-interactively (no TTY),
+# a missing value is a usage error, preserving the scriptable contract.
 cmd_create() {
   OPT_PREFIX=""; OPT_ONTO=""; OPT_CARRY=0
   local prefix_arg="" slug=""
@@ -4089,31 +4149,31 @@ cmd_create() {
     esac
   done
 
-  [[ -n "$prefix_arg" ]] || die "usage: git stack create <prefix> <slug> [--onto <ref>] [--stash]"
-  [[ -n "$slug" ]] || die "create: missing <slug> (usage: git stack create <prefix> <slug>)"
-  _validate_slug "$slug"
+  local have_tty=0
+  if [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then have_tty=1; fi
 
-  # Validate the prefix shape (mirrors the old bootstrap checks).
-  local prefix="${prefix_arg%/}/"
-  [[ -n "$prefix" && "$prefix" != "/" ]] || die "create: prefix is empty"
-  [[ "$prefix" != /* ]] || die "create: prefix must not start with /"
-  [[ "$prefix" != *' '* ]] || die "create: prefix must not contain spaces"
-  local first_seg="${prefix%/}"; first_seg="${first_seg##*/}"
-  [[ ! "$first_seg" =~ ^[0-9]+- ]] || die "create: prefix '$prefix' would clash with leaf-numbering pattern"
+  # Values passed as arguments hard-fail on bad input (non-interactive contract
+  # preserved); missing values are prompted later on a TTY, else a usage die.
+  if [[ -n "$prefix_arg" ]]; then
+    _validate_prefix "$prefix_arg" || die "create: $_VALIDATE_MSG"
+  elif (( ! have_tty )); then
+    die "usage: git stack create <prefix> <slug> [--onto <ref>] [--stash]"
+  fi
+  if [[ -n "$slug" ]]; then
+    _validate_slug "$slug" || die "create: $_VALIDATE_MSG"
+  elif (( ! have_tty )); then
+    die "create: missing <slug> (usage: git stack create <prefix> <slug>)"
+  fi
 
   require_in_repo
   require_no_op_in_progress
   require_no_state_file
-  # No require_clean_tree: a dirty tree may be carried into the new stack (see
-  # the _carry_begin block below). Read-only until the snapshot.
+  # No require_clean_tree: a dirty tree may be carried into the new stack (the
+  # carry decision runs below, before prompting; the stash is deferred to the
+  # mutation). Read-only until the snapshot.
 
-  # Guard: the prefix must be empty — otherwise this is an `add`.
-  local branches=()
-  _load_stack_branches "$prefix" branches
-  (( ${#branches[@]} == 0 )) \
-    || die "create: stack '$prefix' already has ${#branches[@]} branch(es); use 'git stack add <slug>' ${C_DIM}[gstkad]${C_RESET} to add to it"
-
-  # Resolve the base ref: --onto override, else the configured/default base.
+  # Resolve the base ref (fail fast, before any prompt): --onto override, else
+  # the configured/default base.
   local predecessor_ref predecessor_label
   if [[ -n "$OPT_ONTO" ]]; then
     git rev-parse --verify --quiet "${OPT_ONTO}^{commit}" >/dev/null \
@@ -4128,6 +4188,65 @@ cmd_create() {
       || die "create: cannot resolve base ref for '$parent_name'"
     predecessor_label="$parent_name"
   fi
+  local predecessor_sha
+  predecessor_sha=$(git rev-parse "$predecessor_ref") \
+    || die "create: cannot resolve base '$predecessor_ref'"
+
+  # Dirty-tree carry DECISION — before prompting, so declining (or a non-TTY
+  # dirty tree) aborts before the user types anything. The stash itself is
+  # deferred to just before the ref mutation, so a Ctrl-C mid-prompt strands
+  # nothing. --stash is the scriptable affirmative.
+  local do_carry=0
+  if _tree_is_dirty; then
+    if (( OPT_CARRY )); then
+      do_carry=1
+    elif (( have_tty )); then
+      if _prompt_carry_into_stack; then do_carry=1; else die "create: aborted (changes left untouched)"; fi
+    else
+      die "working tree has uncommitted changes; commit or stash first (or pass --stash)"
+    fi
+  fi
+
+  # Resolve the prefix: validate shape (done above for the arg path) and require
+  # it be empty of branches (else this is an `add`). A prompted prefix loops on
+  # either failure; a passed one dies.
+  local prefix="" branches=()
+  if [[ -n "$prefix_arg" ]]; then
+    prefix="${prefix_arg%/}/"
+    _load_stack_branches "$prefix" branches
+    (( ${#branches[@]} == 0 )) \
+      || die "create: stack '$prefix' already has ${#branches[@]} branch(es); use 'git stack add <slug>' ${C_DIM}[gstkad]${C_RESET} to add to it"
+  else
+    local _prev=""
+    while :; do
+      _prompt_prefill "prefix:" "$_prev" prefix_arg || die "create: aborted"
+      _prev="$prefix_arg"
+      if ! _validate_prefix "$prefix_arg"; then
+        printf '  %s\n' "$_VALIDATE_MSG" >&2
+        continue
+      fi
+      prefix="${prefix_arg%/}/"
+      _load_stack_branches "$prefix" branches
+      if (( ${#branches[@]} != 0 )); then
+        printf "  stack '%s' already has %d branch(es); pick another prefix (Ctrl-C to cancel and use 'add')\n" \
+          "$prefix" "${#branches[@]}" >&2
+        continue
+      fi
+      break
+    done
+  fi
+
+  # Resolve the slug: a prompted slug loops until valid; a passed one was
+  # validated above.
+  if [[ -z "$slug" ]]; then
+    local _prev=""
+    while :; do
+      _prompt_prefill "slug:" "$_prev" slug || die "create: aborted"
+      _prev="$slug"
+      if _validate_slug "$slug"; then break; fi
+      printf '  %s\n' "$_VALIDATE_MSG" >&2
+    done
+  fi
 
   # First leaf: sparse width-3 (010).
   local width new_num leaf new_branch
@@ -4136,25 +4255,14 @@ cmd_create() {
   leaf=$(_format_leaf "$new_num" "$width")
   new_branch="${prefix}${leaf}-${slug}"
 
+  # Belt-and-suspenders: unreachable once the prefix is confirmed empty (the leaf
+  # would have been counted), but cheap to keep.
   if git rev-parse --verify --quiet "refs/heads/$new_branch" >/dev/null; then
     die "create: target ref 'refs/heads/$new_branch' already exists"
   fi
 
-  local predecessor_sha
-  predecessor_sha=$(git rev-parse "$predecessor_ref") \
-    || die "create: cannot resolve base '$predecessor_ref'"
-
-  # Dirty tree: offer to carry the work into the new stack. Gated — carrying
-  # onto a fresh stack off the base branch is a bigger surprise than `add`.
-  # --stash is the explicit, scriptable affirmative; otherwise prompt on a TTY
-  # and refuse non-interactively.
-  if _tree_is_dirty; then
-    if (( ! OPT_CARRY )); then
-      if [[ ! -e /dev/tty ]] || { [[ ! -t 0 ]] && [[ ! -t 2 ]]; }; then
-        die "working tree has uncommitted changes; commit or stash first (or pass --stash)"
-      fi
-      _prompt_carry_into_stack "$prefix" || die "create: aborted (changes left untouched)"
-    fi
+  # Carry stash action (deferred from the decision above).
+  if (( do_carry )); then
     _carry_begin "$predecessor_sha" "git-stack create → $new_branch"
   fi
 

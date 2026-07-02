@@ -2223,6 +2223,14 @@ $old_footer"
   [[ "$output" == *"slug"* ]]
 }
 
+@test "create: no args off a TTY is a usage error (does not hang)" {
+  # bats has no controlling terminal, so the interactive prompt path is
+  # unreachable; a missing prefix must fall through to the usage die.
+  run git stack create --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"usage: git stack create"* ]]
+}
+
 @test "create --onto: roots the first branch on the given ref" {
   git commit -q --allow-empty -m extra
   local onto

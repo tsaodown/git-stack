@@ -732,3 +732,62 @@ scan() {
   [ "$status" -eq 0 ]
   [ "$output" == $'squash\t1\tabsorbed' ]
 }
+
+# --- prefix / slug validation (pure; return-not-die, message in _VALIDATE_MSG) ---
+
+validate_prefix() {
+  run bash -c "source '$GIT_STACK_BIN'; _validate_prefix \"\$1\" && echo OK || echo \"ERR:\$_VALIDATE_MSG\"" _ "$1"
+}
+validate_slug() {
+  run bash -c "source '$GIT_STACK_BIN'; _validate_slug \"\$1\" && echo OK || echo \"ERR:\$_VALIDATE_MSG\"" _ "$1"
+}
+
+@test "validate_prefix: accepts a normal nested prefix" {
+  validate_prefix "edd/feature"
+  [ "$output" == OK ]
+}
+
+@test "validate_prefix: tolerates a trailing slash" {
+  validate_prefix "edd/"
+  [ "$output" == OK ]
+}
+
+@test "validate_prefix: rejects empty" {
+  validate_prefix ""
+  [ "$output" == "ERR:prefix is empty" ]
+}
+
+@test "validate_prefix: rejects a leading slash" {
+  validate_prefix "/foo"
+  [ "$output" == "ERR:prefix must not start with /" ]
+}
+
+@test "validate_prefix: rejects spaces" {
+  validate_prefix "foo bar"
+  [ "$output" == "ERR:prefix must not contain spaces" ]
+}
+
+@test "validate_prefix: rejects a first segment that clashes with leaf numbering" {
+  validate_prefix "edd/010-x"
+  [[ "$output" == "ERR:"*"leaf-numbering pattern" ]]
+}
+
+@test "validate_slug: accepts letters, digits, underscore, hyphen" {
+  validate_slug "my-slug_2"
+  [ "$output" == OK ]
+}
+
+@test "validate_slug: rejects empty" {
+  validate_slug ""
+  [ "$output" == "ERR:slug is required" ]
+}
+
+@test "validate_slug: rejects a leading digit" {
+  validate_slug "1abc"
+  [[ "$output" == "ERR:slug '1abc' invalid"* ]]
+}
+
+@test "validate_slug: rejects a slash" {
+  validate_slug "a/b"
+  [[ "$output" == "ERR:slug 'a/b' invalid"* ]]
+}
