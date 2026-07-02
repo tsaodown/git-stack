@@ -2049,6 +2049,17 @@ $old_footer"
   [[ "$output" == *"slug"* ]]
 }
 
+@test "add (no slug, non-TTY): dies with slug-required" {
+  # Pins the non-TTY contract: with no slug and no controlling terminal, add
+  # falls through to _validate_slug rather than prompting. The interactive
+  # re-prompt loop (ADR 0012) reads /dev/tty, which the bats harness has no
+  # terminal for, so it's verified by inspection, not here.
+  make_stack_branches feat 01-a
+  run git stack add --no-color </dev/null
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"slug is required"* ]]
+}
+
 @test "add --after: midpoint between named ref and successor (sparse stack)" {
   # Sparse stack (3-digit width) has gaps for inserts.
   make_stack_branches feat 010-a 020-b 030-c

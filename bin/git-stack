@@ -3889,7 +3889,7 @@ _pick_position_for_new() {
 
   # Step 2: pick before/after.
   local pos
-  pos=$(_pick_one "position relative to $ref_branch:" "before $ref_branch" "after $ref_branch") \
+  pos=$(_pick_one "position relative to $ref_branch:" "after $ref_branch" "before $ref_branch") \
     || return 1
   local pos_kw="before"
   if [[ "$pos" == "after $ref_branch" ]]; then pos_kw="after"; fi
@@ -3946,15 +3946,17 @@ cmd_add() {
     esac
   done
 
-  # If no slug was passed and we have a TTY, prompt for one. Non-TTY callers
-  # still get the existing "slug is required" die from _validate_slug. (A
-  # re-prompt loop here is a tracked follow-up; today this prompt is single-shot.)
+  # Slug resolution splits by path. A passed slug is validated now (die on bad
+  # shape); collision is checked below once the stack loads. An omitted slug on a
+  # TTY defers to the re-prompt loop after _load_stack_branches (ADR 0012) — it
+  # needs `branches` to catch collisions in the loop. An omitted slug off a TTY
+  # falls through to _validate_slug, which dies "slug is required".
+  local prompt_slug=0
   if [[ -z "$slug" ]] && [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]]; then
-    printf '%sslug:%s ' "$C_DIM" "$C_RESET" >&2
-    read -r slug < /dev/tty || die "add: aborted"
+    prompt_slug=1
+  else
+    _validate_slug "$slug" || die "add: $_VALIDATE_MSG"
   fi
-
-  _validate_slug "$slug" || die "add: $_VALIDATE_MSG"
 
   # --at requires a non-negative integer (no slugs or branch refs).
   if [[ -n "$opt_at" && ! "$opt_at" =~ ^[0-9]+$ ]]; then
@@ -3993,7 +3995,28 @@ cmd_add() {
     _require_valid_leaf_nums "${branches[@]}"
   fi
 
-  # Slug collision check (against existing stack only).
+  # Interactive slug prompt (deferred from above so the loop can catch collisions
+  # against the now-loaded stack). Re-prompts on bad shape or collision, prefilling
+  # the rejected value where the shell supports it; EOF/Ctrl-D aborts (ADR 0012).
+  if (( prompt_slug )); then
+    local _prev=""
+    while :; do
+      _prompt_prefill "slug:" "$_prev" slug || die "add: aborted"
+      _prev="$slug"
+      if ! _validate_slug "$slug"; then
+        printf '  %s\n' "$_VALIDATE_MSG" >&2
+        continue
+      fi
+      if (( ${#branches[@]} > 0 )) && _check_slug_collision "$slug" "${branches[@]}"; then
+        printf "  slug '%s' collides with existing branch '%s'\n" "$slug" "$_SLUG_COLLISION_BRANCH" >&2
+        continue
+      fi
+      break
+    done
+  fi
+
+  # Slug collision check (against existing stack only). Fires on the arg path; the
+  # interactive path already resolved this in the loop above.
   if (( ${#branches[@]} > 0 )) && _check_slug_collision "$slug" "${branches[@]}"; then
     die "add: slug '$slug' collides with existing branch '$_SLUG_COLLISION_BRANCH'"
   fi

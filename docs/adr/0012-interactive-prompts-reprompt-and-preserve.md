@@ -64,7 +64,8 @@ mutation — so a Ctrl-C mid-prompt strands no stash.
 - Interactive loop + prefill are **not** bats-testable (no controlling terminal);
   the pure validators are unit-tested and the non-TTY usage die is pinned. Same
   coverage boundary as `_confirm`.
-- `add`'s own slug prompt is **not** retrofitted here — it keeps single-shot
-  behavior for now; applying this policy to `add` is a tracked follow-up. Only the
-  mechanical `_validate_slug` return-not-die change touches `add` (behavior-
-  preserving).
+- `add`'s slug prompt follows the same policy. Its loop additionally re-prompts on
+  a collision with an existing stack branch (`_check_slug_collision`), so it sits
+  *after* `_load_stack_branches` — the one structural difference from `create`,
+  whose empty-by-definition prefix has no such case. The argument and non-TTY paths
+  still hard-fail via `_validate_slug`.

@@ -791,3 +791,25 @@ validate_slug() {
   validate_slug "a/b"
   [[ "$output" == "ERR:slug 'a/b' invalid"* ]]
 }
+
+# --- slug collision (pure; matches on the leaf's post-number suffix) ---
+
+check_slug_collision() {
+  local slug="$1"; shift
+  run bash -c "source '$GIT_STACK_BIN'; _check_slug_collision \"\$1\" \"\${@:2}\" && echo \"HIT:\$_SLUG_COLLISION_BRANCH\" || echo CLEAR" _ "$slug" "$@"
+}
+
+@test "check_slug_collision: matches an existing leaf's slug" {
+  check_slug_collision auth feat/01-auth feat/02-other
+  [ "$output" == "HIT:feat/01-auth" ]
+}
+
+@test "check_slug_collision: clear when no leaf shares the slug" {
+  check_slug_collision fresh feat/01-auth feat/02-other
+  [ "$output" == CLEAR ]
+}
+
+@test "check_slug_collision: compares the slug, not the leaf number" {
+  check_slug_collision 01 feat/010-auth
+  [ "$output" == CLEAR ]
+}

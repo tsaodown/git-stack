@@ -248,7 +248,7 @@ first, or takes `--stash`.) Other placements:
 
 ```sh
 git stack add fix --at 7      # explicit leaf → feat/007-fix
-git stack add                 # interactive picker (ref, before/after, leaf)
+git stack add                 # interactive picker (ref, after/before, leaf)
 ```
 
 If the gap is too tight to fit a whole number, the insert is **refused** rather
