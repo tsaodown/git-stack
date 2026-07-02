@@ -304,7 +304,7 @@ resolve_fzf() {
     _pick_or_enter_leaf "leaf number:" 10 20 3 "" "" 15 11 12
   '
   [ "$status" -eq 0 ]
-  [ "${lines[-1]}" == "15" ]
+  [ "${lines[$((${#lines[@]}-1))]}" == "15" ]
 }
 
 @test "pick-or-enter (fzf): typed query wins over fuzzy-matched selection" {
@@ -314,7 +314,7 @@ resolve_fzf() {
     _pick_or_enter_leaf "leaf number:" 10 200 3 "" "" 105 58 152 82 128
   '
   [ "$status" -eq 0 ]
-  [ "${lines[-1]}" == "15" ]
+  [ "${lines[$((${#lines[@]}-1))]}" == "15" ]
 }
 
 @test "pick-or-enter (fzf): out-of-gap entry re-prompts then accepts" {
@@ -327,7 +327,7 @@ resolve_fzf() {
     _pick_or_enter_leaf "leaf number:" 10 20 3 "" "" 15
   '
   [ "$status" -eq 0 ]
-  [ "${lines[-1]}" == "15" ]
+  [ "${lines[$((${#lines[@]}-1))]}" == "15" ]
   [[ "$output" == *"less than 20"* ]]
 }
 
@@ -338,7 +338,7 @@ resolve_fzf() {
     _pick_or_enter_leaf "leaf number:" 10 20 3 15 "" 15 11 12
   '
   [ "$status" -eq 0 ]
-  [ "${lines[-1]}" == "15" ]
+  [ "${lines[$((${#lines[@]}-1))]}" == "15" ]
 }
 
 @test "pick-or-enter (fzf): renumber excludes the current leaf, re-prompts" {
@@ -349,7 +349,7 @@ resolve_fzf() {
     _pick_or_enter_leaf "renumber:" 10 20 3 "" 12 11 13 14
   '
   [ "$status" -eq 0 ]
-  [ "${lines[-1]}" == "13" ]
+  [ "${lines[$((${#lines[@]}-1))]}" == "13" ]
   [[ "$output" == *"already at 12"* ]]
 }
 
