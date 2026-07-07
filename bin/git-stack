@@ -3028,11 +3028,11 @@ cmd_clean() {
   prefix_path="${prefix%/}"
   default_branch=$(cmd_default_branch)
 
-  # 1. Fetch so [gone] tracking + the remote branch list are current.
-  if (( ! opt_dry_run )); then
-    log "${C_DIM}fetching all remotes...${C_RESET}"
-    git fetch --all --prune >/dev/null 2>&1 || warn "git fetch failed; [gone]/remote state may be stale"
-  fi
+  # 1. Fetch so [gone] tracking + the remote branch list are current. --dry-run
+  #    fetches too (read-only, no remote writes): its [gone]/base-moved forecast
+  #    must reflect the same state the real run acts on, or the preview lies.
+  log "${C_DIM}fetching all remotes...${C_RESET}"
+  git fetch --all --prune >/dev/null 2>&1 || warn "git fetch failed; [gone]/remote state may be stale"
 
   # 2. If the current HEAD is a [gone] branch under this prefix, hop to the
   #    default branch first so the prune below can delete it.

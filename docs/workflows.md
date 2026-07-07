@@ -442,11 +442,12 @@ git stack clean --dry-run
 ```
 
 ```
+fetching all remotes...
 prune   1 local branch(es) with gone upstream:
   delete  feat/010-auth (63aeaec)
   (no matching backup refs)
 
-dry run: would reflow 2 survivor(s) onto origin/main; rerun without --dry-run to apply
+dry run: origin/main has moved a1b2c3d..e4f5a6b (+1 commit(s)); would reflow 2 survivor(s) onto it
 ```
 
 ```sh

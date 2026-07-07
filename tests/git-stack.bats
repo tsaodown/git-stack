@@ -616,7 +616,8 @@ HOOK
   git add base.txt
   git commit -q -m "advance main"
   git push -q origin main
-  git fetch -q --prune
+  # No manual fetch: --dry-run must fetch on its own so its forecast reflects the
+  # moved base the real run would act on (regression — it used to skip the fetch).
   run git stack clean --prefix feat/ --dry-run --no-color
   assert_status 0
   assert_output_contains "origin/main has moved"
