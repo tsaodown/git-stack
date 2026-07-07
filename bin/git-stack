@@ -5303,9 +5303,7 @@ fold: no <branch> given and HEAD is detached"
       && log "  ${C_DIM}survivor ${survivor} renamed to ${new_survivor}${C_RESET}"
     log "  ${C_DIM}reflow ${n_children} child(ren) onto ${new_survivor}${C_RESET}"
     if (( ! OPT_NO_PUSH )); then
-      local dr_gate=("$victim")
-      [[ "$new_survivor" != "$survivor" ]] && dr_gate+=("$survivor")
-      if _check_no_open_prs "${dr_gate[@]}"; then
+      if _check_no_open_prs "$victim"; then
         log "  ${C_YELLOW}would close PR #${_ORPHAN_PR_NUM}${C_RESET} for ${_ORPHAN_PR_BRANCH} (needs --allow-pr-rebuild, or 'pr desync' first)"
       fi
     fi
@@ -5313,14 +5311,13 @@ fold: no <branch> given and HEAD is detached"
     return 0
   fi
 
-  # PR gate: deleting the victim (always) and renaming the survivor (slug change)
-  # close their head PRs on GitHub, with no reattach. Refuse by default unless
-  # --allow-pr-rebuild or --no-push.
+  # PR gate: deleting the victim branch closes its head PR on GitHub, with no
+  # reattach — so refuse a victim with an open PR by default. The survivor is
+  # renamed through GitHub's branch-rename API (_remote_rename_batch_or_skip),
+  # which retargets its PR and keeps it open, so it is not gated.
   if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
-    local gate_branches=("$victim")
-    [[ "$new_survivor" != "$survivor" ]] && gate_branches+=("$survivor")
-    if _check_no_open_prs "${gate_branches[@]}"; then
-      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — deleting or renaming a branch closes its head PR on GitHub, with no reattach. Pass --allow-pr-rebuild to accept the close (a breadcrumb to the superseding PR is posted, and 'pr sync' rebuilds the survivor). Or run 'git stack pr desync' first to take the stack offline, then fold, then 'git stack pr sync' to re-publish cleanly."
+    if _check_no_open_prs "$victim"; then
+      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — deleting the victim branch closes its head PR on GitHub, with no reattach. Pass --allow-pr-rebuild to accept the close (a breadcrumb to the superseding PR is posted). Or run 'git stack pr desync' first to take the stack offline, then fold, then 'git stack pr sync' to re-publish cleanly."
     fi
   fi
 

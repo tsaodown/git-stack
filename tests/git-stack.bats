@@ -2893,6 +2893,23 @@ $old_footer"
   [ "$(gh_log_count 'pr comment')" -eq 0 ]
 }
 
+@test "fold: proceeds when only the survivor has an open PR (rename preserves it)" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  # Default slug renames the survivor 010-a -> 010-b; the survivor carries the
+  # only open PR. GitHub's branch-rename API retargets that PR and keeps it
+  # open, so the gate must NOT fire — no --allow-pr-rebuild needed.
+  export GH_PR_feat_010_a__NUM=41
+  run git stack fold feat/020-b --yes --no-color
+  assert_status 0
+  assert_branch_exists feat/010-b
+  assert_branch_absent feat/020-b
+  # Survivor remote-rename was attempted; no breadcrumb (the victim had no PR).
+  [ "$(gh_log_count 'api -X POST')" -ge 1 ]
+  [ "$(gh_log_count 'pr comment')" -eq 0 ]
+}
+
 @test "fold --no-push: skips the PR gate even with an open victim PR" {
   make_stack_branches feat 010-a 020-b 030-c
   make_remote_origin
