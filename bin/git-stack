@@ -1177,7 +1177,8 @@ _engine_finalize() {
   done
   if (( saw_reflow )); then
     local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
-    log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} branches restacked)"
+    local noun="branches"; (( n_processed == 1 )) && noun="branch"
+    log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} ${noun} restacked)"
   else
     log "${C_GREEN}done${C_RESET}    remote sync complete"
   fi
