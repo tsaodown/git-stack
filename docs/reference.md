@@ -27,7 +27,7 @@ mid-flight. `view` fetches by default; pass `--no-fetch` to skip.
 ## Navigating a stack: `checkout` and `pick`
 
 ```sh
-git stack checkout 10      # check out the branch whose leaf starts with 10 (e.g. feat/010-auth)
+git stack checkout 10      # check out the branch whose leaf equals 10 numerically (e.g. feat/010-auth, not feat/100-x)
 git stack checkout         # no number → interactive branch picker
 git stack pick             # choose a stack, jump straight to its tip
 ```
@@ -88,11 +88,13 @@ victim/survivor range, so multi-commit branches fold fine.
 `fold` is destructive, so it snapshots first (undo with `git stack history
 restore @0` — which also warns if a rename left a duplicate-leaf branch behind),
 refuses a dirty tree, prompts `[Y/n]` (default yes), and needs `--yes` when run
-off a TTY. Deleting the victim closes its head PR; because the default slug
-renames the survivor, the survivor's PR usually closes too — so `fold` refuses
-unless you pass `--allow-pr-rebuild` (or `--no-push`). With it, `fold` deletes the
-remote victim branch, re-syncs the PR chain, and leaves a breadcrumb comment on
-each closed PR pointing at the one that supersedes it. See
+off a TTY. Deleting the victim closes its head PR, so `fold` refuses a victim with
+an open PR unless you pass `--allow-pr-rebuild` (or `--no-push`). The survivor
+keeps its PR — even when the default slug renames it, the remote branch is renamed
+through GitHub's rename API, which retargets the PR and leaves it open. With
+`--allow-pr-rebuild`, `fold` deletes the remote victim branch, re-syncs the PR
+chain, and leaves a breadcrumb comment on the closed victim PR pointing at the one
+that supersedes it. See
 [workflows scenario 13](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away).
 
 ## The default branch: `default-branch`
@@ -148,6 +150,7 @@ This defines one short alias per verb:
 | `gstkhr`    | `git stack history restore` |
 | `gstkmv`    | `git stack move`            |
 | `gstkfo`    | `git stack fold`            |
+| `gstkdr`    | `git stack drop`            |
 | `gstkrn`    | `git stack rename`          |
 | `gstkd`     | `git stack doctor`          |
 

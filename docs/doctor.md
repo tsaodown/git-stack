@@ -59,8 +59,8 @@ git stack doctor --no-sync        # rename the remote, but skip pr sync
 ```
 
 Each issue prompts on a TTY: `y` apply, `e` (squash only) apply and edit the
-message in `$EDITOR`, `N` skip (the default), `a` apply all remaining of that
-kind, `q` quit. Duplicate-leaf prompts instead take a space- or comma-separated
+message in `$EDITOR`, `N` skip (the default), `a` apply all remaining fixes
+(squashes and duplicate-leaf groups alike), `q` quit. Duplicate-leaf prompts instead take a space- or comma-separated
 permutation of `1..N` (RET keeps the current order). `--yes` applies everything
 non-interactively using `sort -V` order for duplicates — required off a TTY.
 
@@ -120,8 +120,8 @@ Before any mutating operation, `git stack` writes a
 ```sh
 git stack history                       # list snapshots, newest first
 git stack history show @0               # show what a snapshot contains
-git stack history restore @0            # roll the stack back to that snapshot
-git stack history restore @0 --yes      # skip the confirmation prompt
+git stack history restore @0            # preview the rollback (changes no refs)
+git stack history restore @0 --yes      # apply it — roll the stack back to that snapshot
 ```
 
 ```

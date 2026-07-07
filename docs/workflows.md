@@ -12,6 +12,47 @@ feat/010-auth → feat/020-login → feat/030-profile
 
 Output blocks are captured from real runs; commit SHAs will differ for you.
 
+---
+
+## The lifecycle of a stack
+
+Most stacks follow the same arc — build, publish, revise, extend, land. Here's
+the whole path in one place; each step links to the scenario that covers it in
+depth. Lines marked `# on GitHub` are actions you take in the browser, not
+`git stack` commands.
+
+```sh
+# ── build it ─────────────────────────────────────────  (scenario 1)
+git stack create feat auth          # bottom branch off main
+git stack add login                 # ...write code + commit between each
+git stack add profile
+
+# ── publish the PR chain ─────────────────────────────  (scenario 6)
+git stack pr sync                   # a draft PR per branch
+
+# ── review lands on the bottom branch ────────────────  (scenario 2)
+git stack checkout 10               # jump by leaf number
+git stack amend -m "add auth (validated)" -- auth.txt
+git stack sync                      # force-with-lease the rewritten branches
+git stack pr sync                   # refresh titles + nav footers
+
+# ── realize you need a branch in the middle ──────────  (scenario 4)
+git stack add cache --after feat/010-auth
+git stack sync && git stack pr sync
+
+# on GitHub: reviewers approve; you merge the bottom PR (GitHub deletes its branch)
+
+# ── catch up after the merge ─────────────────────────  (scenario 7)
+git stack clean                     # prune the merged branch + reflow onto origin/main
+git stack pr sync                   # repoint the remaining PRs
+```
+
+Repeat the revise → `sync` → `pr sync` loop and the merge → `clean` → `pr sync`
+loop until the stack is empty. Off the happy path — reordering, renaming, folding
+a branch away, or recovering from a conflict — jump to the matching scenario below.
+
+---
+
 | # | Scenario |
 |---|----------|
 | [1](#1-start-a-new-stack) | Start a new stack |
@@ -178,6 +219,7 @@ git stack sync       # republish the rewritten branches
 
 ```
 fetching all remotes...
+no local branches under 'feat/' have a gone upstream
 base    origin/main moved a1b2c3d..e4f5a6b (+3 commit(s)); restacking 2 survivor(s) onto it
 restack feat/010-auth onto origin/main
 restack feat/020-login onto feat/010-auth
@@ -275,6 +317,7 @@ git stack view
 ```
 
 ```
+restack feat/030-profile onto feat/010-auth
 restack feat/020-login onto feat/030-profile
 done    move complete (+1 renames)
 done    reflow complete (2 branches restacked)
@@ -339,7 +382,7 @@ alignment. It's idempotent: PRs already matching aren't touched.
 
 ```sh
 git stack pr sync --ready       # open as ready-for-review instead of drafts
-git stack pr sync --dry-run     # show planned actions, make no remote calls
+git stack pr sync --dry-run     # show planned actions, make no remote writes
 git stack pr list               # inspect the chain
 ```
 
@@ -355,8 +398,7 @@ branch + PR number, then status badges, then the title:
     [synced] [draft] [changes: bob]
     add login
 
-  feat/030-profile
-    (no PR)
+  feat/030-profile  (no PR)
 ```
 
 > The `[approved]` / `[changes]` / `[checks: …]` badges and the comment count
@@ -636,12 +678,16 @@ on** (`030-backoff`) — exactly the obsolete-superseded case, no flags needed. 
 - Fold the other way with `--up` (into the successor); renumber the result with
   `--at <leaf>`; squash the whole range, so multi-commit branches fold fine.
 - It's destructive, so it snapshots first — undo with
-  `git stack history restore @0` (which warns if the rename left a duplicate-leaf
-  branch behind). It refuses a dirty tree and prompts `[Y/n]` (needs `--yes` off a TTY).
-- Because the default renames the survivor (020-retry → 020-backoff), folding a
-  branch with pushed PRs closes both the victim's PR and the survivor's, so `fold`
-  asks for `--allow-pr-rebuild`: it then deletes the remote victim branch, re-syncs
-  the chain, and comments on each closed PR pointing at the one that supersedes it.
+  `git stack history restore @0 --yes` (which warns if the rename left a
+  duplicate-leaf branch behind; drop `--yes` to preview the rollback first). It
+  refuses a dirty tree and prompts `[Y/n]` (needs `--yes` off a TTY).
+- Folding a branch with a pushed PR closes the **victim's** PR (its branch is
+  deleted), so `fold` asks for `--allow-pr-rebuild` when the victim has one. The
+  **survivor keeps its PR**: even when the default slug renames it (020-retry →
+  020-backoff), `fold` renames the remote branch through GitHub's rename API,
+  which retargets the PR and leaves it open. With `--allow-pr-rebuild`, `fold`
+  deletes the remote victim branch, re-syncs the chain, and comments on the closed
+  victim PR pointing at the one that supersedes it.
 
 Contrast with [scenario 11](#11-pull-a-branch-out-of-the-middle), which *discards*
 a branch's change; `fold` *keeps* it.

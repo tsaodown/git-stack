@@ -87,12 +87,14 @@ refuses when an affected branch has an open PR and points you at the clean trio:
 [`pr desync`](#git-stack-pr-desync) to take the stack offline → reorder locally →
 `pr sync` to re-publish.
 
-[`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) closes PRs the
-same way — the deleted victim's head PR always, and the survivor's if `--slug`
-renames it — so it shares the `--allow-pr-rebuild` gate. When you accept it, `fold`
-deletes the remote victim branch, runs `pr sync` to rebuild the chain, and then
-posts a **breadcrumb** comment on the closed victim PR pointing at the PR that now
-supersedes it (the breadcrumb runs after the sync, once the superseding PR exists).
+[`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) closes the
+deleted victim's head PR, so it shares the `--allow-pr-rebuild` gate when the
+victim has one. The survivor keeps its PR — its remote branch is renamed through
+GitHub's rename API (which retargets the PR), even when the default slug renames
+it. When you accept the gate, `fold` deletes the remote victim branch, runs
+`pr sync` to rebuild the chain, and then posts a **breadcrumb** comment on the
+closed victim PR pointing at the PR that now supersedes it (the breadcrumb runs
+after the sync, once the superseding PR exists).
 
 ## `git stack pr list`
 
