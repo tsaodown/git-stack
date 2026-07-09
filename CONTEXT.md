@@ -180,9 +180,11 @@ Add a branch to the **current** stack (placement via flag or picker, as the old
 _Avoid_: "new" — the word that conflated create-a-stack with add-a-branch.
 
 **pick**:
-Choose a stack from the **list** selector and check out its **tip**. Works from
-inside a stack too — this is how you hop *between* stacks. Lands on the tip; for a
-specific branch, use **checkout**.
+Check out a stack's **tip**. Takes an optional `<prefix>` (trailing slash
+optional); with a known name it lands directly, otherwise it falls to the
+**list** selector — as does a bare `pick`. Works from inside a stack too — this
+is how you hop *between* stacks. Lands on the tip; for a specific branch, use
+**checkout**.
 
 **list**:
 Overview of *every* stack: branch count, tip, current-stack marker, **base** +

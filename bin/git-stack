@@ -2105,10 +2105,12 @@ ${b}Stack-level subcommands:${r}
                                     (trailing \`/\` optional) or pick one from
                                     outside. Runs \`git fetch --all --prune\` by
                                     default; ${fl}--no-fetch${r} skips it.
-  ${sub}pick${r}                              Choose a stack from the all-stacks selector
-                                    and check out its tip (highest-leaf
+  ${sub}pick${r} [<prefix>]
+                                    Check out a stack's tip (highest-leaf
                                     branch) — a fast hop, even from inside
-                                    another stack.
+                                    another stack. Pass a name (trailing
+                                    \`/\` optional) or choose from the
+                                    all-stacks selector.
   ${sub}create${r} [<prefix>] [<slug>] [${fl}--onto${r} <ref>] [${fl}--stash${r}]
                                     Start a brand-new stack: first branch
                                     (leaf \`010\`) off the resolved base
@@ -2733,11 +2735,12 @@ cmd_view() {
   fi
 }
 
-# Choose a stack from the all-stacks selector and check out its tip (the
-# highest-leaf branch) — a fast hop, even from inside another stack. Use
-# `checkout` to land on a specific branch instead.
+# Check out a stack's tip (the highest-leaf branch) — a fast hop, even from
+# inside another stack. A known <prefix> lands directly; otherwise the all-stacks
+# selector chooses. Use `checkout` to land on a specific branch instead.
 cmd_pick() {
   OPT_PREFIX=""
+  local arg=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -2745,14 +2748,26 @@ cmd_pick() {
     fi
     case "$1" in
       -*) die "unknown pick flag: $1" ;;
-      *)  die "pick: unexpected arg '$1' (pick takes no arguments)" ;;
+      *)  [[ -z "$arg" ]] || die "pick: extra arg '$1'"; arg="$1"; shift ;;
     esac
   done
   require_in_repo
 
-  local prefix
-  prefix=$(_select_stack "pick stack") \
-    || die "no stacks found; create one with 'git stack create <prefix> <slug>' ${C_DIM}[gstkcr]${C_RESET}"
+  # OPT_PREFIX (--prefix) or a known named stack skips the selector; anything
+  # unresolved (no arg, or an unknown name) falls through to the picker.
+  local prefix=""
+  if [[ -n "$OPT_PREFIX" ]]; then
+    prefix="${OPT_PREFIX%/}/"
+  elif [[ -n "$arg" ]]; then
+    local want="${arg%/}/" pfx
+    while IFS= read -r pfx; do
+      [[ "$pfx" == "$want" ]] && prefix="$pfx"
+    done < <(stack_prefixes)
+  fi
+  if [[ -z "$prefix" ]]; then
+    prefix=$(_select_stack "pick stack") \
+      || die "no stacks found; create one with 'git stack create <prefix> <slug>' ${C_DIM}[gstkcr]${C_RESET}"
+  fi
   local branches=()
   _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
   local tip="${branches[$(( ${#branches[@]} - 1 ))]}"
@@ -7545,7 +7560,7 @@ _git-stack() {
   case ${words[2]} in
     checkout|co) _gs_leaves; return ;;
     drop) _gs_leaves; return ;;
-    view) _gs_complete prefixes; _describe -t prefixes 'prefix' _gs_items; return ;;
+    view|pick) _gs_complete prefixes; _describe -t prefixes 'prefix' _gs_items; return ;;
     pr|history)
       if (( CURRENT == 3 )); then
         _gs_complete subverbs "${words[2]}"
@@ -7585,10 +7600,10 @@ complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcomma
 # Sub-verbs.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from pr' -a '(git stack __complete subverbs pr)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from history' -a '(git stack __complete subverbs history)'
-# checkout → leaves; view → prefixes.
+# checkout → leaves; view/pick → prefixes.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from checkout co' -a '(git stack __complete leaves)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from drop' -a '(git stack __complete leaves)'
-complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from view' -a '(git stack __complete prefixes)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from view pick' -a '(git stack __complete prefixes)'
 # Option-value slots (-x binds the candidates to the option's argument).
 complete -c git -n '__fish_git_using_command stack' -l prefix -x -a '(git stack __complete prefixes)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from add move mv' -l before -x -a '(git stack __complete leaves)'

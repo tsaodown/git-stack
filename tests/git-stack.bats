@@ -65,6 +65,49 @@ teardown() { teardown_repo; }
   [[ "$output" == *"feat/02-b"* ]]
 }
 
+# ---------- pick ----------
+
+@test "pick: a named stack checks out its tip without the selector" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q main
+  run git stack pick feat
+  assert_status 0
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" feat/02-b "checked-out tip"
+}
+
+@test "pick: a named stack accepts a trailing slash" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q main
+  run git stack pick feat/
+  assert_status 0
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" feat/02-b "checked-out tip"
+}
+
+# An unknown name is not a hard error: it falls to the selector, which
+# auto-selects when only one stack exists — so we land on that stack's tip.
+@test "pick: an unknown name falls to the selector rather than dying" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q main
+  run git stack pick nope
+  assert_status 0
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" feat/02-b "auto-selected sole stack's tip"
+}
+
+@test "pick: with no stacks, dies pointing at create" {
+  git checkout -q main
+  run git stack pick
+  assert_status 1
+  assert_output_contains "no stacks found"
+}
+
+@test "pick: rejects a second positional arg" {
+  make_stack_branches feat 01-a
+  git checkout -q main
+  run git stack pick feat extra
+  assert_status 1
+  assert_output_contains "extra arg"
+}
+
 # ---------- restack ----------
 
 @test "restack: child reflows after parent message-only amend" {
