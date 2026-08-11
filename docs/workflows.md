@@ -481,14 +481,60 @@ git stack rename fix/              # feat/010-auth → fix/010-auth, etc.
 `<new>/<leaf>`, carrying backup refs along. It refuses if a reflow is in progress,
 a branch is checked out elsewhere, or any target name already exists.
 
-> **Heads up — open PRs.** `rename` changes every head branch name, and GitHub
-> closes a PR when its head branch is renamed (no reattach). So it **refuses if any
-> branch has an open head PR**. Pass `--allow-pr-rebuild` to let those PRs close and
-> reopen on the next sync, or run [`pr desync`](pr-sync.md#git-stack-pr-desync) first
-> to re-publish cleanly ([scenario 14](#14-reorganize-a-stack-thats-already-on-github)).
-> Use `--no-history` to skip carrying backup refs.
+It then renames the pushed branches on the remote too, so nothing is left stranded
+under the old prefix. That remote half matters more here than elsewhere: a branch
+`move` leaves its stale remote in the *same* prefix, where [`clean`](#7-the-bottom-pr-merged)
+reaps it — but an old *prefix* is a namespace `clean` never scans, so `rename` has
+to collect its own litter. `--no-push` skips it.
 
-**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order)
+**`rename` never syncs PRs.** Republishing is always an explicit `pr sync`. Since
+GitHub closes a PR when its head branch is renamed (no reattach), `rename`
+**refuses if any branch has an open head PR** — the fix is the trio:
+
+```sh
+git stack pr desync    # close the chain deliberately
+git stack rename fix/  # rename local + remote
+git stack pr sync      # republish a fresh chain
+```
+
+Use `--no-history` to skip carrying backup refs.
+
+**See also:** [rename one branch's slug](#8a-rename-one-branchs-slug) ·
+[reorder branches](#5-the-branches-are-in-the-wrong-order)
+
+---
+
+## 8a. Rename one branch's slug
+
+**Situation.** `rename` retargets the whole stack's prefix. You just want to fix
+one branch's name — a typo, or a slug that no longer describes the change.
+
+```sh
+git stack reslug authz                  # rename the current branch's slug
+git stack reslug 010 authz              # ...or name the branch (leaf, partial, or full)
+git stack reslug                        # prompts, prefilling the current slug
+```
+
+**What happened.** `feat/010-auth` became `feat/010-authz`. The **leaf** is
+untouched, so the branch keeps its position — `reslug` never reorders. That's
+enforced, not merely intended: a slug can't start with a digit, so there's no way
+to smuggle a leaf change through one. To change position or leaf number, use
+[`move`](#5-the-branches-are-in-the-wrong-order) instead.
+
+Arity follows `git branch -m`: one argument renames the current branch, two name
+the target first.
+
+It's a single atomic ref rename — no reflow, no push, no PR sync — so unlike most
+mutating verbs it **doesn't require a clean tree**; you can fix a branch name
+mid-work. It snapshots first, so `git stack history restore @0` undoes it (that
+re-creates the old name beside the new one and warns about the resulting duplicate
+leaf). The stale remote branch stays under the current prefix, where `clean` reaps
+it.
+
+Like `move`, it refuses when the branch has an open head PR — same trio as above:
+`pr desync` → `reslug` → `pr sync`.
+
+**See also:** [rename the whole prefix](#8-rename-the-stacks-prefix)
 
 ---
 
@@ -682,13 +728,16 @@ on** (`030-backoff`) — exactly the obsolete-superseded case, no flags needed. 
   `git stack history restore @0 --yes` (which warns if the rename left a
   duplicate-leaf branch behind; drop `--yes` to preview the rollback first). It
   refuses a dirty tree and prompts `[Y/n]` (needs `--yes` off a TTY).
-- Folding a branch with a pushed PR closes the **victim's** PR (its branch is
-  deleted), so `fold` asks for `--allow-pr-rebuild` when the victim has one. The
-  **survivor keeps its PR**: even when the default slug renames it (020-retry →
-  020-backoff), `fold` renames the remote branch through GitHub's rename API,
-  which retargets the PR and leaves it open. With `--allow-pr-rebuild`, `fold`
-  deletes the remote victim branch, re-syncs the chain, and comments on the closed
-  victim PR pointing at the one that supersedes it.
+- Folding closes up to **two** PRs, and `fold` asks for `--allow-pr-rebuild` if
+  either exists. The **victim's**, because its branch is deleted. And the
+  **survivor's**, because the result takes the victim's slug by default
+  (`020-retry` folded into `015-reapply` yields `015-retry`) — that renames the
+  survivor, and [a head PR doesn't survive a rename](pr-sync.md#renames-close-head-prs).
+  Pass `--slug reapply` to keep the survivor's name, and its PR.
+- With `--allow-pr-rebuild`, `fold` deletes the remote victim branch, re-syncs the
+  chain, and comments on the closed victim PR pointing at the one that supersedes
+  it. `fold` is the one verb that re-syncs PRs on its own — discarding the
+  victim's review context is the point of the operation.
 
 Contrast with [scenario 11](#11-pull-a-branch-out-of-the-middle), which *discards*
 a branch's change; `fold` *keeps* it.

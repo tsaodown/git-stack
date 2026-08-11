@@ -37,6 +37,16 @@ The numeric segment that orders a branch within its stack (the `010` in
 without renumbering.
 _Avoid_: index, position number, branch number, sequence.
 
+**Slug**:
+The descriptive tail of a branch name, after the **leaf** (the `auth` in
+`feat/010-auth`). Set at **create**/**add** time, changed later by **reslug**.
+Carries no ordering meaning — the leaf decides position, the slug says what the
+branch is *for*. Validated by `_validate_slug`: must start with a letter or
+underscore, so a slug can never be mistaken for a leaf. That rule is
+load-bearing, not cosmetic — it is what keeps **reslug** (renames) and **move**
+(reorders) disjoint (ADR 0014).
+_Avoid_: name, label, description, title (reserve "title" for the PR title).
+
 **Width**:
 The digit-count of a stack's leaves. Sparse stacks are width 3 (`010`); legacy
 stacks are width 2 (`01`). A stack has one width, derived from its first leaf.
@@ -118,6 +128,22 @@ Tear down the **PR chain** — close each branch's open PR (inverse of **pr
 sync**) so the **stack** can be reordered and re-synced clean. Merged/closed PRs
 are left alone; PRs with **activity** prompt before closing.
 _Avoid_: teardown, unsync, delete-PRs.
+
+**Explicit PR state** (ADR 0013):
+The rule that no verb mutates the **PR chain** as a side effect of a local
+operation. Closing and reopening a PR discards review threads, approvals, and CI
+history, so a verb whose rename would hit an open **head PR** *refuses* and
+points at the **pr desync** → mutate → **pr sync** trio, rather than churning and
+re-publishing. Holds for **rename**, **reslug**, **move** and **drop**.
+Two documented exceptions: **fold**, where discarding the victim's review context
+*is* the operation (so it keeps auto-sync, `--allow-pr-rebuild`, and the
+breadcrumb), and **doctor**, which still auto-syncs and has *no* open-PR guard at
+all — a tracked gap, not an endorsement. The rule also covers **clean**, whose
+remote-orphan deletion closes PRs as a side effect of `git push --delete`: it now
+names each PR the deletion would close (bulk `gh pr list`, advisory only — it
+never gates the deletion, and degrades to unannotated when gh is unusable).
+_Avoid_: "no auto-sync" (too narrow — the rule is about PR *state*, not the sync
+verb).
 
 **Activity**:
 A *human* signal on a PR — a non-bot comment, or any review a person left
@@ -320,8 +346,31 @@ branch, never by content (ADR 0008).
 _Avoid_: "remove"/"delete" (the generic words — **clean** already "removes"
 `[gone]` branches; `drop` discards a live branch's work).
 
+**reslug** `[<branch>] <new-slug>`:
+Rename one branch's **slug**, keeping its **leaf** — the branch-level
+counterpart to **rename**, which retargets the whole stack's **prefix**.
+Structurally the twin of **move**'s renumber-in-place: a single-phase
+`[rename-batch]` plan, no reflow, one atomic ref rename. Arity follows
+`git branch -m` (one arg = current branch, two = `<branch> <new-slug>`); with no
+args on a TTY it prompts, prefilling the current slug (ADR 0012's
+re-prompt-and-preserve loop). **Fully local**, and it never reorders — the slug
+validator forbids a leading digit, so a **leaf** change cannot be smuggled
+through a slug. Alone among the mutating verbs it does **not** require a clean
+tree: nothing is rebased, so the index and worktree are untouched (cf.
+`git branch -m`). Snapshots first, so `history restore` undoes it — which
+re-creates the old name beside the new one and trips the **duplicate group**
+warning, since backup refs are keyed by the whole `<leaf>-<slug>` segment.
+Refuses when the branch has an open PR, pointing at the **pr desync** trio (ADR
+0014).
+_Avoid_: "rename" unqualified (that is the prefix verb), relabel, retitle.
+
 `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
-and `pr sync` / `pr list` keep their current meanings. **move** is **fully
+and `pr sync` / `pr list` keep their current meanings, except that **rename** no
+longer runs **pr sync** (ADR 0013): it renames local *and* remote refs — a
+renamed **prefix**'s stale remotes land in a namespace **clean** never scans, so
+nothing else would reap them — then stops, leaving republishing to an explicit
+**pr sync**. Its `--allow-pr-rebuild` is removed (nothing rebuilds), and its
+open-PR guard now points at the **pr desync** trio. **move** is **fully
 local** — it reorders/renumbers branches touching only local refs, never pushing
 or syncing (ADR 0006); it additionally **renumbers in place** when the chosen
 position is the branch's current slot — a pure leaf rename, no reflow (ADR 0002).
@@ -344,6 +393,10 @@ than a bare unknown-subcommand.
 `gstkab` abort · `gstkcon` continue. Dropped: `gstkn` (was new), `gstkpa` (push --all),
 `gstkrom`/`gstkromp`, and the `gstkcl` *shell function* (now the `clean` verb).
 `gstkp` moves from push to pick; `gstks` moves from status to sync.
+Added later: `gstkrsl` reslug — deliberately not `gstkrs`, which reads as a
+member of the `gstkr`/`gstkrp`/`gstkro` restack family (`gstkr` + one modifier
+letter). This is a delta list, not the full set; `git stack init <shell>` is the
+source of truth for that.
 
 ## Architecture
 
@@ -564,6 +617,18 @@ its error arg). Any leak would corrupt the user's prompt.
 > A verb missing from `_help_topic` is caught by a test, not by silence.
 
 ## Flagged ambiguities
+
+**"leaf"** — the docs and the code disagree. Here and on every user-facing
+surface (`checkout <N>`, `move --at <num>`, the **Width** entry) **leaf** is the
+*numeric* segment, `010`. But in the code `leaf` is routinely the *whole* final
+path segment, `010-auth` — `${b##*/}` in `snapshot_stack`, `emit_rename_batch`,
+`_load_stack_branches`, `_check_slug_collision`. Both meanings are entrenched and
+the user-facing one is the definition of record; the code's is a naming smell to
+fix when touching it, like **"parent"** below. When prose needs to name the whole
+segment, write "the `<leaf>-<slug>` segment" rather than minting a third noun.
+This matters most around snapshots: backup refs are keyed by the *whole* segment,
+which is why a **reslug** desyncs them and a restore produces a **duplicate
+group**.
 
 **"parent"** — overloaded in the current code. `_resolve_parent_name` /
 `_resolve_parent_ref` mean the **base** branch, but `_pr_is_empty_diff`'s

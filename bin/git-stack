@@ -100,6 +100,7 @@ STACK_PHASES=()             # ordered phase types, e.g. (reflow-pick)
 STACK_PHASE_IDX=0           # index into STACK_PHASES of the current phase
 STACK_UNIT_IDX=0            # phase-relative index of the current unit
 STACK_RENAME_PAIRS=()       # alternating old/new branch names for rename-batch
+STACK_RENAME_LABEL="move"   # verb name the rename-batch phase reports as (move|reslug)
 STACK_FOLD_VICTIM=""        # fold: remote branch to delete + breadcrumb in remote-sync
 STACK_FOLD_SURVIVOR_NEW=""  # fold: survivor's (post-fold) name, for the breadcrumb target
 _PHASE_OUTCOME=""           # set by a phase op: unit-done|phase-complete|paused
@@ -711,6 +712,10 @@ _render_focus() {
       leaf=$(_kv_get "$kv" leaf); pos=$(_kv_get "$kv" pos)
       if [[ -n "$leaf" && -n "$pos" ]]; then printf '%s→%s' "$leaf" "$pos"
       else printf '%s' "$leaf"; fi ;;
+    reslug)
+      from=$(_kv_get "$kv" slug); pos=$(_kv_get "$kv" to)
+      if [[ -n "$from" && -n "$pos" ]]; then printf '%s→%s' "$from" "$pos"
+      else printf '%s' "$from"; fi ;;
     fold)
       result=$(_kv_get "$kv" result); victim=$(_kv_get "$kv" victim)
       if [[ -n "$result" && -n "$victim" ]]; then printf '%s←%s' "$result" "$victim"
@@ -845,6 +850,7 @@ save_engine_state() {
     printf 'STACK_UNIT_IDX=%d\n'        "$STACK_UNIT_IDX"
     printf 'STACK_OPT_NO_PUSH=%d\n'     "$STACK_OPT_NO_PUSH"
     printf 'STACK_OPT_NO_SYNC=%d\n'     "$STACK_OPT_NO_SYNC"
+    printf 'STACK_RENAME_LABEL=%q\n'       "$STACK_RENAME_LABEL"
     printf 'STACK_FOLD_VICTIM=%q\n'        "$STACK_FOLD_VICTIM"
     printf 'STACK_FOLD_SURVIVOR_NEW=%q\n'  "$STACK_FOLD_SURVIVOR_NEW"
     _emit_array STACK_BRANCHES STACK_BRANCHES
@@ -1016,8 +1022,9 @@ _apply_local_rename_batch() {
 _phase_rename_batch_advance() {
   local pairs=("${STACK_RENAME_PAIRS[@]+"${STACK_RENAME_PAIRS[@]}"}")
   if (( ${#pairs[@]} > 0 )); then
-    _apply_local_rename_batch "git-stack move (post-rename)" "${pairs[@]}"
-    log "${C_GREEN}done${C_RESET}    move complete (+$((${#pairs[@]} / 2)) renames)"
+    local _lbl="${STACK_RENAME_LABEL:-move}"
+    _apply_local_rename_batch "git-stack ${_lbl} (post-rename)" "${pairs[@]}"
+    log "${C_GREEN}done${C_RESET}    ${_lbl} complete (+$((${#pairs[@]} / 2)) renames)"
     # Track the user's branch across the rename so _engine_finalize returns to
     # it under its new name.
     local i
@@ -1170,16 +1177,19 @@ _engine_finalize() {
   fi
   # Tailor the completion line to what the plan actually did: a reflow reports
   # the branch count; a remote-only plan (rename / doctor renumber tail) didn't
-  # restack anything, so don't claim it did.
-  local p saw_reflow=0
+  # restack anything, so don't claim it did. A purely local rename plan
+  # (move --at, reslug) touched no remote at all and already logged its own
+  # "<verb> complete" line, so it gets no extra claim here.
+  local p saw_reflow=0 saw_remote=0
   for p in "${STACK_PHASES[@]+"${STACK_PHASES[@]}"}"; do
-    [[ "$p" == reflow-pick ]] && { saw_reflow=1; break; }
+    if [[ "$p" == reflow-pick ]]; then saw_reflow=1; fi
+    if [[ "$p" == remote-sync ]]; then saw_remote=1; fi
   done
   if (( saw_reflow )); then
     local n_processed=$(( ${#STACK_BRANCHES[@]} - STACK_FROM_IDX ))
     local noun="branches"; (( n_processed == 1 )) && noun="branch"
     log "${C_GREEN}done${C_RESET}    reflow complete (${C_BOLD}${n_processed}${C_RESET} ${noun} restacked)"
-  else
+  elif (( saw_remote )); then
     log "${C_GREEN}done${C_RESET}    remote sync complete"
   fi
   clear_state
@@ -1383,8 +1393,11 @@ _gh_preflight() {
   [[ -n "$GH_REPO" ]] || die "gh repo view returned empty nameWithOwner"
 }
 
-# Rename a single remote branch via gh's branches/rename endpoint. PRs that
-# point at <old> are automatically retargeted by GitHub to <new>.
+# Rename a single remote branch via gh's branches/rename endpoint. GitHub
+# retargets PRs that use <old> as their *base*, but CLOSES any PR whose *head*
+# is <old> — and every stack branch is the head of its own PR. Callers must
+# therefore gate on _check_no_open_prs first (ADR 0006 confirmed this; the
+# closure is not recoverable by a later sync, which finds open PRs only).
 # Args: <old-branch-name> <new-branch-name>
 # Caller must have already invoked _gh_preflight (so GH_REPO is set).
 # Returns 0 on success; non-zero on API failure (caller dies).
@@ -1846,6 +1859,28 @@ _gh_open_index_find() {
   return 1
 }
 
+# Look up the first open PR whose *base* is <branch> in the loaded index, and
+# print its number. The mirror of _gh_open_index_find, which matches on head.
+# Deleting a branch that a PR targets closes that PR, so callers that delete
+# remote refs need this side too. Pure (no gh); returns 1 on miss.
+_gh_open_index_find_by_base() {
+  local b="$1" rec rest num base
+  while IFS= read -r -d $'\x1e' rec; do
+    rec="${rec#$'\n'}"
+    [[ -z "$rec" ]] && continue
+    rest="${rec#*$'\x1f'}"          # drop headRefName
+    num="${rest%%$'\x1f'*}"
+    rest="${rest#*$'\x1f'}"         # drop number
+    rest="${rest#*$'\x1f'}"         # drop title
+    base="${rest%%$'\x1f'*}"
+    if [[ "$base" == "$b" ]]; then
+      printf '%s' "$num"
+      return 0
+    fi
+  done <<< "$_GH_OPEN_INDEX"
+  return 1
+}
+
 # Return 0 (true) if ANY of the given branches has an open head PR on origin.
 # On true, sets _ORPHAN_PR_BRANCH and _ORPHAN_PR_NUM (globals) for the caller's
 # error message. On false (no open PRs found), returns 1 with empty globals.
@@ -1870,6 +1905,50 @@ _check_no_open_prs() {
     fi
   done
   return 1
+}
+
+# For each given branch, print what deleting it on the remote would close —
+# one line per branch, index-aligned with the arguments, empty when nothing.
+# Format: "head<TAB><num>" or "base<TAB><num>".
+#
+# Deleting a remote branch closes PRs on GitHub two ways, and `clean` must name
+# both rather than closing them silently (ADR 0013):
+#   head — the PR whose head IS this branch;
+#   base — any open PR that TARGETS this branch. This is the nastier one: it
+#          closes a PR the user never touched. It is reachable after any local
+#          rename (reslug/move) whose successor's PR still bases on the old
+#          name, if `clean` runs before the `pr sync` that would retarget it.
+#          `pr desync --delete-remote` guards the same hazard explicitly.
+# A head match wins when a branch is somehow both.
+#
+# Purely advisory: every gh problem yields all-empty rather than an error, so it
+# can never gate the deletion. One bulk query, not one per branch.
+# Usage: _clean_orphan_prs <branch>...
+_clean_orphan_prs() {
+  local b rec
+  local usable=1
+  command -v gh >/dev/null 2>&1 || usable=0
+  if (( usable )); then
+    gh auth status -h github.com >/dev/null 2>&1 || usable=0
+  fi
+  if (( usable )) && [[ -z "${GH_REPO:-}" ]]; then
+    GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || GH_REPO=""
+  fi
+  if (( usable )) && [[ -z "${GH_REPO:-}" ]]; then
+    usable=0
+  fi
+  if (( usable )); then
+    _gh_load_open_index || usable=0
+  fi
+  for b in "$@"; do
+    if (( usable )) && rec=$(_gh_open_index_find "$b"); then
+      printf 'head\t%s\n' "${rec%%$'\x1f'*}"
+    elif (( usable )) && rec=$(_gh_open_index_find_by_base "$b"); then
+      printf 'base\t%s\n' "$rec"
+    else
+      printf '\n'
+    fi
+  done
 }
 
 # Fold remote tail, step 1: capture the victim's open PR number (best-effort),
@@ -2104,6 +2183,7 @@ _verb_table() {
     branch history        "Show or restore stack snapshots" \
     branch move           "Move a branch to a different position in the stack" \
     branch rename         "Rename every branch in the stack to a new prefix" \
+    branch reslug         "Rename one branch's slug, keeping its leaf" \
     branch fold           "Fold one branch's commits into another" \
     branch drop           "Discard a branch and reflow its children onto the predecessor" \
     branch doctor         "Diagnose stack health" \
@@ -2410,16 +2490,47 @@ EOF
       ;;
     rename)
       cat <<EOF
-${b}usage:${r} git stack ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}]
-                        [${fl}--allow-pr-rebuild${r}]
+${b}usage:${r} git stack ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}] [${fl}--no-push${r}]
 
 Atomically rename every branch in the stack from <old>/<leaf> to <new>/<leaf>,
 carrying backup refs along by default. Refuses if state file exists, branch
 checked out elsewhere, or any target name collides.
 
-Also refuses if any branch has an open head PR (renaming a branch closes its
-head PR on GitHub, with no reattach); pass ${fl}--allow-pr-rebuild${r} to proceed and
-rebuild them, or run ${sub}pr desync${r} first to re-publish cleanly.
+Then renames the pushed branches on the remote, so nothing is left orphaned
+under the old prefix — unlike a reordered branch, whose stale remote stays in
+the same namespace for ${sub}clean${r} to reap, a renamed prefix's would land where
+${sub}clean${r} never looks. ${fl}--no-push${r} skips that remote half.
+
+${b}Never syncs PRs${r}: republishing is always an explicit ${sub}pr sync${r}. Refuses if any
+branch has an open head PR, since the remote rename would close it with no
+reattach — run ${sub}pr desync${r} first, then rename, then ${sub}pr sync${r}.
+EOF
+      ;;
+    reslug)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}reslug${r} [<branch>] <new-slug> [${fl}--prefix${r} <p>]
+
+Rename one branch's ${b}slug${r} — the descriptive tail of its name — keeping its
+${b}leaf${r}, so its position in the stack is untouched. The branch-level
+counterpart to ${sub}rename${r}, which retargets the whole stack's prefix.
+
+Arity follows \`git branch -m\`: one argument is the new slug for the current
+branch, two are <branch> <new-slug>. <branch> may be a numeric leaf, a partial
+name, or the full branch name. With no arguments on a TTY it prompts, prefilling
+the current slug; re-prompts on a bad or colliding slug.
+
+A slug cannot start with a digit, so a leaf change can't be smuggled through
+one — ${sub}reslug${r} never reorders. To change a branch's position or leaf number,
+use ${sub}move${r} instead.
+
+${b}Fully local${r}: one atomic ref rename, no reflow, no push, no PR sync. Unlike
+${sub}rename${r}, the stale remote branch stays under the current prefix, so ${sub}clean${r}
+reaps it. Does ${b}not${r} require a clean tree — nothing is rebased. Snapshots
+first, so ${sub}history restore${r} undoes it (which re-creates the old name and
+warns about the resulting duplicate leaf).
+
+Refuses if the branch has an open head PR, which the rename would strand on the
+old name — run ${sub}pr desync${r} first, then reslug, then ${sub}pr sync${r}.
 EOF
       ;;
     fold)
@@ -2440,10 +2551,15 @@ boundaries (bottom ${fl}--down${r}, tip ${fl}--up${r}, lone branch — use ${sub
 
 Destructive: snapshots first (undo via ${sub}history restore${r}, which warns about any
 duplicate-leaf leftovers a rename leaves), refuses a dirty tree, needs ${fl}--yes${r}
-off a TTY. Deleting the victim (and renaming the survivor under ${fl}--slug${r}) closes
-their head PRs: refuses unless ${fl}--allow-pr-rebuild${r} (or ${fl}--no-push${r}), then
-deletes the remote victim, re-syncs PRs, and breadcrumbs the closed PR to the
-superseding one. ${fl}--dry-run${r} previews.
+off a TTY.
+
+A head PR survives neither its branch being deleted nor being renamed, so ${sub}fold${r}
+closes the victim's PR — and the survivor's too, since the result takes the
+victim's slug by default and so renames it. Both are gated: refuses unless
+${fl}--allow-pr-rebuild${r} (or ${fl}--no-push${r}), and ${fl}--slug${r} matching the survivor's
+current slug keeps its name, and its PR. On accept it deletes the remote victim,
+re-syncs PRs, and breadcrumbs the closed victim PR to the superseding one.
+${fl}--dry-run${r} previews.
 EOF
       ;;
     drop)
@@ -2490,9 +2606,13 @@ duplicates (required for non-tty / scripts).
 ${fl}--dry-run${r} previews the issue list and proposed fixes without applying.
 ${fl}--no-squash${r} skips the squash checks (rename-only mode); ${fl}--no-rename${r} skips
 the leaf-rename pass (which also skips duplicate detection). Empty squashes
-(branch tree == predecessor tree) offer to delete the absorbed branch. Same
-atomic rename + remote-rename + pr sync flow as ${sub}rename${r} (skip with
-${fl}--no-push${r} / ${fl}--no-sync${r}).
+(branch tree == predecessor tree) offer to delete the absorbed branch.
+
+Renamed branches are renamed on the remote and the PR chain re-synced
+afterwards (skip with ${fl}--no-push${r} / ${fl}--no-sync${r}). ${sub}doctor${r} is currently the
+only verb that re-syncs PRs on its own — ${sub}rename${r}, ${sub}move${r} and ${sub}reslug${r} leave
+that to an explicit ${sub}pr sync${r} — and it has no open-PR guard, so a renumber of
+a published stack closes and re-opens those PRs.
 EOF
       ;;
     prefix)
@@ -2536,8 +2656,10 @@ _help_reference() {
 ${b}Common flags:${r}
   ${fl}--prefix${r} <p>          Override the stack prefix (else git config
                         stack.prefix, else auto-detect).
-  ${fl}--no-push${r}             (move/rename/fold/doctor) skip remote rename + pr sync.
-  ${fl}--no-sync${r}             (move/rename/fold/doctor) skip pr sync only.
+  ${fl}--no-push${r}             (fold/doctor) skip remote rename + pr sync;
+                        (rename) skip the remote rename.
+  ${fl}--no-sync${r}             (fold/doctor) skip pr sync only. ${sub}rename${r}, ${sub}move${r} and
+                        ${sub}reslug${r} never sync, so it does nothing there.
   ${fl}--color${r} | ${fl}--no-color${r}  Force color on/off (default: auto-detect TTY;
                         honors ${fl}NO_COLOR${r} env var).
   ${fl}-v${r}, ${fl}--verbose${r}         More output.
@@ -2612,7 +2734,7 @@ _help_verb() {
     # `history show`/`history restore` are covered by the one `history` topic.
     history) key="history" ;;
     list|view|pick|create|sync|clean|add|checkout|restack|amend|continue|abort|\
-move|rename|fold|drop|doctor|prefix|default-branch|init) key="$verb" ;;
+move|rename|reslug|fold|drop|doctor|prefix|default-branch|init) key="$verb" ;;
     *) return 1 ;;
   esac
   _help_topic "$key"
@@ -3205,9 +3327,9 @@ cmd_history_restore() {
     || die "git update-ref failed"
   log "${C_GREEN}done${C_RESET}    restored from ${run_id}"
 
-  # A restore only resets/re-creates the snapshotted refs; a prior fold/move
-  # that renamed a branch leaves the renamed ref behind, which can now collide
-  # on a leaf with a just-restored branch. Surface any such leftovers.
+  # A restore only resets/re-creates the snapshotted refs; a prior fold/move/
+  # reslug that renamed a branch leaves the renamed ref behind, which can now
+  # collide on a leaf with a just-restored branch. Surface any such leftovers.
   _warn_duplicate_leaves "$prefix_path"
 }
 
@@ -3231,7 +3353,7 @@ _warn_duplicate_leaves() {
     '
   )
   [[ -n "$dups" ]] || return 0
-  warn "duplicate leaf numbers remain — a prior fold/move rename left branches sharing a leaf:"
+  warn "duplicate leaf numbers remain — a prior fold/move/reslug rename left branches sharing a leaf:"
   local line
   while IFS= read -r line; do
     [[ -n "$line" ]] && printf '  %s%s%s\n' "$C_YELLOW" "$line" "$C_RESET" >&2
@@ -3470,8 +3592,20 @@ cmd_clean() {
   # 6. Dry-run: print the plan (incl. the walk-driven reflow forecast) and stop.
   if (( opt_dry_run )); then
     if (( ${#remote_orphans[@]} > 0 )); then
+      local _dr_prs=() _dr_i=0 _dr_line
+      while IFS= read -r _dr_line; do _dr_prs+=("$_dr_line"); done \
+        < <(_clean_orphan_prs "${remote_orphans[@]}")
       log "${C_YELLOW}remote${C_RESET}  ${#remote_orphans[@]} remote branch(es) under '${prefix}' with no local counterpart:"
-      for lname in "${remote_orphans[@]}"; do log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}origin/${lname}${C_RESET}"; done
+      local _dr_kind _dr_num
+      for lname in "${remote_orphans[@]}"; do
+        _dr_kind="${_dr_prs[$_dr_i]-}"; _dr_num="${_dr_kind#*$'\t'}"; _dr_kind="${_dr_kind%%$'\t'*}"
+        case "$_dr_kind" in
+          head) log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}origin/${lname}${C_RESET}  ${C_YELLOW}[closes PR #${_dr_num}]${C_RESET}" ;;
+          base) log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}origin/${lname}${C_RESET}  ${C_RED}[closes PR #${_dr_num}, which targets it]${C_RESET}" ;;
+          *)    log "  ${C_DIM}delete${C_RESET}  ${C_CYAN}origin/${lname}${C_RESET}" ;;
+        esac
+        _dr_i=$((_dr_i + 1))
+      done
     fi
     log ""
     if [[ -n "$pf_msg" ]]; then
@@ -3538,9 +3672,36 @@ cmd_clean() {
 
   # 10. Delete remote orphans (confirm-gated; declining skips only this step).
   if (( ${#remote_orphans[@]} > 0 )); then
+    # Name the PRs this deletion would close, so the confirmation isn't the one
+    # place PR state still changes invisibly (ADR 0013).
+    local _op_prs=() _op_i=0 _op_line _op_closing=0
+    while IFS= read -r _op_line; do _op_prs+=("$_op_line"); done \
+      < <(_clean_orphan_prs "${remote_orphans[@]}")
     log "${C_YELLOW}remote${C_RESET}  ${#remote_orphans[@]} remote branch(es) under '${prefix}' with no local counterpart:"
-    for lname in "${remote_orphans[@]}"; do log "  ${C_CYAN}origin/${lname}${C_RESET}"; done
-    if _confirm "delete these on origin?"; then
+    local _op_kind _op_num
+    for lname in "${remote_orphans[@]}"; do
+      _op_kind="${_op_prs[$_op_i]-}"; _op_num="${_op_kind#*$'\t'}"; _op_kind="${_op_kind%%$'\t'*}"
+      case "$_op_kind" in
+        head)
+          log "  ${C_CYAN}origin/${lname}${C_RESET}  ${C_YELLOW}[open PR #${_op_num} — will be closed]${C_RESET}"
+          _op_closing=$((_op_closing + 1)) ;;
+        base)
+          # Worse than the head case: this closes a PR the user never touched.
+          # Usually means a rename hasn't been followed by `pr sync` yet.
+          log "  ${C_CYAN}origin/${lname}${C_RESET}  ${C_RED}[open PR #${_op_num} targets this branch — deleting it closes that PR]${C_RESET}"
+          _op_closing=$((_op_closing + 1)) ;;
+        *)
+          log "  ${C_CYAN}origin/${lname}${C_RESET}" ;;
+      esac
+      _op_i=$((_op_i + 1))
+    done
+    local _op_prompt="delete these on origin?"
+    if (( _op_closing == 1 )); then
+      _op_prompt="delete these on origin? (closes 1 PR)"
+    elif (( _op_closing > 1 )); then
+      _op_prompt="delete these on origin? (closes ${_op_closing} PRs)"
+    fi
+    if _confirm "$_op_prompt"; then
       for lname in "${remote_orphans[@]}"; do
         if git push origin --delete "$lname" >/dev/null 2>&1; then
           log "  ${C_GREEN}deleted${C_RESET} origin/${lname}"
@@ -3604,7 +3765,7 @@ cmd_clean() {
 
 cmd_rename() {
   OPT_PREFIX=""
-  local opt_dry_run=0 opt_no_history=0 opt_allow_pr_rebuild=0 new_pfx=""
+  local opt_dry_run=0 opt_no_history=0 new_pfx=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -3613,12 +3774,12 @@ cmd_rename() {
     case "$1" in
       --dry-run)          opt_dry_run=1; shift ;;
       --no-history)       opt_no_history=1; shift ;;
-      --allow-pr-rebuild) opt_allow_pr_rebuild=1; shift ;;
+      --allow-pr-rebuild) die "rename: --allow-pr-rebuild has been removed (rename no longer syncs PRs, so there is nothing to rebuild). Run 'git stack pr desync' to take the stack offline first, then rename, then 'git stack pr sync' to re-publish." ;;
       -*)                 die "unknown rename flag: $1" ;;
       *)                  [[ -z "$new_pfx" ]] || die "rename: extra arg '$1'"; new_pfx="$1"; shift ;;
     esac
   done
-  [[ -n "$new_pfx" ]] || die "usage: git stack rename <new-prefix> [--dry-run] [--no-history] [--allow-pr-rebuild]"
+  [[ -n "$new_pfx" ]] || die "usage: git stack rename <new-prefix> [--dry-run] [--no-history] [--no-push]"
 
   require_in_repo
   require_clean_tree
@@ -3655,12 +3816,14 @@ cmd_rename() {
     require_branch_not_in_worktree "$b"
   done
 
-  # PR-orphan guard. Renaming the prefix renames every branch, which closes
-  # any open head PRs on GitHub. Refuse by default unless --allow-pr-rebuild
-  # or --no-push was passed.
-  if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )) && (( ! opt_dry_run )); then
+  # PR-orphan guard. The remote rename below closes any open head PR on GitHub
+  # (a head PR cannot survive its branch being renamed), and rename no longer
+  # re-publishes, so there is nothing to reattach it to. Refuse and route to the
+  # explicit trio. Skipped under --no-push (no remote rename happens) and
+  # --dry-run (no mutation at all).
+  if (( ! OPT_NO_PUSH )) && (( ! opt_dry_run )); then
     if _check_no_open_prs "${branches[@]}"; then
-      die "rename would orphan PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Pass --allow-pr-rebuild to accept the PR will be closed and recreated (a fresh PR opens for the renamed branch via 'pr sync'). Or run 'git stack pr desync' first to take the stack offline, then rename, then 'git stack pr sync' to re-publish cleanly."
+      die "rename would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH}; head-PRs can't survive a branch rename on GitHub. Run 'git stack pr desync' to take the stack offline first, then rename, then 'git stack pr sync' to re-publish cleanly."
     fi
   fi
 
@@ -3709,12 +3872,19 @@ cmd_rename() {
 
   log "${C_GREEN}done${C_RESET}    rename complete"
 
-  # Stage 2 + 3: remote rename + pr sync. Routed through the engine's
-  # remote-sync phase (a one-phase plan) so a remote failure pauses with state
-  # retained — 'continue' retries the idempotent phase — instead of dying with
-  # only a manual-recovery hint. The local rename above stays inline: it does
+  # Stage 2: remote rename only. Routed through the engine's remote-sync phase
+  # (a one-phase plan) so a remote failure pauses with state retained —
+  # 'continue' retries the idempotent phase — instead of dying with only a
+  # manual-recovery hint. The local rename above stays inline: it does
   # stack.prefix config + HEAD retargeting that the generic rename-batch phase
   # doesn't cover.
+  #
+  # The phase's trailing `pr sync` is suppressed unconditionally (ADR 0013):
+  # republishing is an explicit `pr sync`, never a side effect. The remote
+  # rename itself stays — unlike a reordered branch, a renamed prefix's stale
+  # remotes land in a namespace `clean` never scans, so nothing else would ever
+  # reap them. The guard above guarantees no open head PR is present for the
+  # rename to close, which is what makes dropping the sync safe here.
   if (( ! OPT_NO_PUSH )); then
     local b leaf
     STACK_RENAME_PAIRS=()
@@ -3726,7 +3896,7 @@ cmd_rename() {
     done
     STACK_PREFIX="$new_pfx"
     STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
-    STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
+    STACK_OPT_NO_SYNC=1
     # Capture the starting branch AFTER the inline rename retargeted HEAD, so
     # finalize/abort check out the new name (or main, if HEAD was not on the
     # renamed stack) — never the now-deleted old name.
@@ -3745,6 +3915,161 @@ cmd_rename() {
     save_engine_state
     _engine_run
   fi
+}
+
+# ---------- reslug ----------
+
+# Rename one branch's slug, keeping its leaf. The branch-level counterpart to
+# `rename` (which retargets the whole stack's prefix), and the twin of `move`'s
+# renumber-in-place path: both are pure local ref renames driven by a
+# single-phase [rename-batch] plan, one changing the leaf, the other the slug.
+#
+# Fully local (ADR 0014): the stale remote stays under the *current* prefix, so
+# `clean` reaps it — the asymmetry that lets `rename` keep a remote rename but
+# not this. Deliberately does NOT require a clean tree: nothing is rebased, so
+# the index and worktree are untouched (cf. `git branch -m`).
+#
+# Arity mirrors `git branch -m`: one arg is the new slug for the current branch,
+# two are <branch> <new-slug>. `_validate_slug` forbids a leading digit, so a
+# leaf change cannot be smuggled through the slug — reslug never reorders.
+cmd_reslug() {
+  OPT_PREFIX=""
+  local a1="" a2="" nargs=0
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      -*) die "unknown reslug flag: $1" ;;
+      *)
+        case $nargs in
+          0) a1="$1" ;;
+          1) a2="$1" ;;
+          *) die "reslug: extra arg '$1'" ;;
+        esac
+        nargs=$((nargs + 1)); shift ;;
+    esac
+  done
+
+  require_in_repo
+  require_no_op_in_progress
+  require_no_state_file
+
+  local prefix
+  prefix=$(detect_prefix "$OPT_PREFIX")
+
+  local branches=()
+  _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
+
+  # Split the positionals: 2 args => <branch> <slug>; 1 arg => <slug> on the
+  # current branch; 0 => current branch, slug prompted below.
+  local target_ref="" new_slug=""
+  case $nargs in
+    2) target_ref="$a1"; new_slug="$a2" ;;
+    1) new_slug="$a1" ;;
+    0) ;;
+  esac
+
+  local target
+  if [[ -n "$target_ref" ]]; then
+    local rc=0
+    target=$(_resolve_branch_ref "$target_ref" "${branches[@]}") || rc=$?
+    (( rc == 0 )) || die "reslug: '$target_ref' not in stack '$prefix'"
+  else
+    target=$(current_branch) \
+      || die "usage: git stack reslug [<branch>] <new-slug>
+reslug: no <branch> given and HEAD is detached"
+    branch_index "$target" "${branches[@]}" >/dev/null \
+      || die "reslug: current branch '$target' is not in stack '$prefix'; pass <branch> or --prefix"
+  fi
+
+  local seg="${target##*/}"
+  local leaf="${seg%%-*}" cur_slug="${seg#*-}"
+
+  # Every other stack branch — the collision set for both the slug check and
+  # the interactive re-prompt loop (a branch never collides with itself).
+  local others=() b
+  for b in "${branches[@]}"; do
+    [[ "$b" == "$target" ]] || others+=("$b")
+  done
+
+  # Interactive slug prompt, prefilling the current slug (ADR 0012). Re-prompts
+  # on bad shape or collision; EOF/Ctrl-D aborts.
+  if (( nargs == 0 )); then
+    [[ -e /dev/tty ]] && [[ -t 0 || -t 2 ]] \
+      || die "usage: git stack reslug [<branch>] <new-slug>"
+    local _prev="$cur_slug"
+    while :; do
+      _prompt_prefill "slug for ${target} [${cur_slug}]:" "$_prev" new_slug || die "reslug: aborted"
+      _prev="$new_slug"
+      if ! _validate_slug "$new_slug"; then
+        printf '  %s\n' "$_VALIDATE_MSG" >&2
+        continue
+      fi
+      if [[ "$new_slug" == "$cur_slug" ]]; then
+        printf "  '%s' is already the slug for '%s'\n" "$new_slug" "$target" >&2
+        continue
+      fi
+      if (( ${#others[@]} > 0 )) && _check_slug_collision "$new_slug" "${others[@]}"; then
+        printf "  slug '%s' collides with existing branch '%s'\n" "$new_slug" "$_SLUG_COLLISION_BRANCH" >&2
+        continue
+      fi
+      break
+    done
+  else
+    _validate_slug "$new_slug" || die "reslug: $_VALIDATE_MSG"
+    [[ "$new_slug" != "$cur_slug" ]] \
+      || die "reslug: '$new_slug' is already the slug for '$target'"
+    if (( ${#others[@]} > 0 )) && _check_slug_collision "$new_slug" "${others[@]}"; then
+      die "reslug: slug '$new_slug' collides with existing branch '$_SLUG_COLLISION_BRANCH'"
+    fi
+  fi
+
+  local new_full="${prefix}${leaf}-${new_slug}"
+  if git rev-parse --verify --quiet "refs/heads/$new_full" >/dev/null; then
+    die "reslug: '$new_full' already exists"
+  fi
+
+  require_branch_not_in_worktree "$target"
+
+  # PR gate: renaming the branch strands its open head PR on the old remote
+  # name, and a later 'pr sync' would open a fresh PR beside it. Hard block, no
+  # escape flag — matching move's renumber-in-place, whose PR damage is
+  # identical (ADR 0013). Checked unconditionally; the helper no-ops when gh is
+  # unusable.
+  if _check_no_open_prs "$target"; then
+    die "reslug: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); renaming it would strand that PR on the old branch name. Run 'git stack pr desync' to take the stack offline first, then reslug, then 'git stack pr sync'."
+  fi
+
+  log "${C_GREEN}reslug${C_RESET}  ${C_CYAN}${target}${C_RESET} -> ${C_CYAN}${new_full}${C_RESET}"
+
+  # NL outside the quotes — $'\n' inside "${:+…}" is version-dependent.
+  local NL=$'\n'
+  _SNAPSHOT_FOCUS="slug=${cur_slug}${NL}to=${new_slug}"
+  snapshot_stack reslug "$prefix" "${branches[@]}"
+
+  STACK_BRANCHES=("${branches[@]}")
+  STACK_ORIG_SHAS=()
+  STACK_STARTED_AT=$(date +%s)
+  STACK_STARTING_BRANCH=$(current_branch || echo "")
+  STACK_PREFIX="$prefix"
+  STACK_PUSH=0
+  STACK_FORCE=0
+  STACK_ONTO=""
+  STACK_ONTO_REF=""
+  STACK_FROM_IDX=${#branches[@]}
+  STACK_PUSH_FAILURES=()
+  STACK_OPT_NO_PUSH="$OPT_NO_PUSH"
+  STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
+  STACK_RENAME_PAIRS=("$target" "$new_full")
+  STACK_RENAME_LABEL=reslug
+  STACK_PHASES=(rename-batch)
+  STACK_PHASE_IDX=0
+  STACK_UNIT_IDX=0
+
+  save_engine_state
+  _engine_run
 }
 
 # ---------- cmd_add helpers ----------
@@ -5584,7 +5909,13 @@ fold: no <branch> given and HEAD is detached"
       && log "  ${C_DIM}survivor ${survivor} renamed to ${new_survivor}${C_RESET}"
     log "  ${C_DIM}reflow ${n_children} child(ren) onto ${new_survivor}${C_RESET}"
     if (( ! OPT_NO_PUSH )); then
-      if _check_no_open_prs "$victim"; then
+      # Same gate set as the live run: the victim always, the survivor when the
+      # result slug renames it.
+      local _dr_gate=("$victim")
+      if [[ "$new_survivor" != "$survivor" ]]; then
+        _dr_gate+=("$survivor")
+      fi
+      if _check_no_open_prs "${_dr_gate[@]}"; then
         log "  ${C_YELLOW}would close PR #${_ORPHAN_PR_NUM}${C_RESET} for ${_ORPHAN_PR_BRANCH} (needs --allow-pr-rebuild, or 'pr desync' first)"
       fi
     fi
@@ -5592,13 +5923,25 @@ fold: no <branch> given and HEAD is detached"
     return 0
   fi
 
-  # PR gate: deleting the victim branch closes its head PR on GitHub, with no
-  # reattach — so refuse a victim with an open PR by default. The survivor is
-  # renamed through GitHub's branch-rename API (_remote_rename_batch_or_skip),
-  # which retargets its PR and keeps it open, so it is not gated.
+  # PR gate. Two branches can lose a head PR here, and both are gated:
+  #   - the victim, whose branch is deleted;
+  #   - the survivor, whenever the result slug renames it — the rename goes
+  #     through the same branches/rename API as `rename`, which CLOSES a head PR
+  #     (ADR 0006). Only the *base* side of a rename is retargeted, and no stack
+  #     branch is its own PR's base.
+  # An unrenamed survivor (--slug matching its current one) keeps its PR and is
+  # not gated.
   if (( ! opt_allow_pr_rebuild )) && (( ! OPT_NO_PUSH )); then
-    if _check_no_open_prs "$victim"; then
-      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — deleting the victim branch closes its head PR on GitHub, with no reattach. Pass --allow-pr-rebuild to accept the close (a breadcrumb to the superseding PR is posted). Or run 'git stack pr desync' first to take the stack offline, then fold, then 'git stack pr sync' to re-publish cleanly."
+    local _pr_gate=("$victim")
+    if [[ "$new_survivor" != "$survivor" ]]; then
+      _pr_gate+=("$survivor")
+    fi
+    if _check_no_open_prs "${_pr_gate[@]}"; then
+      local _why="deleting the victim branch closes its head PR on GitHub, with no reattach"
+      if [[ "$_ORPHAN_PR_BRANCH" == "$survivor" ]]; then
+        _why="the result is named '${new_survivor##*/}', which renames the survivor — and a head PR does not survive its branch being renamed on GitHub"
+      fi
+      die "fold would close PR #${_ORPHAN_PR_NUM} for ${_ORPHAN_PR_BRANCH} — ${_why}. Pass --allow-pr-rebuild to accept the close, or --slug ${survivor_slug} to keep the survivor's name (and its PR). Or run 'git stack pr desync' first to take the stack offline, then fold, then 'git stack pr sync' to re-publish cleanly."
     fi
   fi
 
@@ -7704,6 +8047,7 @@ alias gstkmv='git stack move'
 alias gstkfo='git stack fold'
 alias gstkdr='git stack drop'
 alias gstkrn='git stack rename'
+alias gstkrsl='git stack reslug'
 alias gstkd='git stack doctor'
 POSIX_EOF
 }
@@ -7736,6 +8080,7 @@ abbr -a -g gstkmv git stack move
 abbr -a -g gstkfo git stack fold
 abbr -a -g gstkdr git stack drop
 abbr -a -g gstkrn git stack rename
+abbr -a -g gstkrsl git stack reslug
 abbr -a -g gstkd git stack doctor
 FISH_EOF
 }
@@ -7800,6 +8145,13 @@ _git-stack() {
   case ${words[2]} in
     checkout|co) _gs_leaves; return ;;
     drop) _gs_leaves; return ;;
+    reslug)
+      # Only the first positional is a branch; the second is the free-text slug.
+      if (( CURRENT == 3 )); then
+        _gs_leaves
+        return
+      fi
+      ;;
     view|pick) _gs_complete prefixes; _describe -t prefixes 'prefix' _gs_items; return ;;
     pr|history)
       if (( CURRENT == 3 )); then
@@ -7836,13 +8188,14 @@ _emit_completion_fish() {
 complete -c git-stack -f
 complete -c git-stack -n 'contains -- -- (commandline -xpc)' -F
 # Top-level verbs: only when no verb has been typed yet.
-complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcommand_from list view pick checkout co create add sync clean restack amend continue abort pr history rename move mv fold drop doctor' -a '(git stack __complete verbs)'
+complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcommand_from list view pick checkout co create add sync clean restack amend continue abort pr history rename reslug move mv fold drop doctor' -a '(git stack __complete verbs)'
 # Sub-verbs.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from pr' -a '(git stack __complete subverbs pr)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from history' -a '(git stack __complete subverbs history)'
 # checkout → leaves; view/pick → prefixes.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from checkout co' -a '(git stack __complete leaves)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from drop' -a '(git stack __complete leaves)'
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from reslug' -a '(git stack __complete leaves)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from view pick' -a '(git stack __complete prefixes)'
 # Option-value slots (-x binds the candidates to the option's argument).
 complete -c git -n '__fish_git_using_command stack' -l prefix -x -a '(git stack __complete prefixes)'
@@ -7911,6 +8264,7 @@ main() {
     pr)                shift; cmd_pr "$@" ;;
     history)           shift; cmd_history "$@" ;;
     rename)            shift; cmd_rename "$@" ;;
+    reslug)            shift; cmd_reslug "$@" ;;
     move|mv)           shift; cmd_move "$@" ;;
     fold)              shift; cmd_fold "$@" ;;
     drop)              shift; cmd_drop "$@" ;;

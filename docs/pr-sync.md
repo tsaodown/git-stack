@@ -74,24 +74,31 @@ not chain members.
 ### Renames close head PRs
 
 GitHub auto-closes a PR when its head branch is renamed, and there's no API to
-reattach it. [`rename`](workflows.md#8-rename-the-stacks-prefix) changes every
-branch name, so it refuses by default when any branch has an open head PR; pass
-`--allow-pr-rebuild` to accept that those PRs close and the next `pr sync` opens
-fresh ones.
+reattach it. (Renaming a branch *does* retarget PRs that use it as their **base** —
+but every stack branch is the **head** of its own PR, and those close.)
 
-[`move`](workflows.md#5-the-branches-are-in-the-wrong-order) also renames branches
-(new leaf numbers), but it is **fully local** — it never pushes or syncs. So a move
-leaves any open PR sitting on the *old* remote branch; a later `pr sync` would open
-a fresh PR and orphan the old one. Rather than rebuild PRs mid-reorder, `move`
-refuses when an affected branch has an open PR and points you at the clean trio:
-[`pr desync`](#git-stack-pr-desync) to take the stack offline → reorder locally →
+That single fact shapes every renaming verb. None of them re-publish on your
+behalf: **PR state changes are explicit**, because closing and reopening a PR
+discards its review threads, approvals, and CI history. So each one refuses when
+the rename would hit an open head PR, and points at the same trio —
+[`pr desync`](#git-stack-pr-desync) to take the stack offline → mutate locally →
 `pr sync` to re-publish.
 
-[`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) closes the
-deleted victim's head PR, so it shares the `--allow-pr-rebuild` gate when the
-victim has one. The survivor keeps its PR — its remote branch is renamed through
-GitHub's rename API (which retargets the PR), even when the default slug renames
-it. When you accept the gate, `fold` deletes the remote victim branch, runs
+- [`rename`](workflows.md#8-rename-the-stacks-prefix) changes every branch name.
+  It renames the remote branches too (nothing else would ever reap an abandoned
+  *prefix*), but never runs `pr sync`.
+- [`reslug`](workflows.md#8a-rename-one-branchs-slug) changes one branch's slug.
+  Fully local — the stale remote stays under the current prefix, so `clean` reaps it.
+- [`move`](workflows.md#5-the-branches-are-in-the-wrong-order) renames branches by
+  giving them new leaf numbers. Also fully local.
+
+The exception is [`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away),
+which *does* auto-sync — discarding the victim's review context is the point of the
+operation, not collateral damage. It keeps the `--allow-pr-rebuild` gate, which
+covers **two** PRs: the deleted victim's, and the **survivor's** whenever the result
+renames it (which the default does, since the result takes the victim's slug).
+Passing `--slug <survivor's current slug>` keeps the survivor's name and its PR.
+When you accept the gate, `fold` deletes the remote victim branch, runs
 `pr sync` to rebuild the chain, and then posts a **breadcrumb** comment on the
 closed victim PR pointing at the PR that now supersedes it (the breadcrumb runs
 after the sync, once the superseding PR exists).

@@ -29,7 +29,7 @@ The verbs split along what they operate on:
   `view` (one stack's contents), `pick` (hop to a stack's tip), `create` (start
   a new stack), `sync` (push the whole stack), `clean` (prune + reflow).
 - **Branch-level** — act on a single branch within the current stack: `add`,
-  `checkout`, `restack`, `amend`, `move`, `rename`.
+  `checkout`, `restack`, `amend`, `move`, `rename`, `reslug`.
 
 `create <prefix> <slug>` starts a brand-new stack off the base; `add <slug>`
 inserts into the stack you're already on (it errors outside one — no silent
@@ -54,6 +54,17 @@ others without renumbering anything.
 The digit-count of a stack's leaves. Sparse stacks are width 3 (`010`); older
 "legacy" stacks created before sparse numbering are width 2 (`01`) and keep that
 width. A stack has one width, derived from its lowest leaf.
+
+## Slug
+
+The descriptive tail of a branch name, after the leaf — the `auth` in
+`feat/010-auth`. You choose it at `create <prefix> <slug>` / `add <slug>` time,
+and change it later with [`reslug`](reference.md#renaming-rename-vs-reslug). It
+carries no ordering meaning: the leaf decides position, the slug just says what
+the branch is for.
+
+A slug must start with a letter or underscore, so it can never look like a leaf —
+which is what keeps `reslug` (renames) and `move` (reorders) from overlapping.
 
 ## Gap
 

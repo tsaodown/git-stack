@@ -579,6 +579,91 @@ HOOK
   assert_output_contains "skipping reflow"
 }
 
+# ADR 0013: deleting a remote branch closes its head PR on GitHub. clean used
+# to do that silently — the confirmation named only branches. It must now say
+# which PRs the deletion closes.
+@test "clean: names the PR a remote-orphan deletion would close" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  # The orphan heads an open PR.
+  export GH_PR_feat_099_orphan__NUM=91
+  export GH_PR_feat_099_orphan__HEAD="feat/099-orphan"
+  run git stack clean --no-color
+  assert_status 0
+  assert_output_contains "feat/099-orphan"
+  assert_output_contains "#91"
+  assert_output_contains "will be closed"
+}
+
+@test "clean --dry-run: forecasts the PR closure alongside the orphan" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  export GH_PR_feat_099_orphan__NUM=91
+  export GH_PR_feat_099_orphan__HEAD="feat/099-orphan"
+  run git stack clean --dry-run --no-color
+  assert_status 0
+  assert_output_contains "closes PR #91"
+  # Still a preview: the remote branch and its PR survive.
+  git ls-remote --exit-code origin refs/heads/feat/099-orphan
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
+}
+
+# The nastier half of ADR 0013's clean annotation: deleting a branch that an
+# open PR *targets* closes that PR too — one the user never touched. Reachable
+# after a reslug/move whose successor's PR still bases on the old remote name,
+# if clean runs before the pr sync that would retarget it.
+@test "clean: warns when an orphan is the base of an open PR" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  # An open PR heads 02-b but is still based on the stale orphan.
+  export GH_PR_feat_02_b__NUM=55
+  export GH_PR_feat_02_b__HEAD="feat/02-b"
+  export GH_PR_feat_02_b__BASE="feat/099-orphan"
+  run git stack clean --no-color
+  assert_status 0
+  assert_output_contains "#55"
+  assert_output_contains "targets this branch"
+}
+
+@test "clean: orphan with no PR is listed without an annotation" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  run git stack clean --no-color
+  assert_status 0
+  assert_output_contains "feat/099-orphan"
+  refute_output_contains "will be closed"
+}
+
+@test "clean: remote-orphan listing degrades silently when gh is unusable" {
+  # The annotation is advisory — no gh (GH_STUB_REPO unset => no repo resolved)
+  # must not gate or break the deletion prompt.
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git push -q origin feat/02-b:refs/heads/feat/099-orphan
+  git fetch -q --prune
+  git checkout -q feat/02-b
+  run git stack clean --no-color
+  assert_status 0
+  assert_output_contains "feat/099-orphan"
+  assert_output_contains "delete these on origin"
+}
+
 @test "clean: bottom PR merged + base advanced reflows survivors onto the new base" {
   # The bread-and-butter flow (scenario 3/7): the bottom branch merges (so its
   # local branch goes [gone]) and origin/main advances to include its squashed
@@ -2006,14 +2091,14 @@ $old_footer"
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches the verb map (25, no shell functions)" {
-  # 25 simple aliases; no compound shell functions after the redesign.
+@test "init bash: alias count matches the verb map (26, no shell functions)" {
+  # 26 simple aliases; no compound shell functions after the redesign.
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count func_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk' || true)
   func_count=$(printf '%s\n' "$output" | grep -c '^gstk.*()' || true)
-  [ "$alias_count" -eq 25 ]
+  [ "$alias_count" -eq 26 ]
   [ "$func_count" -eq 0 ]
 }
 
@@ -2025,6 +2110,7 @@ $old_footer"
   [[ "$output" == *"alias gstkmv='git stack move'"* ]]
   [[ "$output" == *"alias gstkfo='git stack fold'"* ]]
   [[ "$output" == *"alias gstkrn='git stack rename'"* ]]
+  [[ "$output" == *"alias gstkrsl='git stack reslug'"* ]]
   # Removed: gstkn (new), gstkpa (push --all).
   [[ "$output" != *"alias gstkn="* ]]
   [[ "$output" != *"alias gstkpa="* ]]
@@ -2703,6 +2789,145 @@ $old_footer"
   [ "$(gh_log_count 'pr close')" -eq 0 ]
 }
 
+# ---------- reslug ----------
+
+@test "reslug: renames a branch's slug, keeping its leaf and SHA" {
+  make_stack_branches feat 010-a 015-b 020-c
+  local sha_a sha_b
+  sha_a=$(git rev-parse refs/heads/feat/010-a)
+  sha_b=$(git rev-parse refs/heads/feat/015-b)
+
+  run git stack reslug feat/010-a auth --no-color
+  assert_status 0
+  assert_branch_exists feat/010-auth
+  assert_branch_absent feat/010-a
+  # Pure rename: same SHA, neighbours untouched.
+  assert_sha_eq refs/heads/feat/010-auth "$sha_a"
+  assert_sha_eq refs/heads/feat/015-b "$sha_b"
+}
+
+@test "reslug: resolves the branch by bare leaf number" {
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug 15 renamed --no-color
+  assert_status 0
+  assert_branch_exists feat/015-renamed
+  assert_branch_absent feat/015-b
+}
+
+@test "reslug: one arg reslugs the current branch" {
+  make_stack_branches feat 010-a 015-b
+  git checkout -q feat/010-a
+  run git stack reslug auth --no-color
+  assert_status 0
+  assert_branch_exists feat/010-auth
+  assert_branch_absent feat/010-a
+  # HEAD follows the rename rather than dangling.
+  assert_eq "$(git rev-parse --abbrev-ref HEAD)" "feat/010-auth"
+}
+
+@test "reslug: rejects a slug starting with a digit (no smuggled leaf change)" {
+  # The invariant that keeps reslug and move disjoint: a slug can never encode
+  # a new leaf, so reslug cannot reorder.
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/010-a 020-b --no-color
+  assert_status 1
+  assert_branch_exists feat/010-a
+  assert_branch_absent feat/020-b
+}
+
+@test "reslug: refuses a slug identical to the current one" {
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/010-a a --no-color
+  assert_status 1
+  assert_output_contains "already the slug"
+  assert_branch_exists feat/010-a
+}
+
+@test "reslug: refuses a slug already used by another branch in the stack" {
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/010-a b --no-color
+  assert_status 1
+  assert_output_contains "collides"
+  assert_branch_exists feat/010-a
+}
+
+@test "reslug: errors when the branch is not in the stack" {
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/099-nope x --no-color
+  assert_status 1
+  assert_branch_exists feat/010-a
+}
+
+@test "reslug: does not require a clean tree" {
+  # Unlike move, nothing is rebased — the index and worktree are untouched, so
+  # a typo'd branch name is fixable mid-work (ADR 0014).
+  make_stack_branches feat 010-a 015-b
+  git checkout -q feat/010-a
+  echo dirty > uncommitted.txt
+  git add uncommitted.txt
+  run git stack reslug auth --no-color
+  assert_status 0
+  assert_branch_exists feat/010-auth
+  # The staged change survived untouched.
+  [ -f uncommitted.txt ]
+}
+
+@test "reslug: refuses when the branch has an open PR, pointing at the trio" {
+  make_stack_branches feat 010-a 015-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_010_a__NUM=42
+  run git stack reslug feat/010-a auth --no-color
+  assert_status 1
+  assert_output_contains "pr desync"
+  assert_branch_exists feat/010-a
+  assert_branch_absent feat/010-auth
+}
+
+@test "reslug: is fully local (no remote rename, no PR mutations)" {
+  make_stack_branches feat 010-a 015-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack reslug feat/010-a auth --no-color
+  assert_status 0
+  assert_branch_exists feat/010-auth
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
+}
+
+@test "reslug: reports itself, not move, in the rename-batch output" {
+  # The shared rename-batch phase used to hardcode "move".
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/010-a auth --no-color
+  assert_status 0
+  assert_output_contains "reslug complete"
+  refute_output_contains "move complete"
+}
+
+@test "reslug: history shows the slug change in the focus column" {
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/010-a auth --no-color
+  assert_status 0
+  run git stack history --no-color
+  assert_status 0
+  assert_output_contains "reslug"
+  assert_output_contains "a→auth"
+}
+
+@test "reslug: history restore re-creates the old name and warns about the duplicate leaf" {
+  make_stack_branches feat 010-a 015-b
+  run git stack reslug feat/010-a auth --no-color
+  assert_status 0
+  run git stack history restore @0 --yes --no-color
+  assert_status 0
+  # Restore brings back 010-a beside the live 010-auth: same leaf, two branches.
+  assert_branch_exists feat/010-a
+  assert_branch_exists feat/010-auth
+  assert_output_contains "duplicate leaf"
+}
+
 # ---------- fold ----------
 
 @test "fold: squashes a branch down into its predecessor and deletes it" {
@@ -2937,21 +3162,48 @@ $old_footer"
   [ "$(gh_log_count 'pr comment')" -eq 0 ]
 }
 
-@test "fold: proceeds when only the survivor has an open PR (rename preserves it)" {
+@test "fold: refuses when the renamed survivor has an open PR" {
+  # The default slug renames the survivor 010-a -> 010-b, and a head PR does NOT
+  # survive its branch being renamed (ADR 0006) — so the survivor's PR closes
+  # just like the victim's, and must be gated. This test previously asserted the
+  # opposite, on the disproven "rename retargets the PR" premise.
   make_stack_branches feat 010-a 020-b 030-c
   make_remote_origin
   export GH_STUB_REPO="test/repo"
-  # Default slug renames the survivor 010-a -> 010-b; the survivor carries the
-  # only open PR. GitHub's branch-rename API retargets that PR and keeps it
-  # open, so the gate must NOT fire — no --allow-pr-rebuild needed.
   export GH_PR_feat_010_a__NUM=41
   run git stack fold feat/020-b --yes --no-color
+  assert_status 1
+  assert_output_contains "#41"
+  assert_output_contains "renames the survivor"
+  # Refused before mutating, and before any remote call.
+  assert_branch_exists feat/010-a
+  assert_branch_exists feat/020-b
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+}
+
+@test "fold: an unrenamed survivor with an open PR is not gated" {
+  # --slug matching the survivor's current slug leaves its name alone, so its PR
+  # is never at risk and the gate must not fire.
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_010_a__NUM=41
+  run git stack fold feat/020-b --slug a --yes --no-color
+  assert_status 0
+  assert_branch_exists feat/010-a
+  assert_branch_absent feat/020-b
+}
+
+@test "fold: the survivor gate is waivable with --allow-pr-rebuild" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_010_a__NUM=41
+  run git stack fold feat/020-b --allow-pr-rebuild --yes --no-color
   assert_status 0
   assert_branch_exists feat/010-b
   assert_branch_absent feat/020-b
-  # Survivor remote-rename was attempted; no breadcrumb (the victim had no PR).
   [ "$(gh_log_count 'api -X POST')" -ge 1 ]
-  [ "$(gh_log_count 'pr comment')" -eq 0 ]
 }
 
 @test "fold --no-push: skips the PR gate even with an open victim PR" {
@@ -3739,7 +3991,54 @@ make_conflicting_dups() {
   run git stack rename newfeat --no-color
   [ "$status" -eq 0 ]
   [ "$(gh_log_count 'api -X POST')" -ge 2 ]
-  [ "$(gh_log_count 'pr')" -ge 1 ]
+  # `gh pr list` still runs — that's the open-PR guard, not a sync. The PR
+  # chain itself must be untouched (ADR 0013).
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+}
+
+# ADR 0013: rename does the remote rename so nothing is orphaned under the old
+# prefix, but never republishes — that is an explicit `pr sync`.
+@test "rename: renames the remote but never runs pr sync" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  run git stack rename newfeat --no-color
+  assert_status 0
+  assert_branch_exists newfeat/01-a
+  assert_branch_exists newfeat/02-b
+  # Remote half ran...
+  [ "$(gh_log_count 'api -X POST')" -ge 2 ]
+  # ...but no PR was created, edited, or closed.
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
+  refute_output_contains "post-rename"
+}
+
+@test "rename --allow-pr-rebuild: removed, errors pointing at the desync trio" {
+  make_stack_branches feat 01-a 02-b
+  run git stack rename newfeat --allow-pr-rebuild --no-color
+  assert_status 1
+  assert_output_contains "has been removed"
+  assert_output_contains "pr desync"
+  # Refused before touching anything.
+  assert_branch_exists feat/01-a
+  assert_branch_absent newfeat/01-a
+}
+
+@test "rename: refuses when a branch has an open PR, pointing at the trio" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_01_a__NUM=77
+  run git stack rename newfeat --no-color
+  assert_status 1
+  assert_output_contains "pr desync"
+  assert_branch_exists feat/01-a
+  assert_branch_absent newfeat/01-a
+  # The refusal must not promise a rebuild that no longer happens.
+  refute_output_contains "allow-pr-rebuild"
 }
 
 @test "rename --no-push: keeps local-only behavior" {

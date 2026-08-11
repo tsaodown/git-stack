@@ -103,13 +103,21 @@ A leaf-renumber needed to re-space the stack — for instance to open a
 [gap](concepts.md#gap) that was exhausted, so an insert that previously refused
 can succeed.
 
-When renames are applied, doctor runs the same atomic rename + remote-rename +
-`pr sync` flow as [`rename`](workflows.md#8-rename-the-stacks-prefix) and
-[`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away) (suppress the
-remote tail with `--no-push`, or keep the rename but skip the PR step with
-`--no-sync`), and a squash that rewrites commits triggers a reflow — so a
+When renames are applied, doctor renames the remote branches and then runs
+`pr sync` (suppress the remote tail with `--no-push`, or keep the rename but skip
+the PR step with `--no-sync`), and a squash that rewrites commits triggers a reflow — so a
 `doctor` repair can pause on a conflict just like any other reflow (resolve +
 `git stack continue`).
+
+> **Heads up — doctor is the one verb that still re-syncs PRs on its own.**
+> [`rename`](workflows.md#8-rename-the-stacks-prefix),
+> [`reslug`](workflows.md#8a-rename-one-branchs-slug) and
+> [`move`](workflows.md#5-the-branches-are-in-the-wrong-order) leave republishing
+> to an explicit `pr sync` and refuse when a rename would hit an open head PR.
+> `doctor` has no such guard, so renumbering a published stack closes those PRs
+> and opens fresh ones. Run [`pr desync`](pr-sync.md#git-stack-pr-desync) first —
+> or `--no-rename` to skip the renumber pass — if you want to keep the existing
+> PRs. See [renames close head PRs](pr-sync.md#renames-close-head-prs).
 
 ## Rolling back with history
 

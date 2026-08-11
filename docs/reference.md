@@ -95,14 +95,44 @@ victim/survivor range, so multi-commit branches fold fine.
 `fold` is destructive, so it snapshots first (undo with `git stack history
 restore @0` — which also warns if a rename left a duplicate-leaf branch behind),
 refuses a dirty tree, prompts `[Y/n]` (default yes), and needs `--yes` when run
-off a TTY. Deleting the victim closes its head PR, so `fold` refuses a victim with
-an open PR unless you pass `--allow-pr-rebuild` (or `--no-push`). The survivor
-keeps its PR — even when the default slug renames it, the remote branch is renamed
-through GitHub's rename API, which retargets the PR and leaves it open. With
+off a TTY. A head PR survives neither a delete nor a rename, so `fold` refuses when
+either the **victim** (deleted) or the **survivor** (renamed, since the result takes
+the victim's slug by default) has an open PR — unless you pass
+`--allow-pr-rebuild` (or `--no-push`), or `--slug` the survivor's current slug to
+leave its name alone. With
 `--allow-pr-rebuild`, `fold` deletes the remote victim branch, re-syncs the PR
 chain, and leaves a breadcrumb comment on the closed victim PR pointing at the one
 that supersedes it. See
 [workflows scenario 13](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away).
+
+## Renaming: `rename` vs `reslug`
+
+A stack branch is `<prefix>/<leaf>-<slug>` — `feat/010-auth`. Three verbs rename
+one, and they split cleanly by which part they touch:
+
+| Verb            | Changes         | Example                             |
+| --------------- | --------------- | ----------------------------------- |
+| `rename <new>`  | the **prefix**  | `feat/010-auth` → `fix/010-auth`    |
+| `reslug <slug>` | the **slug**    | `feat/010-auth` → `feat/010-authz`  |
+| `move --at <n>` | the **leaf**    | `feat/010-auth` → `feat/020-auth`   |
+
+```sh
+git stack reslug authz          # current branch
+git stack reslug 010 authz      # by leaf, partial name, or full branch name
+git stack reslug                # prompts, prefilling the current slug
+```
+
+`reslug` keeps the leaf, so it never reorders — enforced by the slug validator,
+which forbids a leading digit, so a leaf change can't be smuggled through a slug.
+It's a single atomic ref rename with no reflow, which is why it's the one mutating
+verb that doesn't require a clean tree. It snapshots first (`git stack history
+restore @0` undoes it, re-creating the old name and warning about the duplicate
+leaf that leaves behind).
+
+None of the three re-publish PRs — see [renames close head PRs](pr-sync.md#renames-close-head-prs).
+`rename` renames the remote branches so an abandoned prefix isn't left behind;
+`reslug` and `move` leave their stale remote for `clean`, which sits in the same
+prefix.
 
 ## The default branch: `default-branch`
 
@@ -159,6 +189,7 @@ This defines one short alias per verb:
 | `gstkfo`    | `git stack fold`            |
 | `gstkdr`    | `git stack drop`            |
 | `gstkrn`    | `git stack rename`          |
+| `gstkrsl`   | `git stack reslug`          |
 | `gstkd`     | `git stack doctor`          |
 
 The old `gstkrom`/`gstkromp` (fetch + `restack --onto origin/<default>`) and the
