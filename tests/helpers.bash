@@ -144,6 +144,15 @@ assert_output_contains() {
   fi
 }
 
+# refute_output_contains <substr> : the inverse of assert_output_contains.
+refute_output_contains() {
+  if [[ "${output-}" == *"$1"* ]]; then
+    echo "refute_output_contains failed: '$1' found in:" >&2
+    echo "${output-}" >&2
+    return 1
+  fi
+}
+
 # assert_branch_exists / assert_branch_absent : local ref presence.
 assert_branch_exists() {
   if ! git rev-parse --verify --quiet "refs/heads/$1" >/dev/null; then

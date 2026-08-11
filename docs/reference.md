@@ -4,12 +4,19 @@ Lookup material: the shell aliases, configuration knobs, and a couple of command
 worth spelling out. For the **exhaustive per-command flag reference**, run:
 
 ```sh
-git stack help
+git stack help              # index: every subcommand with a one-liner
+git stack fold --help       # one subcommand in full (also: git stack help fold)
+git stack pr desync --help  # subverbs narrow too
+git stack help --all        # every subcommand's full text in one dump
 ```
 
-`help` lists every subcommand and its flags in one place — this page covers the
-things `help` doesn't (the shell aliases, the config knobs) plus the day-to-day
+`help` is the index; `<verb> --help` is the detail. This page covers the things
+neither of them does (the shell aliases, the config knobs) plus the day-to-day
 shortcuts.
+
+`--help` / `-h` is recognized only immediately after the verb (or after its
+subverb), so a flag value that happens to mention it — `git stack amend -m
+"document the --help flag"` — still runs the command.
 
 ## Seeing your stacks: `list` vs `view`
 
@@ -173,6 +180,7 @@ git config stack.historyKeep 100     # auto-prune snapshots older than the Nth (
 | `stack.historyKeep` | How many [snapshots](concepts.md#snapshot) to retain before auto-pruning | `100` (`0` disables) |
 
 Most flags also have a `--prefix <p>` / `--no-push` / `--no-sync` /
-`--color` / `--no-color` / `-v` / `-q` form — see `git stack help`.
+`--color` / `--no-color` / `-v` / `-q` form — see `git stack help`, or
+`git stack <verb> --help` for one command's own flags.
 
 **See also:** [concepts.md](concepts.md) · [workflows.md](workflows.md) · [development.md](development.md)

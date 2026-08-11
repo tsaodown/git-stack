@@ -2081,284 +2081,467 @@ _gh_pr_inspect() {
 
 # ---------- subcommands ----------
 
-cmd_help() {
-  # Aliases for brevity in the heredoc.
-  local b="$C_BOLD" d="$C_DIM" cy="$C_CYAN" r="$C_RESET"
-  local sub="${b}${cy}"   # subcommand keyword: bold cyan
-  local fl="${cy}"        # flag name: cyan
+# Source of truth for the verb list: `group<TAB>verb<TAB>one-liner` rows, in
+# display order. Read by `help` (all groups) and by the completion plumbing
+# (which drops the `plumb` group). Removed verbs (new/close/push/status) and
+# `__complete` are deliberately absent. Pure printf — no repo access, no stderr
+# — so it stays safe on the completion path, which must never die or print.
+_verb_table() {
+  printf '%s\t%s\t%s\n' \
+    stack  list           "Overview of all stacks in the repo" \
+    stack  view           "Show one stack's branches without checking out" \
+    stack  pick           "Pick a stack and check out its tip" \
+    stack  create         "Start a brand-new stack" \
+    stack  sync           "Push the whole stack additively to the remote" \
+    stack  clean          "Prune gone branches and reflow survivors" \
+    branch add            "Add an empty branch to the current stack" \
+    branch checkout       "Check out a stack branch by leaf number" \
+    branch restack        "Reset+cherry-pick branches onto their predecessors" \
+    branch amend          "Amend the current branch and reflow upper branches" \
+    branch continue       "Resume a paused reflow after resolving conflicts" \
+    branch abort          "Abort a paused reflow and restore original SHAs" \
+    branch pr             "Sync, list, or close GitHub PRs for the stack" \
+    branch history        "Show or restore stack snapshots" \
+    branch move           "Move a branch to a different position in the stack" \
+    branch rename         "Rename every branch in the stack to a new prefix" \
+    branch fold           "Fold one branch's commits into another" \
+    branch drop           "Discard a branch and reflow its children onto the predecessor" \
+    branch doctor         "Diagnose stack health" \
+    plumb  prefix         "Print the auto-detected stack prefix (debug)" \
+    plumb  default-branch "Print the resolved default branch name" \
+    plumb  init           "Emit the shell-integration snippet for bash|zsh|fish"
+}
+
+# Subverbs for the verbs that have them: `verb<TAB>subverb<TAB>one-liner`.
+# Same contract as _verb_table — pure printf, safe on the completion path.
+_subverb_table() {
+  printf '%s\t%s\t%s\n' \
+    pr      sync    "Create/update PRs for the stack" \
+    pr      list    "List the stack's PRs" \
+    pr      desync  "Close the stack's PRs to reorder/re-sync clean" \
+    history show    "Show a stack snapshot" \
+    history restore "Restore a stack snapshot"
+}
+
+# `verb<TAB>desc` for one _verb_table group; `subverb<TAB>desc` for one verb.
+_help_group_rows() {
+  local want="$1"
+  local group="" verb="" desc=""
+  while IFS=$'\t' read -r group verb desc; do
+    [[ "$group" == "$want" ]] || continue
+    printf '%s\t%s\n' "$verb" "$desc"
+  done < <(_verb_table)
+}
+
+_help_subverb_rows() {
+  local want="$1"
+  local verb="" sv="" desc=""
+  while IFS=$'\t' read -r verb sv desc; do
+    [[ "$verb" == "$want" ]] || continue
+    printf '%s\t%s\n' "$sv" "$desc"
+  done < <(_subverb_table)
+}
+
+# Render `key<TAB>description` lines from stdin as an aligned two-column list.
+# Buffers because the key column width isn't known until every row is read, and
+# pads by hand: the keys carry color escapes, which would defeat printf's own
+# `%-*s` width accounting.
+_help_pad_rows() {
+  local kc="${C_BOLD}${C_CYAN}" r="$C_RESET"
+  local keys=() descs=() k="" d="" w=0
+  while IFS=$'\t' read -r k d; do
+    [[ -n "$k" ]] || continue
+    keys+=("$k")
+    descs+=("$d")
+    if (( ${#k} > w )); then w=${#k}; fi
+  done
+  local i=0
+  while (( i < ${#keys[@]} )); do
+    printf '  %s%s%s%*s%s\n' "$kc" "${keys[$i]}" "$r" \
+      "$(( w - ${#keys[$i]} + 2 ))" "" "${descs[$i]}"
+    i=$(( i + 1 ))
+  done
+}
+
+# The default `git stack help`: verb index plus the shared reference sections.
+# Per-verb prose lives in _help_topic, reachable as `git stack <verb> --help`.
+_help_index() {
+  local b="$C_BOLD" r="$C_RESET"
   cat <<EOF
 ${b}usage:${r} git stack <subcommand> [options]
 
-${b}Stack-level subcommands:${r}
-  ${sub}list${r}                              Overview of *all* stacks in the repo: branch
-                                    count, tip leaf, a \`*\` on the current
-                                    stack, and the base ref with
-                                    \`[+ahead/-behind]\`. Local only — never
-                                    fetches or calls \`gh\`.
-  ${sub}view${r} [<stack>] [${fl}--no-fetch${r}]         One stack's contents (no checkout): parent
-                                    header, each branch with tip SHA, subject,
-                                    and upstream sync state (\`[synced]\`,
-                                    \`[+ahead/-behind]\`, \`[gone]\`,
-                                    \`[unpushed]\`), the last snapshot, and a
-                                    paused-op banner if a reflow is mid-flight.
-                                    Defaults to the current stack; pass a name
-                                    (trailing \`/\` optional) or pick one from
-                                    outside. Runs \`git fetch --all --prune\` by
-                                    default; ${fl}--no-fetch${r} skips it.
-  ${sub}pick${r} [<prefix>]
-                                    Check out a stack's tip (highest-leaf
-                                    branch) — a fast hop, even from inside
-                                    another stack. Pass a name (trailing
-                                    \`/\` optional) or choose from the
-                                    all-stacks selector.
-  ${sub}create${r} [<prefix>] [<slug>] [${fl}--onto${r} <ref>] [${fl}--stash${r}]
-                                    Start a brand-new stack: first branch
-                                    (leaf \`010\`) off the resolved base
-                                    (${fl}stack.base${r} → origin/<default> → local
-                                    default), or ${fl}--onto${r} <ref>. Errors if the
-                                    prefix already has branches (use ${sub}add${r}).
-                                    Checks out the new branch. On a TTY, a
-                                    missing <prefix> or <slug> is prompted for
-                                    (re-prompts on invalid input, keeping what
-                                    you typed); off a TTY it's a usage error.
-                                    A dirty tree prompts to carry the
-                                    uncommitted work into the new stack; ${fl}--stash${r}
-                                    carries it without prompting (required to
-                                    carry non-interactively).
-  ${sub}sync${r}                              Push the whole stack to the remote, additive
-                                    only (force-with-lease on every branch; no
-                                    deletes, no PR work). Remote cleanup is
-                                    ${sub}clean${r}'s job; PR chains are ${sub}pr sync${r}'s.
-  ${sub}clean${r} [${fl}--dry-run${r}] [${fl}--keep-history${r}]
-                                    Tidy a stack: prune local branches whose
-                                    upstream is \`[gone]\` (+ their snapshot
-                                    leaves), delete remote branches under the
-                                    prefix with no local counterpart
-                                    (confirm-gated — declining skips only that
-                                    step), then reflow the survivors onto
-                                    origin/<default> (skipped when nothing was
-                                    pruned and the base hasn't moved). Can pause
-                                    on conflict (resolve + ${sub}continue${r}). ${fl}--keep-history${r}
-                                    preserves backup refs; ${fl}--dry-run${r} previews.
+${b}Stack-level:${r}
+$(_help_group_rows stack | _help_pad_rows)
 
-${b}Branch-level subcommands:${r}
-  ${sub}add${r} <slug> [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--prefix${r} <p>]
-                                    Add an empty branch to the *current* stack
-                                    at the chosen position. Local-only — never
-                                    renames or touches existing branches, never
-                                    calls GitHub. <ref> is a numeric leaf or
-                                    full branch name; <num> is a leaf to place
-                                    at exactly. With no position flag, opens an
-                                    interactive picker; its leaf step accepts a
-                                    suggested number or any leaf you type in the
-                                    gap. New stacks get sparse
-                                    3-digit leaves stepping by 10; insert flags
-                                    pick the midpoint of the gap (refuses, no
-                                    cascade, if exhausted). Errors outside a
-                                    stack — use ${sub}create${r} or ${sub}pick${r}.
-                                    A dirty tree is carried onto the new branch
-                                    automatically (stashed + reapplied when the
-                                    insert lands off your current commit).
-  ${sub}checkout${r} [<number>]               Check out the stack branch whose leaf starts
-                                    with that number (numeric match, so \`5\`
-                                    finds \`05-foo\`).
-                                    With no <number>, opens an interactive
-                                    picker (fzf if available, else numbered
-                                    prompt). From outside a stack, picks the
-                                    stack first (shared with ${sub}list${r}/${sub}pick${r}),
-                                    then a specific branch.
-  ${sub}restack${r} [${fl}--from${r} <branch>] [${fl}--onto${r} <ref>] [${fl}--push${r}] [${fl}--force${r}]
-                                    Reset+cherry-pick ${fl}--from${r} (default: current
-                                    branch's child) and each branch above it onto
-                                    its predecessor's new HEAD. With ${fl}--onto${r} <ref>,
-                                    rebase ${fl}--from${r} (default: bottom of stack)
-                                    onto <ref> first, then propagate up. With
-                                    ${fl}--push${r}, force-with-lease push each branch
-                                    as it finishes. Refuses if any branch has
-                                    more than one commit since its predecessor;
-                                    pass ${fl}--force${r} to cherry-pick the tip
-                                    only (intermediate commits are dropped).
-  ${sub}amend${r} [${fl}-m${r} <msg>] [${fl}--push${r}] [${fl}--force${r}] [${d}--${r} <pathspec>...]
-                                    git add <pathspec>, git commit --amend
-                                    [--no-edit|-m <msg>], then \`restack\`.
-                                    ${fl}--force${r} is plumbed through to ${sub}restack${r}.
-  ${sub}continue${r}                          After resolving a cherry-pick conflict
-                                    (\`git add\` the fixed files), finish the
-                                    cherry-pick and resume the reflow loop.
-  ${sub}abort${r}                             Restore every branch in the run to its
-                                    saved original SHA. Warns about already-
-                                    pushed branches; does not undo remote.
-  ${sub}pr sync${r} [${fl}--no-push${r}] [${fl}--ready${r}] [${fl}--dry-run${r}] [${fl}--no-template${r}]
-                                    Sync the GitHub PR chain to the local
-                                    stack. Pushes any unpushed branches,
-                                    opens a draft PR for each (base = previous
-                                    branch, or ${fl}stack.base${r} for the bottom),
-                                    titled \`[N/M] <last commit subject>\`, with
-                                    the repo's PR template as the body. On
-                                    existing PRs, keeps the [N/M] prefix and
-                                    a fenced stack-nav footer up to date.
-                                    Re-run after any stack change. Requires
-                                    \`gh\` authenticated for github.com.
-  ${sub}pr list${r} [${fl}--no-fetch${r}]              List the stack's PRs one per line: branch,
-                                    PR number (clickable link in modern
-                                    terminals), status badges (\`[synced]\`,
-                                    \`[draft]\`, \`[base: X]\`, \`[approved]\`,
-                                    \`[closed]\`/\`[merged]\`), title, and
-                                    comment count. Runs \`git fetch --all
-                                    --prune\` by default; pass ${fl}--no-fetch${r}
-                                    to skip. Requires \`gh\`.
-  ${sub}pr desync${r} [${fl}--delete-remote${r}] [${fl}--yes${r}] [${fl}--dry-run${r}]
-                                    Tear down the stack's PR chain (inverse of
-                                    ${sub}pr sync${r}) so branches can be reordered and
-                                    re-synced clean: closes each branch's open
-                                    PR. Skips merged and already-closed PRs. An
-                                    open PR with human activity (a non-bot
-                                    comment, an approval, or a changes-requested
-                                    review) prompts ${fl}y/N${r} per PR on a TTY —
-                                    skipped non-interactively unless ${fl}--yes${r}.
-                                    ${fl}--delete-remote${r} also deletes the remote
-                                    branch of each PR closed (but never one
-                                    still serving as the base of a PR you kept
-                                    open). ${fl}--dry-run${r} previews. Requires \`gh\`.
-  ${sub}history${r}                           List snapshots taken before each restack/
-                                    amend. Subcommands: \`history show <id>\`,
-                                    \`history restore <id> [--yes]\`. Run-id may
-                                    be full, action-tagged, bare timestamp, or
-                                    \`@N\` (relative; @0 = newest).
-  ${sub}move${r} [<branch>] [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--force${r}]
-                                    Relocate <branch> (default: current branch)
-                                    in the current stack to
-                                    the chosen position. Cherry-picks affected
-                                    branches onto their new predecessors using
-                                    the existing reflow state machine — on
-                                    conflict, resolve + \`git stack continue\`.
-                                    ${b}Fully local${r}: touches only local refs — no
-                                    push, no PR sync. To reorder a published
-                                    stack cleanly, run ${sub}pr desync${r} first, reorder,
-                                    then ${sub}pr sync${r}. Refuses if any affected branch
-                                    has an open PR (it would desync from GitHub),
-                                    pointing you at that workflow. ${fl}--first${r}
-                                    removed; use ${fl}--before${r} instead.
-                                    When the chosen position is the branch's
-                                    current slot (e.g. ${fl}--before${r} the branch it
-                                    already sits below, or ${fl}--at${r} a free leaf in
-                                    the same gap), it ${b}renumbers in place${r}: a
-                                    pure rename of the leaf, no reflow. With a
-                                    TTY and no ${fl}--at${r}, a leaf picker offers the
-                                    free numbers in the gap.
-  ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}] [${fl}--allow-pr-rebuild${r}]
-                                    Atomically rename every branch in the stack
-                                    from <old>/<leaf> to <new>/<leaf>, carrying
-                                    backup refs along by default. Refuses if
-                                    state file exists, branch checked out
-                                    elsewhere, or any target name collides.
-                                    Also refuses if any branch has an open
-                                    head PR (renaming a branch closes its head
-                                    PR on GitHub, with no reattach); pass
-                                    ${fl}--allow-pr-rebuild${r} to proceed and rebuild
-                                    them, or run ${sub}pr desync${r} first to re-publish
-                                    cleanly.
-  ${sub}fold${r} [<branch>] [${fl}--up${r}|${fl}--down${r}] [${fl}--slug${r} <s>] [${fl}--at${r} <num>]
-       [${fl}--allow-pr-rebuild${r}] [${fl}--dry-run${r}] [${fl}--yes${r}] [${fl}--no-push${r}]
-                                    Merge a branch away by squashing it into an
-                                    adjacent neighbor (default: ${fl}--down${r} into the
-                                    predecessor), preserving the combined diff as
-                                    one commit, then reflowing the children. The
-                                    result keeps the survivor's leaf but takes the
-                                    folded branch's slug by default (the branch you
-                                    ran ${sub}fold${r} on names the result); ${fl}--slug${r}
-                                    overrides the slug, ${fl}--at${r} the leaf (to a
-                                    free leaf below the children). Squashes the
-                                    whole victim/survivor range, so multi-commit/
-                                    merge-tip branches fold fine (note: reflowed
-                                    *children* are still cherry-picked tip-only).
-                                    Errors at the stack boundaries (bottom ${fl}--down${r},
-                                    tip ${fl}--up${r}, lone branch — use ${sub}clean${r}).
-                                    Destructive: snapshots first (undo via
-                                    ${sub}history restore${r}, which warns about any
-                                    duplicate-leaf leftovers a rename leaves),
-                                    refuses a dirty tree, needs ${fl}--yes${r} off a TTY.
-                                    Deleting the victim (and renaming the survivor
-                                    under ${fl}--slug${r}) closes their head PRs: refuses
-                                    unless ${fl}--allow-pr-rebuild${r} (or ${fl}--no-push${r}),
-                                    then deletes the remote victim, re-syncs PRs,
-                                    and breadcrumbs the closed PR to the
-                                    superseding one. ${fl}--dry-run${r} previews.
-  ${sub}drop${r} [<branch>] [${fl}--force${r}] [${fl}--dry-run${r}] [${fl}--yes${r}]
-                                    Discard a branch and reflow its children onto
-                                    its predecessor — the destructive sibling of
-                                    ${sub}fold${r} (fold keeps the diff; ${sub}drop${r} throws it
-                                    away). Defaults to the current branch. Degrades
-                                    at every position: middle → children onto the
-                                    predecessor; bottom → onto base; tip → pure
-                                    delete; lone → delete + land on base. Children
-                                    are cherry-picked tip-only, so one that built
-                                    on the dropped work surfaces a normal conflict
-                                    to resolve and ${sub}continue${r}; ${fl}--force${r} waives the
-                                    multi-commit guard. Fully local (no push/
-                                    rename/${sub}pr sync${r}). Destructive: snapshots first
-                                    (undo via ${sub}history restore${r}), refuses a dirty
-                                    tree, needs ${fl}--yes${r} off a TTY. Refuses only when
-                                    the victim has an open PR (run ${sub}pr desync${r}
-                                    first). ${fl}--dry-run${r} previews.
-  ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}]
-          [${fl}--no-rename${r}] [${fl}--no-push${r}] [${fl}--no-sync${r}]
-                                    Detect and offer to fix problems in the
-                                    current stack. Three issue types are checked:
-                                      • leaf numbers out of order (renamed to
-                                        cascade in place, preserving gaps)
-                                      • duplicate leaf numbers — two or more
-                                        branches share the same leaf. Interactive
-                                        prompt lets you pick which branch keeps
-                                        the number; the rest cascade upward and
-                                        upper branches are re-threaded onto the
-                                        chosen predecessor.
-                                      • branches that violate the single-
-                                        commit-per-branch invariant — multi-
-                                        commit branches and merge-commit tips
-                                        (squashed into one commit on top of
-                                        their predecessor, then upper branches
-                                        are re-threaded via ${sub}restack${r})
-                                    Per-issue interactive prompts on a tty:
-                                    ${fl}y${r}=apply, ${fl}e${r}=apply with \$EDITOR for the
-                                    squash message, ${fl}N${r}=skip, ${fl}a${r}=apply all,
-                                    ${fl}q${r}=quit. Duplicate prompts take a
-                                    space- or comma-separated permutation of
-                                    1..N (RET to keep current order, ${fl}q${r} to
-                                    quit). Pass ${fl}--yes${r} to auto-apply every
-                                    fix using sort-V order for duplicates
-                                    (required for non-tty / scripts).
-                                    ${fl}--dry-run${r} previews the issue list and
-                                    proposed fixes without applying. ${fl}--no-squash${r}
-                                    skips the squash checks (rename-only mode);
-                                    ${fl}--no-rename${r} skips the leaf-rename pass
-                                    (which also skips duplicate detection).
-                                    Empty squashes (branch tree == predecessor
-                                    tree) offer to delete the absorbed branch.
-                                    Same atomic rename + remote-rename + pr
-                                    sync flow as ${sub}rename${r} (skip with
-                                    --no-push / --no-sync).
-  ${sub}prefix${r}                            Print auto-detected stack prefix (debug).
-  ${sub}default-branch${r}                    Print the resolved default branch name
-                                    (stack.base → init.defaultBranch → main →
-                                    master, falling back to literal \`main\`).
-                                    Used internally by ${sub}clean${r} and
-                                    ${sub}restack --onto${r}.
-  ${sub}init${r} <bash|zsh|fish>              Emit shell-integration snippet defining
-                                    \`gstk*\` aliases/abbreviations. Add to your
-                                    rc: \`eval "\$(git stack init bash)"\` (bash/
-                                    zsh) or \`git stack init fish | source\`
-                                    (fish).
+${b}Branch-level:${r}
+$(_help_group_rows branch | _help_pad_rows)
 
+${b}Plumbing:${r}
+$(_help_group_rows plumb | _help_pad_rows)
+
+Run \`git stack <verb> --help\` for one verb in full, or \`git stack help --all\`
+for every verb at once.
+EOF
+}
+
+# Full-width prose for one help topic. Topic keys are the verbs of _verb_table,
+# with `pr` split per subverb; `history` keeps show/restore in the one topic.
+_help_topic() {
+  local topic="$1"
+  # Aliases for brevity in the heredocs.
+  local b="$C_BOLD" d="$C_DIM" cy="$C_CYAN" r="$C_RESET"
+  local sub="${b}${cy}"   # subcommand keyword: bold cyan
+  local fl="${cy}"        # flag name: cyan
+  case "$topic" in
+    list)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}list${r}
+
+Overview of *all* stacks in the repo: branch count, tip leaf, a \`*\` on the
+current stack, and the base ref with \`[+ahead/-behind]\`. Local only — never
+fetches or calls \`gh\`.
+EOF
+      ;;
+    view)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}view${r} [<stack>] [${fl}--no-fetch${r}]
+
+One stack's contents (no checkout): parent header, each branch with tip SHA,
+subject, and upstream sync state (\`[synced]\`, \`[+ahead/-behind]\`, \`[gone]\`,
+\`[unpushed]\`), the last snapshot, and a paused-op banner if a reflow is
+mid-flight.
+
+Defaults to the current stack; pass a name (trailing \`/\` optional) or pick one
+from outside. Runs \`git fetch --all --prune\` by default; ${fl}--no-fetch${r} skips it.
+EOF
+      ;;
+    pick)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}pick${r} [<prefix>]
+
+Check out a stack's tip (highest-leaf branch) — a fast hop, even from inside
+another stack. Pass a name (trailing \`/\` optional) or choose from the
+all-stacks selector.
+EOF
+      ;;
+    create)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}create${r} [<prefix>] [<slug>] [${fl}--onto${r} <ref>] [${fl}--stash${r}]
+
+Start a brand-new stack: first branch (leaf \`010\`) off the resolved base
+(${fl}stack.base${r} → origin/<default> → local default), or ${fl}--onto${r} <ref>. Errors if
+the prefix already has branches (use ${sub}add${r}). Checks out the new branch.
+
+On a TTY, a missing <prefix> or <slug> is prompted for (re-prompts on invalid
+input, keeping what you typed); off a TTY it's a usage error. A dirty tree
+prompts to carry the uncommitted work into the new stack; ${fl}--stash${r} carries it
+without prompting (required to carry non-interactively).
+EOF
+      ;;
+    sync)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}sync${r}
+
+Push the whole stack to the remote, additive only (force-with-lease on every
+branch; no deletes, no PR work). Remote cleanup is ${sub}clean${r}'s job; PR chains are
+${sub}pr sync${r}'s.
+EOF
+      ;;
+    clean)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}clean${r} [${fl}--dry-run${r}] [${fl}--keep-history${r}]
+
+Tidy a stack: prune local branches whose upstream is \`[gone]\` (+ their snapshot
+leaves), delete remote branches under the prefix with no local counterpart
+(confirm-gated — declining skips only that step), then reflow the survivors
+onto origin/<default> (skipped when nothing was pruned and the base hasn't
+moved).
+
+Can pause on conflict (resolve + ${sub}continue${r}). ${fl}--keep-history${r} preserves backup
+refs; ${fl}--dry-run${r} previews.
+EOF
+      ;;
+    add)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}add${r} <slug> [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>]
+                     [${fl}--prefix${r} <p>]
+
+Add an empty branch to the *current* stack at the chosen position. Local-only —
+never renames or touches existing branches, never calls GitHub. <ref> is a
+numeric leaf or full branch name; <num> is a leaf to place at exactly.
+
+With no position flag, opens an interactive picker; its leaf step accepts a
+suggested number or any leaf you type in the gap. New stacks get sparse 3-digit
+leaves stepping by 10; insert flags pick the midpoint of the gap (refuses, no
+cascade, if exhausted). Errors outside a stack — use ${sub}create${r} or ${sub}pick${r}.
+
+A dirty tree is carried onto the new branch automatically (stashed + reapplied
+when the insert lands off your current commit).
+EOF
+      ;;
+    checkout)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}checkout${r} [<number>]
+
+Check out the stack branch whose leaf starts with that number (numeric match,
+so \`5\` finds \`05-foo\`).
+
+With no <number>, opens an interactive picker (fzf if available, else numbered
+prompt). From outside a stack, picks the stack first (shared with
+${sub}list${r}/${sub}pick${r}), then a specific branch.
+EOF
+      ;;
+    restack)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}restack${r} [${fl}--from${r} <branch>] [${fl}--onto${r} <ref>] [${fl}--push${r}] [${fl}--force${r}]
+
+Reset+cherry-pick ${fl}--from${r} (default: current branch's child) and each branch
+above it onto its predecessor's new HEAD. With ${fl}--onto${r} <ref>, rebase ${fl}--from${r}
+(default: bottom of stack) onto <ref> first, then propagate up. With ${fl}--push${r},
+force-with-lease push each branch as it finishes.
+
+Refuses if any branch has more than one commit since its predecessor; pass
+${fl}--force${r} to cherry-pick the tip only (intermediate commits are dropped).
+EOF
+      ;;
+    amend)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}amend${r} [${fl}-m${r} <msg>] [${fl}--push${r}] [${fl}--force${r}] [${d}--${r} <pathspec>...]
+
+git add <pathspec>, git commit --amend [--no-edit|-m <msg>], then \`restack\`.
+${fl}--force${r} is plumbed through to ${sub}restack${r}.
+EOF
+      ;;
+    continue)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}continue${r}
+
+After resolving a cherry-pick conflict (\`git add\` the fixed files), finish the
+cherry-pick and resume the reflow loop.
+EOF
+      ;;
+    abort)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}abort${r}
+
+Restore every branch in the run to its saved original SHA. Warns about
+already-pushed branches; does not undo remote.
+EOF
+      ;;
+    pr)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}pr${r} <sync|list|desync> [options]
+
+$(_help_subverb_rows pr | _help_pad_rows)
+
+With no subverb (or only flags), defaults to ${sub}pr sync${r}. Run
+\`git stack pr <subverb> --help\` for one of them in full.
+EOF
+      ;;
+    pr-sync)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}pr sync${r} [${fl}--no-push${r}] [${fl}--ready${r}] [${fl}--dry-run${r}] [${fl}--no-template${r}]
+
+Sync the GitHub PR chain to the local stack. Pushes any unpushed branches,
+opens a draft PR for each (base = previous branch, or ${fl}stack.base${r} for the
+bottom), titled \`[N/M] <last commit subject>\`, with the repo's PR template as
+the body.
+
+On existing PRs, keeps the [N/M] prefix and a fenced stack-nav footer up to
+date. Re-run after any stack change. Requires \`gh\` authenticated for
+github.com.
+EOF
+      ;;
+    pr-list)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}pr list${r} [${fl}--no-fetch${r}]
+
+List the stack's PRs one per line: branch, PR number (clickable link in modern
+terminals), status badges (\`[synced]\`, \`[draft]\`, \`[base: X]\`, \`[approved]\`,
+\`[closed]\`/\`[merged]\`), title, and comment count.
+
+Runs \`git fetch --all --prune\` by default; pass ${fl}--no-fetch${r} to skip. Requires
+\`gh\`.
+EOF
+      ;;
+    pr-desync)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}pr desync${r} [${fl}--delete-remote${r}] [${fl}--yes${r}] [${fl}--dry-run${r}]
+
+Tear down the stack's PR chain (inverse of ${sub}pr sync${r}) so branches can be
+reordered and re-synced clean: closes each branch's open PR. Skips merged and
+already-closed PRs.
+
+An open PR with human activity (a non-bot comment, an approval, or a
+changes-requested review) prompts ${fl}y/N${r} per PR on a TTY — skipped
+non-interactively unless ${fl}--yes${r}. ${fl}--delete-remote${r} also deletes the remote
+branch of each PR closed (but never one still serving as the base of a PR you
+kept open). ${fl}--dry-run${r} previews. Requires \`gh\`.
+EOF
+      ;;
+    history)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}history${r} [${sub}show${r} <id> | ${sub}restore${r} <id> [${fl}--yes${r}]]
+
+List snapshots taken before each restack/amend. Subcommands: \`history show
+<id>\`, \`history restore <id> [--yes]\`. Run-id may be full, action-tagged, bare
+timestamp, or \`@N\` (relative; @0 = newest).
+EOF
+      ;;
+    move)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}move${r} [<branch>]
+                      [${fl}--last${r}|${fl}--before${r} <ref>|${fl}--after${r} <ref>|${fl}--at${r} <num>] [${fl}--force${r}]
+
+Relocate <branch> (default: current branch) in the current stack to the chosen
+position. Cherry-picks affected branches onto their new predecessors using the
+existing reflow state machine — on conflict, resolve + \`git stack continue\`.
+
+${b}Fully local${r}: touches only local refs — no push, no PR sync. To reorder a
+published stack cleanly, run ${sub}pr desync${r} first, reorder, then ${sub}pr sync${r}. Refuses
+if any affected branch has an open PR (it would desync from GitHub), pointing
+you at that workflow. ${fl}--first${r} removed; use ${fl}--before${r} instead.
+
+When the chosen position is the branch's current slot (e.g. ${fl}--before${r} the
+branch it already sits below, or ${fl}--at${r} a free leaf in the same gap), it
+${b}renumbers in place${r}: a pure rename of the leaf, no reflow. With a TTY and no
+${fl}--at${r}, a leaf picker offers the free numbers in the gap.
+EOF
+      ;;
+    rename)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${fl}--no-history${r}]
+                        [${fl}--allow-pr-rebuild${r}]
+
+Atomically rename every branch in the stack from <old>/<leaf> to <new>/<leaf>,
+carrying backup refs along by default. Refuses if state file exists, branch
+checked out elsewhere, or any target name collides.
+
+Also refuses if any branch has an open head PR (renaming a branch closes its
+head PR on GitHub, with no reattach); pass ${fl}--allow-pr-rebuild${r} to proceed and
+rebuild them, or run ${sub}pr desync${r} first to re-publish cleanly.
+EOF
+      ;;
+    fold)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}fold${r} [<branch>] [${fl}--up${r}|${fl}--down${r}] [${fl}--slug${r} <s>] [${fl}--at${r} <num>]
+                      [${fl}--allow-pr-rebuild${r}] [${fl}--dry-run${r}] [${fl}--yes${r}] [${fl}--no-push${r}]
+
+Merge a branch away by squashing it into an adjacent neighbor (default: ${fl}--down${r}
+into the predecessor), preserving the combined diff as one commit, then
+reflowing the children.
+
+The result keeps the survivor's leaf but takes the folded branch's slug by
+default (the branch you ran ${sub}fold${r} on names the result); ${fl}--slug${r} overrides the
+slug, ${fl}--at${r} the leaf (to a free leaf below the children). Squashes the whole
+victim/survivor range, so multi-commit/merge-tip branches fold fine (note:
+reflowed *children* are still cherry-picked tip-only). Errors at the stack
+boundaries (bottom ${fl}--down${r}, tip ${fl}--up${r}, lone branch — use ${sub}clean${r}).
+
+Destructive: snapshots first (undo via ${sub}history restore${r}, which warns about any
+duplicate-leaf leftovers a rename leaves), refuses a dirty tree, needs ${fl}--yes${r}
+off a TTY. Deleting the victim (and renaming the survivor under ${fl}--slug${r}) closes
+their head PRs: refuses unless ${fl}--allow-pr-rebuild${r} (or ${fl}--no-push${r}), then
+deletes the remote victim, re-syncs PRs, and breadcrumbs the closed PR to the
+superseding one. ${fl}--dry-run${r} previews.
+EOF
+      ;;
+    drop)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}drop${r} [<branch>] [${fl}--force${r}] [${fl}--dry-run${r}] [${fl}--yes${r}]
+
+Discard a branch and reflow its children onto its predecessor — the destructive
+sibling of ${sub}fold${r} (fold keeps the diff; ${sub}drop${r} throws it away). Defaults to the
+current branch.
+
+Degrades at every position: middle → children onto the predecessor; bottom →
+onto base; tip → pure delete; lone → delete + land on base. Children are
+cherry-picked tip-only, so one that built on the dropped work surfaces a normal
+conflict to resolve and ${sub}continue${r}; ${fl}--force${r} waives the multi-commit guard.
+
+Fully local (no push/rename/${sub}pr sync${r}). Destructive: snapshots first (undo via
+${sub}history restore${r}), refuses a dirty tree, needs ${fl}--yes${r} off a TTY. Refuses only
+when the victim has an open PR (run ${sub}pr desync${r} first). ${fl}--dry-run${r} previews.
+EOF
+      ;;
+    doctor)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}] [${fl}--no-rename${r}]
+                       [${fl}--no-push${r}] [${fl}--no-sync${r}]
+
+Detect and offer to fix problems in the current stack. Three issue types are
+checked:
+
+  • leaf numbers out of order (renamed to cascade in place, preserving gaps)
+  • duplicate leaf numbers — two or more branches share the same leaf.
+    Interactive prompt lets you pick which branch keeps the number; the rest
+    cascade upward and upper branches are re-threaded onto the chosen
+    predecessor.
+  • branches that violate the single-commit-per-branch invariant — multi-commit
+    branches and merge-commit tips (squashed into one commit on top of their
+    predecessor, then upper branches are re-threaded via ${sub}restack${r})
+
+Per-issue interactive prompts on a tty: ${fl}y${r}=apply, ${fl}e${r}=apply with \$EDITOR for
+the squash message, ${fl}N${r}=skip, ${fl}a${r}=apply all, ${fl}q${r}=quit. Duplicate prompts take a
+space- or comma-separated permutation of 1..N (RET to keep current order, ${fl}q${r}
+to quit). Pass ${fl}--yes${r} to auto-apply every fix using sort-V order for
+duplicates (required for non-tty / scripts).
+
+${fl}--dry-run${r} previews the issue list and proposed fixes without applying.
+${fl}--no-squash${r} skips the squash checks (rename-only mode); ${fl}--no-rename${r} skips
+the leaf-rename pass (which also skips duplicate detection). Empty squashes
+(branch tree == predecessor tree) offer to delete the absorbed branch. Same
+atomic rename + remote-rename + pr sync flow as ${sub}rename${r} (skip with
+${fl}--no-push${r} / ${fl}--no-sync${r}).
+EOF
+      ;;
+    prefix)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}prefix${r}
+
+Print auto-detected stack prefix (debug).
+EOF
+      ;;
+    default-branch)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}default-branch${r}
+
+Print the resolved default branch name (stack.base → init.defaultBranch → main
+→ master, falling back to literal \`main\`).
+
+Used internally by ${sub}clean${r} and ${sub}restack --onto${r}.
+EOF
+      ;;
+    init)
+      cat <<EOF
+${b}usage:${r} git stack ${sub}init${r} <bash|zsh|fish>
+
+Emit shell-integration snippet defining \`gstk*\` aliases/abbreviations. Add to
+your rc: \`eval "\$(git stack init bash)"\` (bash/zsh) or
+\`git stack init fish | source\` (fish).
+EOF
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Reference sections shared by every rendering of `help` — they document the
+# model and the flags common to many verbs, so they belong with the index
+# rather than with any one topic.
+_help_reference() {
+  local b="$C_BOLD" d="$C_DIM" cy="$C_CYAN" r="$C_RESET"
+  local sub="${b}${cy}"
+  local fl="${cy}"
+  cat <<EOF
 ${b}Common flags:${r}
-  ${fl}--prefix${r} <p>                      Override the stack prefix (else
-                                    git config stack.prefix, else auto-detect).
-  ${fl}--no-push${r}                         (move/rename/fold/doctor) skip remote rename + pr sync.
-  ${fl}--no-sync${r}                         (move/rename/fold/doctor) skip pr sync only.
-  ${fl}--color${r} | ${fl}--no-color${r}              Force color on/off (default: auto-detect
-                                    TTY; honors ${fl}NO_COLOR${r} env var).
-  ${fl}-v${r}, ${fl}--verbose${r}                     More output.
-  ${fl}-q${r}, ${fl}--quiet${r}                       Less output.
+  ${fl}--prefix${r} <p>          Override the stack prefix (else git config
+                        stack.prefix, else auto-detect).
+  ${fl}--no-push${r}             (move/rename/fold/doctor) skip remote rename + pr sync.
+  ${fl}--no-sync${r}             (move/rename/fold/doctor) skip pr sync only.
+  ${fl}--color${r} | ${fl}--no-color${r}  Force color on/off (default: auto-detect TTY;
+                        honors ${fl}NO_COLOR${r} env var).
+  ${fl}-v${r}, ${fl}--verbose${r}         More output.
+  ${fl}-q${r}, ${fl}--quiet${r}           Less output.
 
 ${b}Stack ordering:${r}
   Branches whose final path segment matches  ${d}^[0-9]+-${r}  are sorted by
@@ -2379,6 +2562,88 @@ ${b}Configuration:${r}
                                        init.defaultBranch, then main, then master)${r}
   git config stack.historyKeep 100   ${d}# auto-prune older snapshots; 0 disables${r}
 EOF
+}
+
+# `help --all`: the index's groups, but with every topic in full underneath.
+_help_all() {
+  local b="$C_BOLD" r="$C_RESET"
+  printf '%susage:%s git stack <subcommand> [options]\n' "$b" "$r"
+  _help_all_group stack  "Stack-level subcommands:"
+  _help_all_group branch "Branch-level subcommands:"
+  _help_all_group plumb  "Plumbing:"
+  printf '\n'
+  _help_reference
+}
+
+_help_all_group() {
+  local want="$1" title="$2"
+  local b="$C_BOLD" r="$C_RESET"
+  printf '\n%s%s%s\n' "$b" "$title" "$r"
+  local verb="" desc="" s=""
+  while IFS=$'\t' read -r verb desc; do
+    printf '\n'
+    _help_topic "$verb"
+    # `pr` is an index topic; its three subverbs follow it here.
+    if [[ "$verb" == "pr" ]]; then
+      for s in pr-sync pr-list pr-desync; do
+        printf '\n'
+        _help_topic "$s"
+      done
+    fi
+  done < <(_help_group_rows "$want")
+}
+
+# Resolve a verb (plus optional subverb) to a help topic and print it. Returns
+# 1 without printing when the verb isn't one we document, so callers can fall
+# through to the dispatch table and its renamed/unknown-verb messages.
+_help_verb() {
+  local verb="${1-}" sv="${2-}"
+  local key=""
+  case "$verb" in
+    co) key="checkout" ;;
+    mv) key="move" ;;
+    pr)
+      case "$sv" in
+        sync|list|desync) key="pr-$sv" ;;
+        "")               key="pr" ;;
+        *)                return 1 ;;
+      esac
+      ;;
+    # `history show`/`history restore` are covered by the one `history` topic.
+    history) key="history" ;;
+    list|view|pick|create|sync|clean|add|checkout|restack|amend|continue|abort|\
+move|rename|fold|drop|doctor|prefix|default-branch|init) key="$verb" ;;
+    *) return 1 ;;
+  esac
+  _help_topic "$key"
+}
+
+cmd_help() {
+  local all=0
+  local args=()
+  while (( $# > 0 )); do
+    if _consume_common_flag "$@"; then
+      shift "$_FLAG_SHIFT"
+      continue
+    fi
+    case "$1" in
+      --all) all=1; shift ;;
+      -*)    die "unknown help flag: $1 (try 'git stack help')" ;;
+      *)     args+=("$1"); shift ;;
+    esac
+  done
+  if (( ${#args[@]} )); then
+    _help_verb "${args[0]}" "${args[1]-}" \
+      || die "no help topic for '${args[*]}' (try 'git stack help')"
+    return 0
+  fi
+  if (( all )); then
+    _help_all
+    return 0
+  fi
+  _help_index
+  printf '\n'
+  _help_reference
 }
 
 cmd_prefix() {
@@ -7348,46 +7613,21 @@ cmd___complete() {
   esac
 }
 
-# Every user-facing verb with a one-line description. Source of truth for the
-# verb list — excludes removed verbs (new/close/push/status) and plumbing
-# (init, default-branch, prefix, __complete).
+# Every user-facing verb with a one-line description, from the _verb_table it
+# shares with `help` — minus the plumbing group (init, default-branch, prefix).
+# Removed verbs (new/close/push/status) and __complete aren't in the table.
 _complete_verbs() {
-  printf '%s\t%s\n' \
-    list      "Overview of all stacks in the repo" \
-    view      "Show one stack's branches without checking out" \
-    pick      "Pick a stack and check out its tip" \
-    checkout  "Check out a stack branch by leaf number" \
-    create    "Start a brand-new stack" \
-    add       "Add an empty branch to the current stack" \
-    sync      "Push the whole stack additively to the remote" \
-    clean     "Prune gone branches and reflow survivors" \
-    restack   "Reset+cherry-pick branches onto their predecessors" \
-    amend     "Amend the current branch and reflow upper branches" \
-    continue  "Resume a paused reflow after resolving conflicts" \
-    abort     "Abort a paused reflow and restore original SHAs" \
-    pr        "Sync, list, or close GitHub PRs for the stack" \
-    history   "Show or restore stack snapshots" \
-    rename    "Rename every branch in the stack to a new prefix" \
-    move      "Move a branch to a different position in the stack" \
-    fold      "Fold one branch's commits into another" \
-    drop      "Discard a branch and reflow its children onto the predecessor" \
-    doctor    "Diagnose stack health"
+  local group="" verb="" desc=""
+  while IFS=$'\t' read -r group verb desc; do
+    [[ "$group" != "plumb" ]] || continue
+    printf '%s\t%s\n' "$verb" "$desc"
+  done < <(_verb_table)
 }
 
 # Subverbs for verbs that have them; nothing (exit 0) for any other verb.
 _complete_subverbs() {
   case "${1-}" in
-    pr)
-      printf '%s\t%s\n' \
-        sync   "Create/update PRs for the stack" \
-        list   "List the stack's PRs" \
-        desync "Close the stack's PRs to reorder/re-sync clean"
-      ;;
-    history)
-      printf '%s\t%s\n' \
-        show    "Show a stack snapshot" \
-        restore "Restore a stack snapshot"
-      ;;
+    pr|history) _help_subverb_rows "$1" ;;
     *) exit 0 ;;
   esac
 }
@@ -7632,8 +7872,29 @@ main() {
   done
   color_init
   local sub="${1-help}"
+
+  # Completion plumbing runs before the --help pre-scan below: its contract is
+  # to never print, and `__complete --help` would otherwise emit a help topic.
+  if [[ "$sub" == "__complete" ]]; then
+    shift
+    cmd___complete "$@"
+    return
+  fi
+
+  # `--help`/`-h` immediately after the verb (or after its subverb) prints just
+  # that verb's help topic. Positional-only on purpose: scanning all of "$@"
+  # like the color pre-scan above would swallow commands whose flag *values*
+  # contain the word, e.g. `amend -m "fix --help output"`. An undocumented verb
+  # returns 1 here and falls through to the dispatch below, which owns the
+  # renamed-verb hints and the unknown-subcommand error.
+  if [[ "${2-}" == "--help" || "${2-}" == "-h" ]]; then
+    if _help_verb "$sub"; then return 0; fi
+  elif [[ "${3-}" == "--help" || "${3-}" == "-h" ]]; then
+    if _help_verb "$sub" "${2-}"; then return 0; fi
+  fi
+
   case "$sub" in
-    help|--help|-h|"") cmd_help ;;
+    help|--help|-h|"") shift || true; cmd_help "$@" ;;
     list)              shift; cmd_list "$@" ;;
     view)              shift; cmd_view "$@" ;;
     pick)              shift; cmd_pick "$@" ;;
@@ -7656,8 +7917,6 @@ main() {
     doctor)            shift; cmd_doctor "$@" ;;
     init)              shift; cmd_init "$@" ;;
     default-branch)    shift; cmd_default_branch "$@" ;;
-    # Hidden plumbing for shell completion — intentionally undocumented.
-    __complete)        shift; cmd___complete "$@" ;;
     # Removed verbs — point at the renamed command.
     new)               die "'git stack new' was split: use 'git stack create <prefix> <slug>' to start a stack, or 'git stack add <slug>' to add to the current one" ;;
     close)             die "'git stack close' was renamed to 'git stack clean'" ;;

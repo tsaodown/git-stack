@@ -103,7 +103,8 @@ cleaning up — see **[docs/workflows.md](docs/workflows.md)**.
 | [reference.md](docs/reference.md) | Aliases, configuration, and `git stack help` |
 | [development.md](docs/development.md) | Running the tests; the script's architecture |
 
-Full per-command flags: `git stack help`.
+Full per-command flags: `git stack <verb> --help` for one command, `git stack
+help` for the index, `git stack help --all` for everything.
 
 ## License
 

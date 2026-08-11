@@ -473,6 +473,40 @@ absorbed handling already lives in the squash phase (detect + prompt + delete at
 scan time). The **Absorbed-policy** entry under "Reflow engine" below is a
 discarded proposal, not a target.
 
+### Help
+
+**Help topic** (built 2026-08-11, ADR 0015): the unit of help. One topic per
+verb, holding that verb's `usage:` signature plus its full-width prose. Topic
+keys are the verbs of `_verb_table`, except that `pr` splits into `pr` (an index
+of its subverbs) + `pr-sync` / `pr-list` / `pr-desync`, and `history` keeps
+`show`/`restore` inside its single topic. `_help_topic <key>` prints one and
+returns 1 for an unknown key.
+
+Two renderings share those topics:
+
+- **`git stack help`** — `_help_index` (grouped verb + one-liner table) followed
+  by `_help_reference` (Common flags, Stack ordering, Single-commit assumption,
+  Configuration). No per-verb prose.
+- **`git stack <verb> --help`** / **`git stack help <verb>`** — one topic.
+  **`help --all`** — `_help_all`, every topic under its group heading, plus the
+  reference sections.
+
+**`_verb_table`** is the source of truth for the verb list: `group<TAB>verb<TAB>
+one-liner` rows, groups `stack` / `branch` / `plumb`. `_help_index` renders all
+three groups; `_complete_verbs` drops `plumb`. `_subverb_table` does the same for
+`pr` / `history` subverbs, feeding both the `pr` topic and `_complete_subverbs`.
+Both tables are pure `printf` with no repo access, which is what makes them safe
+to read from the completion path (see the never-fail contract below).
+
+**Positional-only `--help`** (invariant): `main()` honors `--help`/`-h` only in
+`$2` (after the verb) or `$3` (after a subverb) — never by scanning all of `"$@"`
+the way the `--color` pre-scan does, because a flag *value* may legitimately
+contain the word: `git stack amend -m "document the --help flag"` must amend, not
+print help. An undocumented verb makes `_help_verb` return 1 and **fall through**
+to the dispatch `case`, so the renamed-verb hints and the unknown-subcommand
+error stay in one place. `__complete` dispatches *before* the pre-scan — printing
+a topic would violate its never-fail contract.
+
 ### Completion
 
 **Completion** (built 2026-06-08, ADR 0004):
@@ -508,8 +542,9 @@ its error arg). Any leak would corrupt the user's prompt.
 > **not symmetric** — note where each needs editing:
 >
 > - **Add or rename a verb** → update (a) the dispatch `case` in `main()`,
->   (b) `_complete_verbs` (the candidate source of truth — **both** shells render
->   it automatically), and (c) **fish only**: the
+>   (b) `_verb_table` (the candidate source of truth, shared with `help` —
+>   **both** shells render it automatically) plus a `_help_topic` arm and the
+>   `_help_verb` key list, and (c) **fish only**: the
 >   `not __fish_seen_subcommand_from …` guard list in `_emit_completion_fish`
 >   (the full verb set; omit the new verb and fish keeps re-offering top-level
 >   verbs after it's typed). zsh needs **nothing** for a plain verb name — it
@@ -524,8 +559,9 @@ its error arg). Any leak would corrupt the user's prompt.
 > - **Add a new dynamic value type** → add a `__complete` kind (`cmd___complete`
 >   case + a `_complete_*` function), then reference it from each shell emitter.
 >
-> So verb *names* are genuinely single-source (`_complete_verbs`); the fish guard
+> So verb *names* are genuinely single-source (`_verb_table`); the fish guard
 > duplicates the verb *set* for suppression timing only, not as a candidate list.
+> A verb missing from `_help_topic` is caught by a test, not by silence.
 
 ## Flagged ambiguities
 

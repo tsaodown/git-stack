@@ -3844,15 +3844,150 @@ make_conflicting_dups() {
 
 # ---------- help ----------
 
-@test "help: documents the core verbs" {
+@test "help: indexes the core verbs" {
   run git stack help --no-color
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"create"* ]]
-  [[ "$output" == *"add"* ]]
-  [[ "$output" == *"view"* ]]
-  [[ "$output" == *"clean"* ]]
-  [[ "$output" == *"sync"* ]]
-  [[ "$output" == *"move"* ]]
+  assert_status 0
+  for v in create add view clean sync move prefix default-branch init; do
+    assert_output_contains "$v"
+  done
+}
+
+@test "help: index omits per-verb prose and points at the per-verb flag" {
+  run git stack help --no-color
+  assert_status 0
+  # Distinctive prose from the sync/restack topics — detail belongs behind
+  # `<verb> --help`, not in the index.
+  refute_output_contains "force-with-lease"
+  assert_output_contains "git stack <verb> --help"
+}
+
+@test "help --all: keeps every verb's full prose in one dump" {
+  run git stack help --all --no-color
+  assert_status 0
+  for v in create add view clean sync move prefix default-branch init; do
+    assert_output_contains "$v"
+  done
+  assert_output_contains "force-with-lease"
+  assert_output_contains "Stack ordering:"
+}
+
+@test "help: reference sections survive on the bare index" {
+  run git stack help --no-color
+  assert_status 0
+  assert_output_contains "Common flags:"
+  assert_output_contains "Stack ordering:"
+  assert_output_contains "Single-commit assumption:"
+  assert_output_contains "Configuration:"
+}
+
+@test "<verb> --help: narrows to that verb only" {
+  run git stack fold --help --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack fold"
+  assert_output_contains "squashing it into an adjacent neighbor"
+  # The drop topic is fold's nearest neighbour in the help text; it must not
+  # bleed in.
+  refute_output_contains "the destructive sibling of fold"
+}
+
+@test "<verb> -h: short form works too" {
+  run git stack drop -h --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack drop"
+}
+
+@test "help <verb>: same output as <verb> --help" {
+  run git stack help fold --no-color
+  assert_status 0
+  local via_help="$output"
+  run git stack fold --help --no-color
+  assert_status 0
+  assert_eq "$via_help" "$output" "help fold vs fold --help"
+}
+
+@test "<verb> --help: aliases resolve to the canonical topic" {
+  run git stack co --help --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack checkout"
+  run git stack mv --help --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack move"
+}
+
+@test "pr --help: indexes its subverbs; pr <subverb> --help narrows" {
+  run git stack pr --help --no-color
+  assert_status 0
+  for sv in sync list desync; do
+    assert_output_contains "$sv"
+  done
+  refute_output_contains "changes-requested review"
+
+  run git stack pr desync --help --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack pr desync"
+  assert_output_contains "changes-requested review"
+  refute_output_contains "repo's PR template"
+}
+
+@test "history <subverb> --help: falls back to the one history topic" {
+  run git stack history restore --help --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack history"
+  assert_output_contains "@0 = newest"
+}
+
+@test "--help is positional: a flag value containing it is not a help request" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  run git stack amend -m "document the --help flag" --no-color
+  assert_status 0
+  refute_output_contains "usage: git stack amend"
+  assert_eq "$(git log -1 --format=%s feat/01-a)" "document the --help flag"
+}
+
+@test "--help on an unknown verb still reports the unknown verb" {
+  run git stack bogus --help --no-color
+  assert_status 1
+  assert_output_contains "unknown subcommand: bogus"
+}
+
+@test "--help on a removed verb still prints the rename hint" {
+  run git stack push --help --no-color
+  assert_status 1
+  assert_output_contains "renamed to 'git stack sync'"
+}
+
+@test "help: rejects an unknown flag and an unknown topic" {
+  run git stack help --bogus --no-color
+  assert_status 1
+  assert_output_contains "unknown help flag"
+  run git stack help nosuchverb --no-color
+  assert_status 1
+  assert_output_contains "no help topic"
+}
+
+@test "help: every completion verb has a help topic, and vice versa" {
+  local verb
+  while IFS=$'\t' read -r verb _; do
+    [[ -n "$verb" ]] || continue
+    run git stack help "$verb" --no-color
+    assert_status 0
+    # Naming the verb catches a _help_verb arm wired to the wrong topic, which a
+    # bare "usage: git stack" would wave through.
+    assert_output_contains "usage: git stack $verb"
+  done < <(git stack __complete verbs)
+  # Plumbing verbs are absent from completion but documented all the same.
+  for verb in prefix default-branch init; do
+    run git stack help "$verb" --no-color
+    assert_status 0
+    assert_output_contains "usage: git stack $verb"
+  done
+}
+
+@test "help: accepts the common flags rather than erroring on them" {
+  run git stack help -v --no-color
+  assert_status 0
+  assert_output_contains "usage: git stack <subcommand>"
 }
 
 # ---------- __complete (hidden completion plumbing) ----------
