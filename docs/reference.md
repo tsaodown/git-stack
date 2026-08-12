@@ -134,6 +134,12 @@ None of the three re-publish PRs — see [renames close head PRs](pr-sync.md#ren
 `reslug` and `move` leave their stale remote for `clean`, which sits in the same
 prefix.
 
+Each refuses on an open head PR, and the remedy tracks how much it renames:
+`reslug` and `move --at` touch one branch, so they ask for
+[`pr desync <branch>`](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest)
+and the rest of the chain keeps its review threads; `rename` changes every name,
+so it asks for the whole-stack form.
+
 ## The default branch: `default-branch`
 
 ```sh

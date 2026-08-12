@@ -98,6 +98,12 @@ one branch too, making the damage identical and any divergence between the two
 arbitrary. The escape also failed on its own terms: it left an orphaned PR for a
 later `clean` to close, which is the opposite of explicit.
 
+> **Amended by [ADR 0016](0016-single-branch-pr-desync.md).** The live objection to
+> this section was cost, not correctness: the remedy it pointed at closed the
+> *whole chain's* PRs to protect the one branch `reslug` renames. `pr desync` now
+> takes an optional `<branch>`, so the remedy is one PR, and `reslug`'s refusal
+> names that form. The no-escape-flag decision stands and is cheaper to accept.
+
 ### 6. Snapshots, and what restore does
 
 `reslug` snapshots before mutating (focus `slug=<old> to=<new>`, rendered

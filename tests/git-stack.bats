@@ -1979,6 +1979,204 @@ $old_footer"
   assert_eq "$(gh_log_count 'pr close')" 2 "pr close calls"
 }
 
+# ---------- pr desync <branch> (single-branch) ----------
+
+@test "pr desync <branch>: closes only that branch's PR" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync feat/02-bar --no-color
+  assert_status 0
+  assert_output_contains "close   #102 feat/02-bar"
+  assert_eq "$(gh_log_count 'pr close')" 1 "pr close calls"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/101.json")" OPEN "101 state"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/102.json")" CLOSED "102 state"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/103.json")" OPEN "103 state"
+  assert_output_contains "1 closed"
+}
+
+@test "pr desync <branch>: out-of-scope branches are not listed or counted" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr desync feat/02-bar --no-color
+  assert_status 0
+  assert_output_contains "desync: feat/02-bar only (2 other branches untouched)"
+  refute_output_contains "feat/01-foo"
+  refute_output_contains "feat/03-baz"
+  assert_output_contains "1 closed, 0 remote deleted, 0 skipped"
+}
+
+@test "pr desync <branch>: resolves a bare numeric leaf" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync 2 --no-color
+  assert_status 0
+  assert_output_contains "close   #102 feat/02-bar"
+  assert_eq "$(gh_log_count 'pr close')" 1 "pr close calls"
+}
+
+@test "pr desync <branch>: a branch outside the stack errors" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr desync other/99-nope --no-color
+  assert_status 1
+  assert_output_contains "not in stack"
+}
+
+@test "pr desync <branch>: a second positional errors" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  run git stack pr desync feat/01-foo feat/02-bar --no-color
+  assert_status 1
+  # The first positional is consumed as the target; only the second is a surprise.
+  assert_output_contains "unexpected arg 'feat/02-bar'"
+}
+
+@test "pr desync <branch>: activity on an out-of-scope branch never prompts" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  # 03 is loud but out of scope: its activity must not be reported or queried.
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C GH_PR_feat_03_baz__REVIEW=APPROVED
+  run git stack pr desync feat/02-bar --no-color
+  assert_status 0
+  refute_output_contains "approved"
+  assert_eq "$(gh_log_count 'pr close')" 1 "pr close calls"
+}
+
+@test "pr desync <branch>: activity on the target still gates the close" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__REVIEW=APPROVED
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C
+  # No tty -> _confirm declines -> the active target is kept.
+  run git stack pr desync feat/02-bar --no-color
+  assert_status 0
+  assert_output_contains "kept — has activity"
+  assert_eq "$(gh_log_count 'pr close')" 0 "pr close calls"
+  assert_output_contains "0 closed, 0 remote deleted, 1 skipped"
+}
+
+@test "pr desync <branch> --delete-remote: refuses when the successor's PR is open" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync feat/02-bar --delete-remote --no-color
+  assert_status 1
+  assert_output_contains "#103"
+  assert_output_contains "feat/03-baz"
+  # Refuses before mutating: no close, and the remote survives.
+  assert_eq "$(gh_log_count 'pr close')" 0 "pr close calls"
+  assert git ls-remote --exit-code --heads origin feat/02-bar
+}
+
+@test "pr desync <branch> --delete-remote: refuses under --dry-run too" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  run git stack pr desync feat/02-bar --delete-remote --dry-run --no-color
+  assert_status 1
+  assert_output_contains "#103"
+}
+
+@test "pr desync <branch> --delete-remote: allowed on the stack tip" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr desync feat/03-baz --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "delete  remote feat/03-baz"
+  refute git ls-remote --exit-code --heads origin feat/03-baz
+  assert git ls-remote --exit-code --heads origin feat/02-bar
+  assert_eq "$(gh_log_count 'pr close')" 1 "pr close calls"
+}
+
+@test "pr desync <branch> --delete-remote: allowed mid-stack when the successor has no PR" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B
+  # feat/03-baz deliberately has no PR, so nothing targets 02 as a base.
+  run git stack pr desync feat/02-bar --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "delete  remote feat/02-bar"
+  refute git ls-remote --exit-code --heads origin feat/02-bar
+}
+
+@test "pr desync <branch> --delete-remote: allowed mid-stack when the successor's PR is merged" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B
+  export GH_PR_feat_03_baz__NUM=103 GH_PR_feat_03_baz__TITLE=C GH_PR_feat_03_baz__STATE=MERGED
+  run git stack pr desync feat/02-bar --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "delete  remote feat/02-bar"
+}
+
+@test "pr desync <branch>: unblocks reslug without closing the rest of the chain" {
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  git stack pr desync feat/02-bar --no-color > /dev/null
+  run git stack reslug feat/02-bar renamed --no-color
+  assert_status 0
+  assert git rev-parse --verify --quiet refs/heads/feat/02-renamed
+  # The neighbours' PRs never closed.
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/101.json")" OPEN "101 state"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/103.json")" OPEN "103 state"
+}
+
+@test "pr desync <branch>: the re-sync updates neighbours in place, minting one new PR" {
+  # The payoff claim for the whole single-branch form: after desync -> reslug ->
+  # pr sync, only the renamed branch churns. The neighbours keep their PR numbers
+  # (and so their review threads); the renamed one gets a fresh PR beside the
+  # closed original, since a closed PR is never reattached (ADR 0013).
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  git stack pr sync --no-color > /dev/null
+  git stack pr desync feat/02-bar --no-color > /dev/null
+  git stack reslug feat/02-bar renamed --no-color > /dev/null
+  truncate -s 0 "$GH_STUB_LOG"
+  run git stack pr sync --no-color
+  assert_status 0
+  # Neighbours: same PR numbers, still open, never closed and never recreated.
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/101.json")" OPEN "101 state"
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/103.json")" OPEN "103 state"
+  assert_eq "$(gh_log_count 'pr close')" 0 "pr close calls"
+  assert_eq "$(gh_log_count 'pr create')" 1 "pr create calls"
+  # The one new PR is for the renamed branch; #102 stays closed beside it.
+  assert_eq "$(jq -r .state "$GH_STUB_DIR/by-num/102.json")" CLOSED "102 state"
+  assert_output_contains "feat/02-renamed"
+  # #103's base follows the rename rather than dangling on the old branch name.
+  assert_eq "$(jq -r .baseRefName "$GH_STUB_DIR/by-num/103.json")" feat/02-renamed "103 base"
+}
+
+@test "pr desync <branch> --delete-remote: an activity-kept target deletes nothing" {
+  # The two new guards meet the activity gate: the pre-flight passes (no
+  # successor PR), but the target's own PR is kept, so --delete-remote has
+  # nothing in scope — its scope is tied to PRs desync actually closes.
+  make_stack_branches feat 01-foo 02-bar 03-baz
+  make_remote_origin
+  export GH_PR_feat_01_foo__NUM=101 GH_PR_feat_01_foo__TITLE=A GH_PR_feat_01_foo__BASE=main
+  export GH_PR_feat_02_bar__NUM=102 GH_PR_feat_02_bar__TITLE=B GH_PR_feat_02_bar__REVIEW=APPROVED
+  # feat/03-baz deliberately has no PR, so the pre-flight finds no hazard.
+  run git stack pr desync feat/02-bar --delete-remote --no-color
+  assert_status 0
+  assert_output_contains "kept — has activity"
+  assert_output_contains "0 closed, 0 remote deleted, 1 skipped"
+  assert git ls-remote --exit-code --heads origin feat/02-bar
+}
+
 # ---------- default-branch ----------
 
 @test "default-branch: returns main when on main" {
@@ -2644,7 +2842,10 @@ $old_footer"
   export GH_PR_feat_02_b__NUM=42
   run git stack move feat/01-a --last --no-color
   assert_status 1
+  # A reorder rewrites every affected branch, so this gate is genuinely
+  # multi-branch and keeps the whole-stack remedy — no single-branch form here.
   assert_output_contains "pr desync"
+  refute_output_contains "pr desync feat/"
   # Hard block: nothing was reordered.
   assert_branch_exists feat/01-a
   assert_branch_exists feat/02-b
@@ -2769,7 +2970,8 @@ $old_footer"
   export GH_PR_feat_010_a__NUM=42
   run git stack move feat/010-a --at 12 --no-color
   assert_status 1
-  assert_output_contains "pr desync"
+  # Renumber-in-place renames one branch, so it gets the single-branch remedy.
+  assert_output_contains "pr desync feat/010-a"
   assert_branch_exists feat/010-a
 }
 
@@ -2879,7 +3081,9 @@ $old_footer"
   export GH_PR_feat_010_a__NUM=42
   run git stack reslug feat/010-a auth --no-color
   assert_status 1
-  assert_output_contains "pr desync"
+  # Names the single-branch remedy: reslug renames one branch, so closing the
+  # whole chain's PRs would be disproportionate (ADR 0016).
+  assert_output_contains "pr desync feat/010-a"
   assert_branch_exists feat/010-a
   assert_branch_absent feat/010-auth
 }
@@ -3447,7 +3651,8 @@ make_disjoint_stack() {
   export GH_PR_feat_02_b__NUM=42
   run git stack drop feat/02-b --yes --no-color
   assert_status 1
-  assert_output_contains "pr desync"
+  # drop gates on the victim alone, so it gets the single-branch remedy.
+  assert_output_contains "pr desync feat/02-b"
   # Hard block: nothing dropped.
   assert_branch_exists feat/02-b
   assert_branch_exists feat/03-c

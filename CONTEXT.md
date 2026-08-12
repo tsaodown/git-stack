@@ -142,6 +142,12 @@ all — a tracked gap, not an endorsement. The rule also covers **clean**, whose
 remote-orphan deletion closes PRs as a side effect of `git push --delete`: it now
 names each PR the deletion would close (bulk `gh pr list`, advisory only — it
 never gates the deletion, and degrades to unannotated when gh is unusable).
+The refusal is **proportionate to the blast radius** (ADR 0016): a gate that
+inspects one branch (**reslug**, **move --at**, **drop**) names that branch in the
+remedy — `pr desync <branch>` — so one PR closes instead of the chain's. Only
+**move**'s reorder, whose reflow rewrites every affected branch, points at the bare
+whole-stack form. This is what makes the hard block acceptable without an escape
+flag; ADR 0014 §5 rejected `--allow-pr-orphan`, and the cost it dodged is now gone.
 _Avoid_: "no auto-sync" (too narrow — the rule is about PR *state*, not the sync
 verb).
 
@@ -340,7 +346,8 @@ like **move**): no push/rename/`pr sync`, leaves the orphaned remote for
 children, so their PRs survive a later `pr sync`; only the **victim**'s head-PR
 closes irreversibly (no superseding PR to breadcrumb to). So it refuses only
 when the **victim** has an open PR, pointing at the **pr desync** → drop →
-**pr sync** trio. A child that goes content-empty after the reflow earns a
+**pr sync** trio — naming the victim, since that is the only PR that must close
+(ADR 0016). A child that goes content-empty after the reflow earns a
 **non-mutating advisory** (→ `doctor`/`fold`); `drop` deletes only the named
 branch, never by content (ADR 0008).
 _Avoid_: "remove"/"delete" (the generic words — **clean** already "removes"
@@ -360,8 +367,8 @@ tree: nothing is rebased, so the index and worktree are untouched (cf.
 `git branch -m`). Snapshots first, so `history restore` undoes it — which
 re-creates the old name beside the new one and trips the **duplicate group**
 warning, since backup refs are keyed by the whole `<leaf>-<slug>` segment.
-Refuses when the branch has an open PR, pointing at the **pr desync** trio (ADR
-0014).
+Refuses when the branch has an open PR, pointing at the **pr desync** trio —
+naming the branch, since only that one PR need close (ADR 0014, ADR 0016).
 _Avoid_: "rename" unqualified (that is the prefix verb), relabel, retitle.
 
 `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
@@ -377,7 +384,10 @@ position is the branch's current slot — a pure leaf rename, no reflow (ADR 000
 It refuses when an affected branch has an open PR (reordering would desync it),
 pointing at the **pr desync** → reorder → **pr sync** trio. **pr desync** closes
 the chain's PRs to take a stack off GitHub for clean reordering (the inverse of
-**pr sync**; ADR 0005).
+**pr sync**; ADR 0005); an optional `<branch>` narrows it to that one PR, the
+proportionate remedy for the single-branch gates (ADR 0016) — it keeps the
+full-width scan and narrows only the action set, since the `--delete-remote`
+base-branch guard reads a branch's successor by index.
 
 ### Removed verbs
 
@@ -606,6 +616,11 @@ its error arg). Any leak would corrupt the user's prompt.
 > - **A verb that takes special positional/value completion** (leaf number,
 >   prefix, subverb) → add a zsh `case ${words[2]}` arm in `_git-stack` **and** a
 >   fish `__fish_seen_subcommand_from <verb>` line.
+> - **A *subverb* positional** (`pr desync <branch>`) is one level deeper and does
+>   **not** get its own `case` arm: it lives *inside* the existing `pr|history)`
+>   arm, past the `CURRENT == 3` subverb check, keyed on `${words[3]}`. In fish it
+>   needs **two chained** `__fish_seen_subcommand_from` conditions — one call with
+>   both words ORs them and would fire on either alone.
 > - **Add a flag that needs value completion** → update each shell's grammar (zsh
 >   prev-word `case` + fish `complete -c git … -x` line). Flag **name**
 >   completion is intentionally not provided (out of scope, v1).

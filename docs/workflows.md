@@ -356,8 +356,11 @@ git stack move feat/010-auth --before feat/015-b  # TTY: pick a leaf in the gap
 ```
 
 This is a **pure rename** — no commits move, no reflow, every other branch
-untouched. It's still local-only, so the same open-PR rule applies: if the branch
-has an open PR, `pr desync` first, renumber, then `pr sync`
+untouched. It's still local-only, so the same open-PR rule applies — but since only
+this branch is renamed, close only its PR:
+`pr desync <branch>` → renumber → `pr sync`
+([one-PR desync](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest)).
+A full reorder is the case that needs the whole chain torn down
 ([scenario 14](#14-reorganize-a-stack-thats-already-on-github)).
 
 **See also:** [insert a branch](#4-you-need-a-branch-in-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
@@ -531,10 +534,20 @@ re-creates the old name beside the new one and warns about the resulting duplica
 leaf). The stale remote branch stays under the current prefix, where `clean` reaps
 it.
 
-Like `move`, it refuses when the branch has an open head PR — same trio as above:
-`pr desync` → `reslug` → `pr sync`.
+Like `move`, it refuses when the branch has an open head PR. Since only this one
+branch is renamed, close only its PR — name the branch in the desync:
 
-**See also:** [rename the whole prefix](#8-rename-the-stacks-prefix)
+```sh
+git stack pr desync feat/010-auth   # close just #12
+git stack reslug feat/010-auth authz
+git stack pr sync                   # fresh PR for this branch; the others update in place
+```
+
+The rest of the chain keeps its review threads. Reach for a whole-stack
+`pr desync` only when the change itself is whole-stack — see
+[scenario 14](#14-reorganize-a-stack-thats-already-on-github).
+
+**See also:** [rename the whole prefix](#8-rename-the-stacks-prefix) · [pr desync one branch](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest)
 
 ---
 
@@ -646,7 +659,10 @@ The `move` is local, so if the branch you're removing has an open PR, run
 `--delete-remote` to drop the remote branches too); then reorder and delete, and
 let [`clean`](#7-the-bottom-pr-merged) tidy up the rest — the
 [desync → reorder → re-sync trio](#14-reorganize-a-stack-thats-already-on-github)
-in full.
+in full. The whole chain is in scope here because this recipe's `move` reflows every
+branch above the victim. `git stack drop` does the same extraction in one command
+and gates on the **victim alone**, so it asks only for
+[`pr desync <victim>`](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest).
 
 > **Want to keep the change, just not as its own branch?** That's
 > [`fold`](#13-a-branchs-change-is-obsolete-fold-it-away) — it squashes the branch
@@ -777,6 +793,19 @@ This is the proactive counterpart to the "heads up — open PRs" notes in
 because you have open PRs, this is the workflow it's pointing you at. For the full
 `pr desync` reference — the activity rules and `--delete-remote`'s leaf→base
 deletion order — see [pr-sync.md](pr-sync.md#git-stack-pr-desync).
+
+**Don't reach for this when one branch is changing.** A reorder rewrites every
+branch above the one you moved, so tearing the whole chain down is proportionate.
+But `reslug`, `move --at`, and `drop` each rename exactly **one** branch — for
+those, name it in the desync and keep the other PRs alive:
+
+```sh
+git stack pr desync feat/030-profile   # close just this one
+```
+
+The refusal message tells you which form you're in: it names the branch when one
+PR is enough, and stays bare when the change is genuinely chain-wide. See
+[pr desync one branch](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest).
 
 **See also:** [pr-sync.md](pr-sync.md#git-stack-pr-desync) · [reorder branches](#5-the-branches-are-in-the-wrong-order) · [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [rename the prefix](#8-rename-the-stacks-prefix)
 

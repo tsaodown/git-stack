@@ -213,23 +213,29 @@ case "$_sub1 $_sub2" in
     _head=$(_flagval --head "$@" || true)
     _jq=$(_flagval --jq "$@" || true)
     _state=$(_flagval --state "$@" || true)
+    _want=""
+    case "$_state" in
+      open|OPEN)     _want="OPEN" ;;
+      merged|MERGED) _want="MERGED" ;;
+      closed|CLOSED) _want="CLOSED" ;;
+      *)             _want="" ;;
+    esac
     if [ -n "$_head" ]; then
-      # Single-branch lookup (the --head filter).
+      # Single-branch lookup (the --head filter). Honors --state just as the bulk
+      # path does: production has one caller per state scope (`--state open` for
+      # the open-PR guard, `--state all` for the state inspector), so ignoring it
+      # here would let a closed PR masquerade as open.
       if pr_obj=$(_lookup_pr "$_head"); then
         pr_obj=$(printf '%s' "$pr_obj" | jq -c --arg h "$_head" '. + {headRefName: $h}')
         _json="[$pr_obj]"
+        if [ -n "$_want" ]; then
+          _json=$(printf '%s' "$_json" | jq -c --arg w "$_want" '[.[] | select(.state == $w)]')
+        fi
       else
         _json='[]'
       fi
     else
       # Bulk listing — every PR matching the requested state.
-      _want=""
-      case "$_state" in
-        open|OPEN)     _want="OPEN" ;;
-        merged|MERGED) _want="MERGED" ;;
-        closed|CLOSED) _want="CLOSED" ;;
-        *)             _want="" ;;
-      esac
       _json=$(_enumerate_prs "$_want")
     fi
     if [ -n "$_jq" ]; then

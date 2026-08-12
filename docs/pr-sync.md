@@ -84,13 +84,22 @@ the rename would hit an open head PR, and points at the same trio —
 [`pr desync`](#git-stack-pr-desync) to take the stack offline → mutate locally →
 `pr sync` to re-publish.
 
+**How much of the chain the desync covers matches how much the verb renames**, and
+the refusal message tells you which form you're in — it names a branch when one PR
+is enough, and stays bare when the change is chain-wide:
+
 - [`rename`](workflows.md#8-rename-the-stacks-prefix) changes every branch name.
   It renames the remote branches too (nothing else would ever reap an abandoned
-  *prefix*), but never runs `pr sync`.
+  *prefix*), but never runs `pr sync`. Chain-wide, so the desync is too.
 - [`reslug`](workflows.md#8a-rename-one-branchs-slug) changes one branch's slug.
   Fully local — the stale remote stays under the current prefix, so `clean` reaps it.
+  One branch, so [`pr desync <branch>`](#git-stack-pr-desync-branch--close-one-pr-keep-the-rest).
 - [`move`](workflows.md#5-the-branches-are-in-the-wrong-order) renames branches by
-  giving them new leaf numbers. Also fully local.
+  giving them new leaf numbers. Also fully local. A **renumber in place**
+  (`--at`) touches one branch and takes the one-PR form; a **reorder** reflows
+  every branch above the one you moved, so it takes the whole-stack form.
+- [`drop`](workflows.md#11-pull-a-branch-out-of-the-middle) gates on the victim
+  alone — children pass through ungated — so it too takes the one-PR form.
 
 The exception is [`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away),
 which *does* auto-sync — discarding the victim's review context is the point of the
@@ -162,6 +171,7 @@ reorder freely and re-publish with a clean `pr sync`.
 
 ```sh
 git stack pr desync                  # close each branch's open PR
+git stack pr desync feat/015-auth    # close only that branch's PR
 git stack pr desync --delete-remote  # also delete the remote branches
 git stack pr desync --yes            # close active PRs too, without prompting
 git stack pr desync --dry-run        # show planned actions, make no changes
@@ -183,6 +193,40 @@ checks are **not** activity (they run on nearly every PR). The check exists so
 you don't silently close a PR someone has engaged with; everything quiet closes
 without ceremony.
 
+### `git stack pr desync <branch>` — close one PR, keep the rest
+
+Pass a branch to tear down just its PR and leave the rest of the chain published.
+This is the proportionate remedy when the change you're about to make renames
+**one** branch — [`reslug`](workflows.md#8a-rename-one-branchs-slug),
+[`move --at`](workflows.md#5-the-branches-are-in-the-wrong-order), or
+[`drop`](workflows.md#11-pull-a-branch-out-of-the-middle). Each of those refuses on
+an open head PR, and each renames a single branch, so closing the whole chain would
+spend four sets of review threads to protect one:
+
+```sh
+git stack pr desync feat/015-auth    # close only #12
+git stack reslug feat/015-auth authz
+git stack pr sync                    # re-publish; the rest of the chain never moved
+```
+
+The trailing `pr sync` is still whole-stack, and that's the point: it opens a fresh
+PR for the renamed branch and **updates** the others in place (bases, `[N/M]`
+titles, nav footers). Their review threads, approvals, and CI history survive.
+
+`<branch>` accepts a numeric leaf or a full branch name (`pr desync 15` works).
+Branches outside the target aren't listed or counted — they were never in scope, so
+reporting them as `skip` would misread:
+
+```
+desync: feat/015-auth only (4 other branches untouched)
+close   #12 feat/015-auth
+desynced: 1 closed, 0 remote deleted, 0 skipped
+```
+
+Activity gating is per-PR and unchanged, so a target with review activity still
+prompts. The renamed branch gets a **new PR number** — a closed PR is never
+reattached ([ADR 0013](adr/0013-pr-state-changes-are-explicit.md)).
+
 ### `--delete-remote`
 
 Also deletes the remote branch of each PR closed. (Closing a PR leaves its branch
@@ -192,5 +236,13 @@ the base of a PR that was kept open — deleting it would retarget that PR to th
 default branch on GitHub. Such a branch is reported `keeping remote <branch>` and
 left in place. Branches without a PR (and the branches of merged or kept PRs) are
 left alone; use [`clean`](workflows.md) for broader remote pruning.
+
+With a `<branch>` target, `--delete-remote` is **refused up front** when a
+still-open PR bases on that branch — normally its immediate successor's. Nothing
+has retargeted that PR yet (`pr sync` does it, and hasn't run), so the delete would
+close a PR you never touched. Re-run without the flag and `clean` will reap the
+stale remote later, or desync the whole chain if a clean slate is what you want. A
+target whose successor has no PR — or a merged or closed one — is no hazard and
+deletes normally, as does the stack tip.
 
 **See also:** [concepts: PR chain](concepts.md#pr-chain) · [workflows §14: reorganize a published stack](workflows.md#14-reorganize-a-stack-thats-already-on-github) · [workflows §6](workflows.md#6-publish-and-refresh-the-pr-chain) · [workflows §7: bottom PR merged](workflows.md#7-the-bottom-pr-merged)

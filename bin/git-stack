@@ -2446,17 +2446,25 @@ EOF
       ;;
     pr-desync)
       cat <<EOF
-${b}usage:${r} git stack ${sub}pr desync${r} [${fl}--delete-remote${r}] [${fl}--yes${r}] [${fl}--dry-run${r}]
+${b}usage:${r} git stack ${sub}pr desync${r} [<branch>] [${fl}--delete-remote${r}] [${fl}--yes${r}] [${fl}--dry-run${r}]
 
 Tear down the stack's PR chain (inverse of ${sub}pr sync${r}) so branches can be
 reordered and re-synced clean: closes each branch's open PR. Skips merged and
 already-closed PRs.
 
+With <branch>, closes only that branch's PR and leaves the rest of the chain
+published — the proportionate remedy when the mutation you're about to make
+renames one branch (${sub}reslug${r}, ${sub}move --at${r}, ${sub}drop${r}). The following ${sub}pr sync${r}
+re-publishes the one PR and updates the others in place, so their review
+threads survive. <branch> may be a numeric leaf or a full branch name.
+
 An open PR with human activity (a non-bot comment, an approval, or a
 changes-requested review) prompts ${fl}y/N${r} per PR on a TTY — skipped
 non-interactively unless ${fl}--yes${r}. ${fl}--delete-remote${r} also deletes the remote
 branch of each PR closed (but never one still serving as the base of a PR you
-kept open). ${fl}--dry-run${r} previews. Requires \`gh\`.
+kept open); with <branch> it is ${b}refused${r} outright when a still-open PR bases
+on the target, since nothing has retargeted it yet. ${fl}--dry-run${r} previews.
+Requires \`gh\`.
 EOF
       ;;
     history)
@@ -4039,7 +4047,7 @@ reslug: no <branch> given and HEAD is detached"
   # identical (ADR 0013). Checked unconditionally; the helper no-ops when gh is
   # unusable.
   if _check_no_open_prs "$target"; then
-    die "reslug: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); renaming it would strand that PR on the old branch name. Run 'git stack pr desync' to take the stack offline first, then reslug, then 'git stack pr sync'."
+    die "reslug: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); renaming it would strand that PR on the old branch name. Run 'git stack pr desync ${_ORPHAN_PR_BRANCH}' to close just that PR first, then reslug, then 'git stack pr sync'."
   fi
 
   log "${C_GREEN}reslug${C_RESET}  ${C_CYAN}${target}${C_RESET} -> ${C_CYAN}${new_full}${C_RESET}"
@@ -5127,9 +5135,10 @@ move: no <branch> given and HEAD is detached"
     # is fully local — the open PR still sits on the old remote branch, so a
     # later 'pr sync' would open a fresh PR and orphan the old one. Hard-block
     # and point at the desync workflow (checked unconditionally; the helper
-    # no-ops when gh is unusable).
+    # no-ops when gh is unusable). One branch renamed, so one PR to close —
+    # unlike the reorder path below, whose gate spans every affected branch.
     if _check_no_open_prs "$src_branch"; then
-      die "move: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); reordering would desync it from GitHub. Run 'git stack pr desync' to take the stack offline first, then reorder, then 'git stack pr sync'."
+      die "move: '${_ORPHAN_PR_BRANCH}' has an open PR (#${_ORPHAN_PR_NUM}); renumbering would desync it from GitHub. Run 'git stack pr desync ${_ORPHAN_PR_BRANCH}' to close just that PR first, then renumber, then 'git stack pr sync'."
     fi
 
     _SNAPSHOT_FOCUS="leaf=${src_branch##*/}"$'\n'"pos=${new_num}"
@@ -6096,7 +6105,7 @@ drop: no <branch> given and HEAD is detached"
       log "  ${C_DIM}no children — pure delete; HEAD lands on ${pred_label}${C_RESET}"
     fi
     if _check_no_open_prs "$victim"; then
-      log "  ${C_YELLOW}would refuse: ${victim} has open PR #${_ORPHAN_PR_NUM}${C_RESET} (run 'pr desync' first)"
+      log "  ${C_YELLOW}would refuse: ${victim} has open PR #${_ORPHAN_PR_NUM}${C_RESET} (run 'pr desync ${victim}' first)"
     fi
     log "  ${C_DIM}rerun without --dry-run to apply${C_RESET}"
     return 0
@@ -6138,7 +6147,7 @@ drop: no <branch> given and HEAD is detached"
   # pass through ungated. Checked unconditionally (like move); the only escape
   # is the desync workflow.
   if _check_no_open_prs "$victim"; then
-    die "drop: '${victim}' has an open PR (#${_ORPHAN_PR_NUM}); deleting its head branch closes the PR on GitHub with no reattach and no superseding PR to breadcrumb to. Run 'git stack pr desync' to take the stack offline first, then 'git stack drop', then 'git stack pr sync' to re-publish cleanly."
+    die "drop: '${victim}' has an open PR (#${_ORPHAN_PR_NUM}); deleting its head branch closes the PR on GitHub with no reattach and no superseding PR to breadcrumb to. Run 'git stack pr desync ${victim}' to close just that PR first, then 'git stack drop', then 'git stack pr sync' to re-publish cleanly."
   fi
 
   # Destructive op: confirm on a TTY, refuse non-interactively without --yes.
@@ -7286,10 +7295,14 @@ cmd_pr_sync() {
 # on a TTY — skipped non-interactively unless --yes. With --delete-remote, also
 # delete the remote branch of each PR closed, except one still serving as the
 # base of a PR we kept open (deleting it would retarget that PR on GitHub).
-# --dry-run previews without mutating.
+# --dry-run previews without mutating. An optional <branch> narrows the teardown
+# to that one PR — the proportionate remedy for the verbs whose rename hits a
+# single branch (reslug, move --at, drop), which would otherwise cost the whole
+# chain's review threads to protect one (ADR 0016).
 cmd_pr_desync() {
   OPT_PREFIX=""
   local opt_delete_remote=0 opt_yes=0 opt_dry_run=0
+  local target_ref=""
   while (( $# > 0 )); do
     if _consume_common_flag "$@"; then
       shift "$_FLAG_SHIFT"
@@ -7300,7 +7313,8 @@ cmd_pr_desync() {
       --yes|-y)        opt_yes=1; shift ;;
       --dry-run)       opt_dry_run=1; shift ;;
       -*) die "unknown pr desync flag: $1" ;;
-      *)  die "pr desync: unexpected arg '$1'" ;;
+      *)  [[ -z "$target_ref" ]] || die "pr desync: unexpected arg '$1'"
+          target_ref="$1"; shift ;;
     esac
   done
 
@@ -7313,6 +7327,46 @@ cmd_pr_desync() {
   local branches=()
   _load_stack_branches "$prefix" branches "no stack branches under $prefix"
   local M=${#branches[@]}
+
+  # Single-branch mode is expressed as a target *index*, never as a shorter
+  # branches[]: the scan below stays full-width so Phase 2's base-branch guard
+  # can still consult a branch's successor by index. -1 means whole-stack.
+  local target_idx=-1 target=""
+  if [[ -n "$target_ref" ]]; then
+    local rc=0
+    target=$(_resolve_branch_ref "$target_ref" "${branches[@]}") || rc=$?
+    (( rc == 0 )) || die "pr desync: '$target_ref' not in stack '$prefix'"
+    target_idx=$(branch_index "$target" "${branches[@]}")
+    local others=$((M - 1)) scope_sfx=""
+    case $others in
+      0) ;;
+      1) scope_sfx=" ${C_DIM}(1 other branch untouched)${C_RESET}" ;;
+      *) scope_sfx=" ${C_DIM}(${others} other branches untouched)${C_RESET}" ;;
+    esac
+    log "${C_DIM}desync:${C_RESET} ${C_CYAN}${target}${C_RESET} only${scope_sfx}"
+  fi
+
+  # --delete-remote pre-flight. Deleting the target's remote closes any PR that
+  # targets it as a base, and in single-branch mode nothing has retargeted the
+  # successor's PR yet — that happens on the next `pr sync`, which by definition
+  # hasn't run. Phase 2's guard would warn-and-skip, but a silent "keeping
+  # remote X" when the user explicitly asked to delete it reads as a bug, so
+  # refuse up front, before any prompt or mutation (--dry-run included: showing
+  # a delete the real run would refuse is worse than showing nothing).
+  if (( target_idx >= 0 && opt_delete_remote && target_idx + 1 < M )); then
+    local succ="" succ_data="" succ_rest="" succ_num="" succ_state=""
+    succ="${branches[$((target_idx + 1))]}"
+    succ_data=$(_gh_pr_inspect "$succ")
+    if [[ -n "$succ_data" ]]; then
+      succ_num="${succ_data%%$'\x1f'*}"
+      succ_rest="${succ_data#*$'\x1f'}"   # drop number
+      succ_rest="${succ_rest#*$'\x1f'}"   # drop title
+      succ_state="${succ_rest%%$'\x1f'*}"
+      if [[ "$succ_state" == "OPEN" ]]; then
+        die "pr desync: refusing --delete-remote for '${target}' — $(_pr_link "$succ_num") ('${succ}') still targets it as a base, so deleting it would close that PR too. Re-run without --delete-remote (the stale remote is left for 'git stack clean'), or run 'git stack pr desync --delete-remote' to tear the whole chain down."
+      fi
+    fi
+  fi
 
   # --- Phase 1: inspect + classify + (interactively) confirm. No mutations.
   # One plan entry per branch, index-aligned with branches[], so the Phase 2
@@ -7362,6 +7416,13 @@ cmd_pr_desync() {
 
     # OPEN — classify human activity (non-bot comment / approval / changes).
     OPEN_AFTER[i]=1
+    # Out of scope in single-branch mode. The state settled above is all the
+    # Phase 2 base-branch guard needs from this branch, so stop here rather than
+    # querying its comments or prompting about activity we won't act on.
+    if (( target_idx >= 0 && i != target_idx )); then
+      PLAN_ACTION[i]="skip"
+      continue
+    fi
     local human_comments=0 hc=""
     if [[ "$comments" =~ ^[0-9]+$ ]] && (( comments > 0 )); then
       hc=$(gh api "repos/${GH_REPO}/issues/${num}/comments?per_page=100" --paginate \
@@ -7413,6 +7474,11 @@ cmd_pr_desync() {
   local DESYNC_FAILURES=()
   local closed=0 deleted=0 skipped=0
   for ((i = M - 1; i >= 0; i--)); do
+    # Out of scope in single-branch mode: neither reported nor counted. "skip"
+    # here means considered-and-declined, which is not what happened.
+    if (( target_idx >= 0 && i != target_idx )); then
+      continue
+    fi
     b="${branches[$i]}"
     num="${PLAN_NUM[i]-}"
     local action="${PLAN_ACTION[i]-}"
@@ -8159,6 +8225,11 @@ _git-stack() {
         _describe -t subverbs 'subcommand' _gs_items
         return
       fi
+      # The one nested positional that takes a branch: `pr desync [<branch>]`.
+      if [[ ${words[2]} == pr && ${words[3]} == desync ]]; then
+        _gs_leaves
+        return
+      fi
       ;;
   esac
 }
@@ -8192,6 +8263,9 @@ complete -c git -n '__fish_git_using_command stack; and not __fish_seen_subcomma
 # Sub-verbs.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from pr' -a '(git stack __complete subverbs pr)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from history' -a '(git stack __complete subverbs history)'
+# `pr desync [<branch>]`. Two chained conditions, not one: __fish_seen_subcommand_from
+# ORs its arguments, so a single call with both words would match either alone.
+complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from pr; and __fish_seen_subcommand_from desync' -a '(git stack __complete leaves)'
 # checkout → leaves; view/pick → prefixes.
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from checkout co' -a '(git stack __complete leaves)'
 complete -c git -n '__fish_git_using_command stack; and __fish_seen_subcommand_from drop' -a '(git stack __complete leaves)'
