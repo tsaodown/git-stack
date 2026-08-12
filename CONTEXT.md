@@ -134,11 +134,10 @@ The rule that no verb mutates the **PR chain** as a side effect of a local
 operation. Closing and reopening a PR discards review threads, approvals, and CI
 history, so a verb whose rename would hit an open **head PR** *refuses* and
 points at the **pr desync** → mutate → **pr sync** trio, rather than churning and
-re-publishing. Holds for **rename**, **reslug**, **move** and **drop**.
-Two documented exceptions: **fold**, where discarding the victim's review context
-*is* the operation (so it keeps auto-sync, `--allow-pr-rebuild`, and the
-breadcrumb), and **doctor**, which still auto-syncs and has *no* open-PR guard at
-all — a tracked gap, not an endorsement. The rule also covers **clean**, whose
+re-publishing. Holds for **rename**, **reslug**, **move**, **drop** and
+**doctor**. One documented exception: **fold**, where discarding the victim's
+review context *is* the operation (so it keeps auto-sync, `--allow-pr-rebuild`,
+and the breadcrumb). The rule also covers **clean**, whose
 remote-orphan deletion closes PRs as a side effect of `git push --delete`: it now
 names each PR the deletion would close (bulk `gh pr list`, advisory only — it
 never gates the deletion, and degrades to unannotated when gh is unusable).
@@ -148,6 +147,14 @@ remedy — `pr desync <branch>` — so one PR closes instead of the chain's. Onl
 **move**'s reorder, whose reflow rewrites every affected branch, points at the bare
 whole-stack form. This is what makes the hard block acceptable without an escape
 flag; ADR 0014 §5 rejected `--allow-pr-orphan`, and the cost it dodged is now gone.
+**doctor is the one verb that skips rather than refuses** (ADR 0017): it repairs
+several independent issue kinds in one run and only the **rename pass** touches
+PR state, so a blocked renumber is dropped — warning and naming every blocked
+branch — while the **squash** fixes still apply and the run exits 0. The pass is
+all-or-nothing: the cascade is interdependent, so renumbering a subset would land
+branches at positions the **scan** never proposed. One doctor path remains
+ungated: deleting an **absorbed branch** orphans its remote (and PR) where
+**drop** refuses the same operation — a named follow-up, not an exemption.
 _Avoid_: "no auto-sync" (too narrow — the rule is about PR *state*, not the sync
 verb).
 
@@ -387,7 +394,11 @@ the chain's PRs to take a stack off GitHub for clean reordering (the inverse of
 **pr sync**; ADR 0005); an optional `<branch>` narrows it to that one PR, the
 proportionate remedy for the single-branch gates (ADR 0016) — it keeps the
 full-width scan and narrows only the action set, since the `--delete-remote`
-base-branch guard reads a branch's successor by index.
+base-branch guard reads a branch's successor by index. **doctor** is **fully
+local** too (ADR 0017): its renumber leaves stale remotes under the same prefix,
+where **clean** reaps them, so it has no litter of its own to collect and no
+reason to touch the remote — which retires its `--no-push` / `--no-sync` as
+no-ops. Its rename pass is gated on open head PRs, skipping rather than refusing.
 
 ### Removed verbs
 
@@ -450,8 +461,8 @@ branch whose only extras-over-its-original-predecessor are in that set is
 cherry-picked tip-only instead of refused; `clean` populates it from the gone
 branches it pruned, ADR 0009), **rename-batch**
 (atomic local ref rename), **remote-sync** (remote rename + PR sync; idempotent —
-used by **rename**/**fold**/**doctor**, but *not* **move**, which is fully local;
-ADR 0006). _Avoid_: step, stage, pass.
+used by **rename** and **fold**, but *not* **move** or **doctor**, which are fully
+local; ADR 0006, ADR 0017). _Avoid_: step, stage, pass.
 
 **Unit**:
 One increment of work within a **phase** — for reflow-pick, one branch. The

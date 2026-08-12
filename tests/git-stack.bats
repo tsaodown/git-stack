@@ -3366,6 +3366,48 @@ $old_footer"
   [ "$(gh_log_count 'pr comment')" -eq 0 ]
 }
 
+# fold is the only verb still composing (reflow-pick, remote-sync) into one
+# plan — doctor's tail went local in ADR 0017 — so the engine's behavior at a
+# remote-phase failure is pinned here.
+@test "fold: remote rename failure is resumable; continue completes the tail" {
+  make_stack_branches feat 010-a 020-b 030-c
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_STUB_FAIL_RENAME="feat/010-a"
+  run git stack fold feat/020-b --yes --no-color
+  refute test "$status" -eq 0
+  # Local fold + child reflow already applied before the remote tail ran.
+  assert_branch_exists feat/010-b
+  assert_branch_absent feat/020-b
+  # State retained at the remote-sync phase → resumable.
+  assert test -f "$(git rev-parse --git-dir)/stack-rebase-state"
+  unset GH_STUB_FAIL_RENAME
+  run git stack continue --no-color
+  assert_status 0
+  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
+}
+
+# Aborting at the remote-sync pause walks back through reflow-pick too: the
+# reflowed child returns to its captured SHA and state clears. The fold and
+# rename were applied outside the engine, so they persist — the snapshot is the
+# recovery path for those.
+@test "fold: abort after remote failure unwinds the reflow and clears state" {
+  make_stack_branches feat 010-a 020-b 030-c
+  local orig_c
+  orig_c=$(git rev-parse refs/heads/feat/030-c)
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_STUB_FAIL_RENAME="feat/010-a"
+  run git stack fold feat/020-b --yes --no-color
+  refute test "$status" -eq 0
+  assert test -f "$(git rev-parse --git-dir)/stack-rebase-state"
+  run git stack abort --no-color
+  assert_status 0
+  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
+  assert_branch_exists feat/010-b
+  assert_sha_eq refs/heads/feat/030-c "$orig_c"
+}
+
 @test "fold: refuses when the renamed survivor has an open PR" {
   # The default slug renames the survivor 010-a -> 010-b, and a head PR does NOT
   # survive its branch being renamed (ADR 0006) — so the survivor's PR closes
@@ -4055,52 +4097,6 @@ make_conflicting_dups() {
   refute test "$status" -eq 0
 }
 
-# Doctor's remote tail (remote rename + pr sync for renumbered branches) now
-# runs through the engine as the final phase, after the local reflow. A remote
-# failure must retain state so 'continue' retries it — matching cmd_move/rename.
-@test "doctor: remote rename failure is resumable; continue completes the tail" {
-  make_dup_siblings
-  make_remote_origin
-  export GH_STUB_REPO="test/repo"
-  export GH_STUB_FAIL_RENAME="feat/02-c"
-  git checkout -q feat/01-a
-  run git stack doctor --yes --no-color
-  refute test "$status" -eq 0
-  # Local renumber + reflow already applied before the remote tail ran.
-  assert_branch_exists feat/03-c
-  assert_branch_absent feat/02-c
-  # State retained at the remote-sync phase → resumable.
-  assert test -f "$(git rev-parse --git-dir)/stack-rebase-state"
-  unset GH_STUB_FAIL_RENAME
-  run git stack continue --no-color
-  assert_status 0
-  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
-}
-
-# Aborting the combined (reflow-pick, remote-sync) plan at the remote-sync pause
-# walks back through reflow-pick too: it restores the reflowed branch to its
-# captured (post-rename, pre-reflow) SHA and clears state. The local rename was
-# applied outside the engine, so it persists — doctor's snapshot remains the
-# recovery path for that.
-@test "doctor: abort after remote failure unwinds reflow, keeps rename, clears state" {
-  make_dup_siblings
-  local orig_c
-  orig_c=$(git rev-parse refs/heads/feat/02-c)
-  make_remote_origin
-  export GH_STUB_REPO="test/repo"
-  export GH_STUB_FAIL_RENAME="feat/02-c"
-  git checkout -q feat/01-a
-  run git stack doctor --yes --no-color
-  refute test "$status" -eq 0
-  assert test -f "$(git rev-parse --git-dir)/stack-rebase-state"
-  run git stack abort --no-color
-  assert_status 0
-  refute test -f "$(git rev-parse --git-dir)/stack-rebase-state"
-  # Rename kept (applied outside the engine); reflow unwound to the captured SHA.
-  assert_branch_exists feat/03-c
-  assert_sha_eq refs/heads/feat/03-c "$orig_c"
-  assert_branch_absent feat/02-c
-}
 
 @test "doctor --dry-run: lists duplicate leaf group without applying" {
   make_dup_siblings
@@ -4185,6 +4181,153 @@ make_conflicting_dups() {
   assert_output_contains 'b-file'
   assert_output_contains 'c-file'
   assert_output_contains 'd-file'
+}
+
+# ---------- doctor PR guard ----------
+#
+# ADR 0017: renumbering strands a branch's open head PR on the old remote name.
+# The whole rename pass is skipped (not the run — squash fixes are PR-safe and
+# still apply), and every blocked branch is named.
+
+@test "doctor: an open PR on a renumbered branch skips the rename pass" {
+  make_dup_siblings
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_c__NUM=42
+  export GH_PR_feat_02_c__HEAD="feat/02-c"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  assert_status 0
+  assert_output_contains "rename pass skipped"
+  assert_output_contains "#42"
+  assert_output_contains "pr desync feat/02-c"
+  # Nothing renumbered.
+  assert_branch_exists feat/02-c
+  assert_branch_absent feat/03-c
+}
+
+@test "doctor: an open PR on a branch that keeps its number does not block" {
+  # Sort-V order leaves 02-b at leaf 02 and renumbers only 02-c, so 02-b's PR
+  # is not at risk — the gate is the actual rename set, not the dup group.
+  make_dup_siblings
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_b__NUM=41
+  export GH_PR_feat_02_b__HEAD="feat/02-b"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  assert_status 0
+  refute_output_contains "rename pass skipped"
+  assert_branch_exists feat/03-c
+  assert_branch_absent feat/02-c
+}
+
+@test "doctor: the skip warning names every blocked branch" {
+  git checkout -q -b feat/01-a
+  printf '01-a\n' >> file && git add file && git commit -q -m '01-a'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '02-c'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-d
+  printf 'd\n' > d-file && git add d-file && git commit -q -m '02-d'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_c__NUM=42
+  export GH_PR_feat_02_c__HEAD="feat/02-c"
+  export GH_PR_feat_02_d__NUM=43
+  export GH_PR_feat_02_d__HEAD="feat/02-d"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  assert_status 0
+  assert_output_contains "feat/02-c"
+  assert_output_contains "#42"
+  assert_output_contains "feat/02-d"
+  assert_output_contains "#43"
+  assert_branch_absent feat/03-c
+  assert_branch_absent feat/04-d
+}
+
+@test "doctor: a skipped rename pass still applies squash fixes" {
+  # 01-a carries two commits (squash issue); 02-b/02-c share leaf 02 and 02-c's
+  # open PR blocks the renumber. The squash is PR-safe and must still land.
+  git checkout -q -b feat/01-a
+  printf '01-a\n' >> file && git add file && git commit -q -m '01-a'
+  printf '01-a more\n' >> file && git add file && git commit -q -m '01-a second'
+  git checkout -q -b feat/02-b
+  printf 'b\n' > b-file && git add b-file && git commit -q -m '02-b'
+  git checkout -q feat/01-a
+  git checkout -q -b feat/02-c
+  printf 'c\n' > c-file && git add c-file && git commit -q -m '02-c'
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_c__NUM=42
+  export GH_PR_feat_02_c__HEAD="feat/02-c"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  assert_status 0
+  assert_output_contains "rename pass skipped"
+  # Squash landed: 01-a is one commit past main.
+  local n
+  n=$(( $(git rev-list --count refs/heads/feat/01-a) - $(git rev-list --count refs/heads/main) ))
+  assert_eq "$n" "1" "commits on 01-a"
+  # Renumber did not.
+  assert_branch_exists feat/02-c
+  assert_branch_absent feat/03-c
+}
+
+@test "doctor: an unusable gh does not block the renumber" {
+  make_dup_siblings
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_c__NUM=42
+  export GH_PR_feat_02_c__HEAD="feat/02-c"
+  # Shadow the stub with a gh that fails every call: the guard must degrade to
+  # "no PRs known" and let the local fix through, never gate on it.
+  mkdir -p "${TEST_REPO}/fake-bin"
+  printf '#!/bin/sh\nexit 1\n' > "${TEST_REPO}/fake-bin/gh"
+  chmod +x "${TEST_REPO}/fake-bin/gh"
+  PATH="${TEST_REPO}/fake-bin:$PATH"
+  export PATH
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  assert_status 0
+  refute_output_contains "rename pass skipped"
+  assert_branch_exists feat/03-c
+  assert_branch_absent feat/02-c
+}
+
+@test "doctor --dry-run: marks a renumber the guard would skip" {
+  make_dup_siblings
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  export GH_PR_feat_02_c__NUM=42
+  export GH_PR_feat_02_c__HEAD="feat/02-c"
+  run git stack doctor --dry-run --no-color
+  assert_status 0
+  assert_output_contains "rename  feat/02-c -> feat/03-c"
+  assert_output_contains "#42"
+  assert_output_contains "skipped"
+  assert_branch_exists feat/02-c
+}
+
+# ADR 0017: doctor's renumber joins move/reslug as fully local. Its stale
+# remotes sit under the same prefix, where `clean` reaps them — so unlike
+# `rename` there is nothing to collect, and no reason to touch the remote.
+@test "doctor: renumbering is fully local — no remote rename, no pr sync" {
+  make_dup_siblings
+  make_remote_origin
+  export GH_STUB_REPO="test/repo"
+  git checkout -q feat/01-a
+  run git stack doctor --yes --no-color
+  assert_status 0
+  assert_branch_exists feat/03-c
+  [ "$(gh_log_count 'api -X POST')" -eq 0 ]
+  [ "$(gh_log_count 'pr create')" -eq 0 ]
+  [ "$(gh_log_count 'pr edit')" -eq 0 ]
+  [ "$(gh_log_count 'pr close')" -eq 0 ]
 }
 
 # ---------- rename (remote stages) ----------

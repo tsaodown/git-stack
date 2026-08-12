@@ -79,8 +79,9 @@ but every stack branch is the **head** of its own PR, and those close.)
 
 That single fact shapes every renaming verb. None of them re-publish on your
 behalf: **PR state changes are explicit**, because closing and reopening a PR
-discards its review threads, approvals, and CI history. So each one refuses when
-the rename would hit an open head PR, and points at the same trio —
+discards its review threads, approvals, and CI history. So each one stops when
+the rename would hit an open head PR — refusing outright, or in `doctor`'s case
+skipping just the rename — and points at the same trio —
 [`pr desync`](#git-stack-pr-desync) to take the stack offline → mutate locally →
 `pr sync` to re-publish.
 
@@ -100,6 +101,11 @@ is enough, and stays bare when the change is chain-wide:
   every branch above the one you moved, so it takes the whole-stack form.
 - [`drop`](workflows.md#11-pull-a-branch-out-of-the-middle) gates on the victim
   alone — children pass through ungated — so it too takes the one-PR form.
+- [`doctor`](doctor.md#the-renumber-is-local-and-stops-at-an-open-pr) renumbers
+  duplicate and out-of-order leaves, also fully local. It is the one verb that
+  **skips rather than refuses**: it fixes several independent issue kinds in one
+  run, and squashes are PR-safe, so only the rename pass waits. It names every
+  blocked branch, since the cascade can span more than one.
 
 The exception is [`fold`](workflows.md#13-a-branchs-change-is-obsolete-fold-it-away),
 which *does* auto-sync — discarding the victim's review context is the point of the

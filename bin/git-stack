@@ -1951,6 +1951,33 @@ _clean_orphan_prs() {
   done
 }
 
+# For each given branch with an open head PR, print "<branch><TAB><num>".
+# Branches without one are omitted entirely, so the output doubles as the
+# "is anything blocked?" answer.
+#
+# The refusing verbs use _check_no_open_prs, which dies on the first hit and
+# carries one branch. doctor *skips* rather than refuses, so it has to name
+# every blocked branch in one go — hence the bulk index and the full list.
+# Same degrade-silently contract as _clean_orphan_prs: any gh problem yields
+# an empty result, so an unusable gh can never gate a local repair.
+# Usage: _doctor_open_pr_blockers <branch>...
+_doctor_open_pr_blockers() {
+  (( $# > 0 )) || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  gh auth status -h github.com >/dev/null 2>&1 || return 0
+  if [[ -z "${GH_REPO:-}" ]]; then
+    GH_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || return 0
+  fi
+  [[ -n "${GH_REPO:-}" ]] || return 0
+  _gh_load_open_index || return 0
+  local b rec
+  for b in "$@"; do
+    if rec=$(_gh_open_index_find "$b"); then
+      printf '%s\t%s\n' "$b" "${rec%%$'\x1f'*}"
+    fi
+  done
+}
+
 # Fold remote tail, step 1: capture the victim's open PR number (best-effort),
 # then delete its remote branch — which closes that PR on GitHub. Prints the
 # captured PR number (empty if none / gh unavailable) so the caller can
@@ -2593,7 +2620,6 @@ EOF
     doctor)
       cat <<EOF
 ${b}usage:${r} git stack ${sub}doctor${r} [${fl}--yes${r}] [${fl}--dry-run${r}] [${fl}--no-squash${r}] [${fl}--no-rename${r}]
-                       [${fl}--no-push${r}] [${fl}--no-sync${r}]
 
 Detect and offer to fix problems in the current stack. Three issue types are
 checked:
@@ -2618,11 +2644,14 @@ ${fl}--no-squash${r} skips the squash checks (rename-only mode); ${fl}--no-renam
 the leaf-rename pass (which also skips duplicate detection). Empty squashes
 (branch tree == predecessor tree) offer to delete the absorbed branch.
 
-Renamed branches are renamed on the remote and the PR chain re-synced
-afterwards (skip with ${fl}--no-push${r} / ${fl}--no-sync${r}). ${sub}doctor${r} is currently the
-only verb that re-syncs PRs on its own — ${sub}rename${r}, ${sub}move${r} and ${sub}reslug${r} leave
-that to an explicit ${sub}pr sync${r} — and it has no open-PR guard, so a renumber of
-a published stack closes and re-opens those PRs.
+Fully local: renumbering touches local refs only, and republishing is an
+explicit ${sub}pr sync${r}. The stale remotes it leaves sit under the same prefix,
+where ${sub}clean${r} reaps them.
+
+A renumber would strand an open head PR on the old branch name, so the whole
+rename pass is skipped when any branch it would rename has one — every blocked
+branch is named. Squash fixes are PR-safe and still apply. To renumber anyway,
+${sub}pr desync${r} the named branches first, re-run, then ${sub}pr sync${r}.
 EOF
       ;;
     prefix)
@@ -2666,10 +2695,10 @@ _help_reference() {
 ${b}Common flags:${r}
   ${fl}--prefix${r} <p>          Override the stack prefix (else git config
                         stack.prefix, else auto-detect).
-  ${fl}--no-push${r}             (fold/doctor) skip remote rename + pr sync;
+  ${fl}--no-push${r}             (fold) skip remote rename + pr sync;
                         (rename) skip the remote rename.
-  ${fl}--no-sync${r}             (fold/doctor) skip pr sync only. ${sub}rename${r}, ${sub}move${r} and
-                        ${sub}reslug${r} never sync, so it does nothing there.
+  ${fl}--no-sync${r}             (fold) skip pr sync only. ${sub}rename${r}, ${sub}move${r}, ${sub}reslug${r} and
+                        ${sub}doctor${r} never sync, so it does nothing there.
   ${fl}--color${r} | ${fl}--no-color${r}  Force color on/off (default: auto-detect TTY;
                         honors ${fl}NO_COLOR${r} env var).
   ${fl}-v${r}, ${fl}--verbose${r}         More output.
@@ -5343,10 +5372,45 @@ _doctor_check_rename_collisions() {
   done
 }
 
+# Gate doctor's rename pass on open head PRs, reporting what it found. Returns
+# 0 (blocked) when any branch the pass would rename has one, after printing the
+# full list and the unblocking recipe; 1 (clear) otherwise.
+#
+# All-or-nothing by design (ADR 0017): the cascade is interdependent — each
+# rename sets the floor for the one above — so applying a subset would renumber
+# branches into positions the scan never proposed. Only the *sources* are
+# gated; a branch that keeps its number is not at risk.
+# Usage: _doctor_rename_blocked <rename_pairs>...
+_doctor_rename_blocked() {
+  local pairs=("$@")
+  local sources=() i
+  for ((i = 0; i < ${#pairs[@]}; i += 2)); do sources+=("${pairs[$i]}"); done
+
+  local blocked=() line=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && blocked+=("$line")
+  done < <(_doctor_open_pr_blockers "${sources[@]+"${sources[@]}"}")
+  (( ${#blocked[@]} > 0 )) || return 1
+
+  warn "rename pass skipped — renumbering would strand these open PRs on the old branch name:"
+  local b num
+  for line in "${blocked[@]}"; do
+    b="${line%%$'\t'*}"
+    num="${line#*$'\t'}"
+    printf '  %s%s%s  (open PR #%s)\n' "$C_CYAN" "$b" "$C_RESET" "$num" >&2
+  done
+  if (( ${#blocked[@]} == 1 )); then
+    warn "run 'git stack pr desync ${blocked[0]%%$'\t'*}', re-run doctor, then 'git stack pr sync'"
+  else
+    warn "run 'git stack pr desync <branch>' for each, re-run doctor, then 'git stack pr sync'"
+  fi
+  return 0
+}
+
 # Apply a confirmed batch of renames atomically via git update-ref --stdin.
-# Local-only: the remote tail (remote rename + pr sync) is driven separately by
-# cmd_doctor's finish phase through the engine, so it's resumable and runs after
-# the reflow. Caller is responsible for snapshot + collision check.
+# Local refs only — doctor never touches the remote (ADR 0017), and its stale
+# remotes are left under the same prefix for `clean` to reap. Caller is
+# responsible for snapshot + collision check.
 # Usage: _doctor_apply_renames_batch <rename_pairs>...
 _doctor_apply_renames_batch() {
   local pairs=("$@")
@@ -5713,7 +5777,7 @@ _doctor_print_issue_header() {
     "$C_DIM" "$label" "$C_RESET" >&2
 }
 
-# Finish a doctor run as ONE resumable engine plan, composing:
+# Finish a doctor or fold run as ONE resumable engine plan, composing:
 #   - reflow-pick   when from_idx is in range (stale predecessors to re-thread
 #                   after a squash/sweep or duplicate renumber)
 #   - remote-sync   when renames were applied this run and push is enabled
@@ -5722,7 +5786,9 @@ _doctor_print_issue_header() {
 # step — pr sync reflects the reflowed SHAs, and a remote failure pauses with
 # state retained rather than dying with a manual-recovery hint. The caller sets
 # STACK_RENAME_PAIRS to the applied renames (alternating old/new); empty ⇒ no
-# remote tail. Returns 0 (no plan) when there's nothing to do.
+# remote tail, which is how doctor stays fully local (ADR 0017) while fold —
+# the only remaining caller with a tail — keeps its auto-sync.
+# Returns 0 (no plan) when there's nothing to do.
 # Usage: _doctor_finish <prefix> <from_idx> <branch>...
 _doctor_finish() {
   local prefix="$1" from_idx="$2"; shift 2
@@ -6359,10 +6425,20 @@ cmd_doctor() {
     for ((k = 0; k < ${#squash_idx[@]}; k++)); do
       log "  squash  ${C_CYAN}${branches[${squash_idx[$k]}]}${C_RESET}  (${squash_kind[$k]})"
     done
-    local i
+    local i dr_sources=() dr_b="" dr_n=""
     for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
       log "  rename  ${C_CYAN}${rename_pairs[$i]}${C_RESET} -> ${C_CYAN}${rename_pairs[$((i+1))]}${C_RESET}"
+      dr_sources+=("${rename_pairs[$i]}")
     done
+    # Run the PR guard here too, so a preview never advertises a renumber the
+    # real run would skip (ADR 0017). Reported per blocker, but the pass is
+    # all-or-nothing — one of these skips every rename above.
+    if (( ${#dr_sources[@]} > 0 )); then
+      while IFS=$'\t' read -r dr_b dr_n; do
+        [[ -n "$dr_b" ]] || continue
+        log "  ${C_YELLOW}rename pass will be skipped${C_RESET}: ${C_CYAN}${dr_b}${C_RESET} has an open PR (#${dr_n})"
+      done < <(_doctor_open_pr_blockers "${dr_sources[@]}")
+    fi
     return 0
   fi
 
@@ -6374,9 +6450,6 @@ cmd_doctor() {
   local lowest_dup_idx=-1
   local apply_all=$(( opt_yes ))
   local user_quit=0
-  # Renames applied this run (alternating old/new), carried to the finish phase
-  # so its remote tail (remote rename + pr sync) runs after the reflow.
-  local doctor_rename_pairs=()
 
   # ----- Squash phase (bottom-up, applies immediately) -----
 
@@ -6588,44 +6661,55 @@ cmd_doctor() {
     if (( ${#rename_pairs[@]} > 0 )); then
       _doctor_check_rename_collisions "${rename_pairs[@]}"
 
-      local confirmed=()
-      local i from_b to_b label_idx label_total ans
-      label_total=$(( ${#rename_pairs[@]} / 2 ))
-      for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
-        from_b="${rename_pairs[$i]}"
-        to_b="${rename_pairs[$((i+1))]}"
-        label_idx=$(( i / 2 + 1 ))
-        _doctor_print_issue_header "$label_idx" "$label_total" "$from_b" "rename"
-        printf '  %srename to:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$to_b" "$C_RESET" >&2
-
-        if (( apply_all )); then
-          ans=y
-        elif (( interactive )); then
-          ans=$(_doctor_prompt "  rename? [y/N/a/q]: ") || ans=n
-          case "$ans" in
-            y) ;;
-            a) apply_all=1; ans=y ;;
-            q) user_quit=1; ans=n ;;
-            *) ans=n ;;
-          esac
-        else
-          ans=n
+      if _doctor_rename_blocked "${rename_pairs[@]}"; then
+        # The duplicate phase only permuted the in-memory array; the renames
+        # were what would have realized that order in refs. With the pass
+        # skipped, fall back to the on-disk order and cancel the reflow it
+        # would have driven — those branches' ancestry never moved.
+        if (( lowest_dup_idx >= 0 )); then
+          lowest_dup_idx=-1
+          branches=()
+          _load_stack_branches "$prefix" branches
         fi
+      else
+        local confirmed=()
+        local i from_b to_b label_idx label_total ans
+        label_total=$(( ${#rename_pairs[@]} / 2 ))
+        for ((i = 0; i < ${#rename_pairs[@]}; i+=2)); do
+          from_b="${rename_pairs[$i]}"
+          to_b="${rename_pairs[$((i+1))]}"
+          label_idx=$(( i / 2 + 1 ))
+          _doctor_print_issue_header "$label_idx" "$label_total" "$from_b" "rename"
+          printf '  %srename to:%s %s%s%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$to_b" "$C_RESET" >&2
 
-        if [[ "$ans" == "y" ]]; then
-          confirmed+=("$from_b" "$to_b")
-        else
-          printf '  %sskip%s\n' "$C_DIM" "$C_RESET" >&2
+          if (( apply_all )); then
+            ans=y
+          elif (( interactive )); then
+            ans=$(_doctor_prompt "  rename? [y/N/a/q]: ") || ans=n
+            case "$ans" in
+              y) ;;
+              a) apply_all=1; ans=y ;;
+              q) user_quit=1; ans=n ;;
+              *) ans=n ;;
+            esac
+          else
+            ans=n
+          fi
+
+          if [[ "$ans" == "y" ]]; then
+            confirmed+=("$from_b" "$to_b")
+          else
+            printf '  %sskip%s\n' "$C_DIM" "$C_RESET" >&2
+          fi
+          (( user_quit )) && break
+        done
+
+        if (( ${#confirmed[@]} > 0 )); then
+          _doctor_apply_renames_batch "${confirmed[@]}"
+          # Renames mutate ref names — reload branches for reflow.
+          branches=()
+          _load_stack_branches "$prefix" branches
         fi
-        (( user_quit )) && break
-      done
-
-      if (( ${#confirmed[@]} > 0 )); then
-        _doctor_apply_renames_batch "${confirmed[@]}"
-        doctor_rename_pairs=("${confirmed[@]}")
-        # Renames mutate ref names — reload branches for reflow.
-        branches=()
-        _load_stack_branches "$prefix" branches
       fi
     fi
   fi
@@ -6684,7 +6768,7 @@ cmd_doctor() {
     done
   fi
 
-  # ----- Finish phase: reflow + remote tail, as one resumable engine plan -----
+  # ----- Finish phase: reflow, as a resumable engine plan -----
   #
   # Reflow re-threads branches whose positional predecessor SHA went stale. Two
   # independent triggers:
@@ -6694,10 +6778,13 @@ cmd_doctor() {
   #     predecessor whose tip is a different commit than their actual parent.
   #     Start at lowest_dup_idx (the first renumbered slot).
   # When both fire, take the lower index so the cascade covers everything.
-  # The remote tail (remote rename + pr sync for any applied renames) is folded
-  # into the same plan so it runs *after* the reflow and is itself resumable.
-  # Reflow is skipped after a user quit; the remote tail still runs for renames
-  # already confirmed and applied this run (keeping local and remote in sync).
+  # Reflow is skipped after a user quit.
+  #
+  # No remote tail: doctor is fully local (ADR 0017). Its renumbered branches
+  # leave their stale remotes under the same prefix, where `clean` reaps
+  # them — so unlike `rename`, which moves refs into a namespace `clean` never
+  # scans, doctor has no litter of its own to collect. Empty rename pairs are
+  # what keep _doctor_finish (shared with fold) from appending remote-sync.
 
   local reflow_from=-1
   if (( applied_squash > 0 && lowest_squash_idx >= 0 )); then
@@ -6709,7 +6796,7 @@ cmd_doctor() {
     fi
   fi
   (( user_quit )) && reflow_from=-1
-  STACK_RENAME_PAIRS=("${doctor_rename_pairs[@]+"${doctor_rename_pairs[@]}"}")
+  STACK_RENAME_PAIRS=()
   _doctor_finish "$prefix" "$reflow_from" "${branches[@]}"
 
   log ""

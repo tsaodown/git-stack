@@ -54,8 +54,6 @@ git stack doctor                  # interactive: prompt per issue
 git stack doctor --yes            # auto-apply every fix (required for non-TTY / scripts)
 git stack doctor --no-squash      # rename/dedup only, skip squash checks
 git stack doctor --no-rename      # squash only, skip leaf-rename (also skips dup detection)
-git stack doctor --no-push        # apply locally, skip the remote rename + pr sync
-git stack doctor --no-sync        # rename the remote, but skip pr sync
 ```
 
 Each issue prompts on a TTY: `y` apply, `e` (squash only) apply and edit the
@@ -63,6 +61,9 @@ message in `$EDITOR`, `N` skip (the default), `a` apply all remaining fixes
 (squashes and duplicate-leaf groups alike), `q` quit. Duplicate-leaf prompts instead take a space- or comma-separated
 permutation of `1..N` (RET keeps the current order). `--yes` applies everything
 non-interactively using `sort -V` order for duplicates — required off a TTY.
+
+A fix that rewrites commits triggers a reflow, so a `doctor` repair can pause on
+a conflict just like any other reflow (resolve + `git stack continue`).
 
 It detects three kinds of issue:
 
@@ -103,21 +104,39 @@ A leaf-renumber needed to re-space the stack — for instance to open a
 [gap](concepts.md#gap) that was exhausted, so an insert that previously refused
 can succeed.
 
-When renames are applied, doctor renames the remote branches and then runs
-`pr sync` (suppress the remote tail with `--no-push`, or keep the rename but skip
-the PR step with `--no-sync`), and a squash that rewrites commits triggers a reflow — so a
-`doctor` repair can pause on a conflict just like any other reflow (resolve +
-`git stack continue`).
+### The renumber is local, and stops at an open PR
 
-> **Heads up — doctor is the one verb that still re-syncs PRs on its own.**
-> [`rename`](workflows.md#8-rename-the-stacks-prefix),
-> [`reslug`](workflows.md#8a-rename-one-branchs-slug) and
-> [`move`](workflows.md#5-the-branches-are-in-the-wrong-order) leave republishing
-> to an explicit `pr sync` and refuse when a rename would hit an open head PR.
-> `doctor` has no such guard, so renumbering a published stack closes those PRs
-> and opens fresh ones. Run [`pr desync`](pr-sync.md#git-stack-pr-desync) first —
-> or `--no-rename` to skip the renumber pass — if you want to keep the existing
-> PRs. See [renames close head PRs](pr-sync.md#renames-close-head-prs).
+Renumbering is [fully local](pr-sync.md#renames-close-head-prs), like
+[`move`](workflows.md#5-the-branches-are-in-the-wrong-order) and
+[`reslug`](workflows.md#8a-rename-one-branchs-slug): it touches local refs only,
+and republishing is an explicit [`pr sync`](pr-sync.md#git-stack-pr-sync). The
+stale remote it leaves behind sits under the same prefix, where
+[`clean`](workflows.md#7-the-bottom-pr-merged) reaps it.
+
+That rename would strand an open head PR on the old branch name, so `doctor`
+skips the **whole rename pass** when any branch it would rename has one, and
+names each blocker:
+
+```
+git-stack: warn: rename pass skipped — renumbering would strand these open PRs on the old branch name:
+  feat/02-c  (open PR #42)
+git-stack: warn: run 'git stack pr desync feat/02-c', re-run doctor, then 'git stack pr sync'
+```
+
+The run itself continues and exits 0 — squash fixes don't touch PRs, so they
+still apply. Only the renumber waits. `--dry-run` runs the same check, so a
+preview never advertises a rename the real run will skip.
+
+The pass is all-or-nothing because the cascade is interdependent: each rename
+sets the floor for the one above, so renumbering a subset would land branches at
+positions the scan never proposed. A branch that *keeps* its number is never
+gated. See [renames close head PRs](pr-sync.md#renames-close-head-prs).
+
+> **Not yet gated:** deleting an [absorbed branch](#squash) is offered even when
+> that branch has an open PR, leaving the remote (and its PR) orphaned for a
+> later [`clean`](workflows.md#7-the-bottom-pr-merged) to close.
+> [`drop`](workflows.md#11-pull-a-branch-out-of-the-middle) refuses the same
+> operation — a known inconsistency.
 
 ## Rolling back with history
 
