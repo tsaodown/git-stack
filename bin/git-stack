@@ -2585,7 +2585,9 @@ conflict to resolve and ${sub}continue${r}; ${fl}--force${r} waives the multi-co
 
 Fully local (no push/rename/${sub}pr sync${r}). Destructive: snapshots first (undo via
 ${sub}history restore${r}), refuses a dirty tree, needs ${fl}--yes${r} off a TTY. Refuses only
-when the victim has an open PR (run ${sub}pr desync${r} first). ${fl}--dry-run${r} previews.
+when the victim has an open PR — children are ungated, so run
+${sub}pr desync <victim>${r} first and the rest of the chain keeps its PRs.
+${fl}--dry-run${r} previews.
 EOF
       ;;
     doctor)

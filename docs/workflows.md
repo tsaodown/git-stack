@@ -49,7 +49,8 @@ git stack pr sync                   # repoint the remaining PRs
 
 Repeat the revise → `sync` → `pr sync` loop and the merge → `clean` → `pr sync`
 loop until the stack is empty. Off the happy path — reordering, renaming, folding
-a branch away, or recovering from a conflict — jump to the matching scenario below.
+a branch away, dropping one entirely, or recovering from a conflict — jump to the
+matching scenario below.
 
 ---
 
@@ -63,9 +64,10 @@ a branch away, or recovering from a conflict — jump to the matching scenario b
 | [6](#6-publish-and-refresh-the-pr-chain) | Publish and refresh the PR chain |
 | [7](#7-the-bottom-pr-merged) | The bottom PR merged |
 | [8](#8-rename-the-stacks-prefix) | Rename the stack's prefix |
+| [8a](#8a-rename-one-branchs-slug) | Rename one branch's slug (`reslug`) |
 | [9](#9-push-or-reflow-only-part-of-the-stack) | Push or reflow only part of the stack *(advanced)* |
 | [10](#10-a-branch-grew-a-second-commit) | A branch grew a second commit *(advanced)* |
-| [11](#11-pull-a-branch-out-of-the-middle) | Pull a branch out of the middle *(advanced)* |
+| [11](#11-pull-a-branch-out-of-the-middle) | Pull a branch out of the middle (`drop`) *(advanced)* |
 | [12](#12-sharing-a-stack-with-someone-else) | Sharing a stack with someone else *(advanced)* |
 | [13](#13-a-branchs-change-is-obsolete-fold-it-away) | A branch's change is obsolete: fold it away |
 | [14](#14-reorganize-a-stack-thats-already-on-github) | Reorganize a stack that's already on GitHub |
@@ -534,18 +536,60 @@ re-creates the old name beside the new one and warns about the resulting duplica
 leaf). The stale remote branch stays under the current prefix, where `clean` reaps
 it.
 
-Like `move`, it refuses when the branch has an open head PR. Since only this one
-branch is renamed, close only its PR — name the branch in the desync:
+### When the branch has a PR
 
-```sh
-git stack pr desync feat/010-auth   # close just #12
-git stack reslug feat/010-auth authz
-git stack pr sync                   # fresh PR for this branch; the others update in place
+GitHub closes a PR whose head branch is renamed, and nothing can reattach it. So
+`reslug` refuses rather than silently spending the PR:
+
+```
+git-stack: error: reslug: 'feat/020-login' has an open PR (#102); renaming it would
+strand that PR on the old branch name. Run 'git stack pr desync feat/020-login' to
+close just that PR first, then reslug, then 'git stack pr sync'.
 ```
 
-The rest of the chain keeps its review threads. Reach for a whole-stack
-`pr desync` only when the change itself is whole-stack — see
-[scenario 14](#14-reorganize-a-stack-thats-already-on-github).
+The message names the branch because only *that* PR has to go — `reslug` renames
+one branch, so closing the whole chain would spend the other reviews for nothing:
+
+```sh
+git stack pr desync feat/020-login    # close just #102
+git stack reslug feat/020-login signin
+git stack pr sync
+```
+
+```
+desync: feat/020-login only (2 other branches untouched)
+close   #102 feat/020-login
+desynced: 1 closed, 0 remote deleted, 0 skipped
+
+reslug  feat/020-login -> feat/020-signin
+done    reslug complete (+1 renames)
+
+push    feat/020-signin (6f2e50e, --force-with-lease)
+exists  #101 feat/010-auth
+create  #104 feat/020-signin -> feat/010-auth
+exists  #103 feat/030-profile
+update  #101 feat/010-auth
+update  #104 feat/020-signin
+update  #103 feat/030-profile (base: feat/020-login -> feat/020-signin)
+done    pr sync complete (3 branches)
+```
+
+Read the last block closely — it's the whole point of naming the branch:
+
+- **`exists #101` / `exists #103`** — the neighbours are *reused*. Their review
+  threads, approvals and CI history are untouched; they only needed a refreshed
+  title and nav footer.
+- **`create #104`** — the renamed branch gets a **new PR number**. #102 stays
+  closed beside it; a closed PR is never reattached, so this is inherent, not a
+  bug. Copy anything you still need from #102's discussion before you desync.
+- **`update #103 (base: feat/020-login -> feat/020-signin)`** — the successor's
+  base follows the rename automatically. That retarget is why the stale
+  `origin/feat/020-login` must survive until `pr sync` runs: deleting it first
+  would close #103. `pr desync --delete-remote` refuses for exactly this reason,
+  and `clean` reaps the stale remote afterwards.
+
+Reach for a whole-stack `pr desync` only when the change itself is chain-wide —
+see [scenario 14](#14-reorganize-a-stack-thats-already-on-github).
 
 **See also:** [rename the whole prefix](#8-rename-the-stacks-prefix) · [pr desync one branch](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest)
 
@@ -611,7 +655,7 @@ git-stack: error: branch 'feat/030-profile' has 2 commit(s) beyond its predecess
 
 ## 11. Pull a branch out of the middle
 
-*(advanced — recipe, not a single command)*
+*(advanced)*
 
 **Situation.** A middle branch (`feat/020-login`) turned out to be unnecessary and
 you want it gone, with its changes removed from the branches above it.
@@ -621,9 +665,82 @@ you want it gone, with its changes removed from the branches above it.
 > contain login's changes, and `restack` would refuse it as a multi-commit branch
 > (see [scenario 10](#10-a-branch-grew-a-second-commit)).
 
-The reliable recipe is to **move the unwanted branch to the top, then delete it** —
-the move reflows the branches that were above it down onto its old predecessor,
-cleanly extracting its changes:
+That's what `drop` is for — it discards the branch **and** reflows its children
+onto its predecessor, in one command:
+
+```sh
+git stack drop feat/020-login
+```
+
+```
+drop 020-login
+  discards its work; reflow 1 child(ren) onto 010-auth. proceed? [Y/n] y
+done    dropped feat/020-login
+absorb  feat/030-profile tip-only restack, dropping 1 superseded commit(s)
+restack feat/030-profile onto feat/010-auth
+done    reflow complete (1 branch restacked)
+```
+
+`feat/030-profile` now sits directly on `feat/010-auth` and contains only
+`auth` + `profile`; login is gone entirely. The children are cherry-picked
+**tip-only**, so a child that genuinely built on the dropped work surfaces a normal
+conflict — resolve it and `git stack continue`, same as any reflow.
+
+`drop` **degrades at every position**, so you don't need a different recipe per
+case: a middle branch sends its children to the predecessor, the bottom one sends
+them to the base, the tip is a pure delete, and a lone branch is deleted with HEAD
+landing on the base. It's destructive but recoverable — it snapshots first, so
+`git stack history restore @0` puts the branch back. It confirms `[Y/n]` on a TTY
+(spelling out the plan, as above), refuses a dirty tree, and off a TTY needs
+`--yes`. Preview with `--dry-run`:
+
+```
+dry run: would drop feat/020-login (discards its work)
+  reflow 1 child(ren) onto feat/010-auth
+  rerun without --dry-run to apply
+```
+
+### When the branch has a PR
+
+`drop` is fully local, and deleting a head branch closes its PR on GitHub with no
+way to reattach — and unlike [`fold`](#13-a-branchs-change-is-obsolete-fold-it-away),
+there's no superseding PR to breadcrumb to. So it refuses:
+
+```
+git-stack: error: drop: 'feat/020-login' has an open PR (#102); deleting its head
+branch closes the PR on GitHub with no reattach and no superseding PR to breadcrumb
+to. Run 'git stack pr desync feat/020-login' to close just that PR first, then
+'git stack drop', then 'git stack pr sync' to re-publish cleanly.
+```
+
+The gate covers the **victim only** — children pass through ungated — so the
+remedy is one PR, not the chain's:
+
+```sh
+git stack pr desync feat/020-login   # close just #102
+git stack drop feat/020-login
+git stack pr sync
+```
+
+```
+push    feat/030-profile (66b57c2, --force-with-lease)
+exists  #101 feat/010-auth
+exists  #103 feat/030-profile
+update  #101 feat/010-auth
+update  #103 feat/030-profile (base: feat/020-login -> feat/010-auth)
+done    pr sync complete (2 branches)
+```
+
+`exists` on both survivors is the point: #101 and #103 are **reused**, not
+reopened, so their review threads, approvals and CI history carry over. All #103
+needed was a new base, and `pr sync` retargeted it.
+
+### Doing it by hand
+
+Before `drop` existed the recipe was to **move the unwanted branch to the top, then
+delete it** — the move reflows the branches that were above it down onto its old
+predecessor, extracting its changes. It's worth knowing, because it's exactly what
+`drop` automates, and the intermediate state is inspectable:
 
 ```sh
 git stack move feat/020-login --last
@@ -653,22 +770,19 @@ git stack checkout 10        # switch off the branch we're about to delete
 git branch -D feat/031-login
 ```
 
-`feat/030-profile` now contains only `auth` + `profile`; login is gone entirely.
-The `move` is local, so if the branch you're removing has an open PR, run
-[`pr desync`](pr-sync.md#git-stack-pr-desync) first to close the chain's PRs (with
-`--delete-remote` to drop the remote branches too); then reorder and delete, and
-let [`clean`](#7-the-bottom-pr-merged) tidy up the rest — the
-[desync → reorder → re-sync trio](#14-reorganize-a-stack-thats-already-on-github)
-in full. The whole chain is in scope here because this recipe's `move` reflows every
-branch above the victim. `git stack drop` does the same extraction in one command
-and gates on the **victim alone**, so it asks only for
-[`pr desync <victim>`](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest).
+Same end state — but note the PR cost differs. This recipe's `move` is a **reorder**,
+so it reflows every branch above the victim and its open-PR gate covers all of them:
+you'd need a whole-stack [`pr desync`](pr-sync.md#git-stack-pr-desync), then
+[`clean`](#7-the-bottom-pr-merged) to tidy the leftovers — the
+[desync → reorder → re-sync trio](#14-reorganize-a-stack-thats-already-on-github) in
+full. `drop` gates on the victim alone, which is why it costs one PR instead. Prefer
+`drop`; reach for this when you want to inspect the intermediate state.
 
 > **Want to keep the change, just not as its own branch?** That's
 > [`fold`](#13-a-branchs-change-is-obsolete-fold-it-away) — it squashes the branch
 > into a neighbor instead of discarding it.
 
-**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order) · [multi-commit branches](#10-a-branch-grew-a-second-commit) · [fold a branch away](#13-a-branchs-change-is-obsolete-fold-it-away)
+**See also:** [reorder branches](#5-the-branches-are-in-the-wrong-order) · [multi-commit branches](#10-a-branch-grew-a-second-commit) · [fold a branch away](#13-a-branchs-change-is-obsolete-fold-it-away) · [pr desync one branch](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest)
 
 ---
 
@@ -758,7 +872,7 @@ on** (`030-backoff`) — exactly the obsolete-superseded case, no flags needed. 
 Contrast with [scenario 11](#11-pull-a-branch-out-of-the-middle), which *discards*
 a branch's change; `fold` *keeps* it.
 
-**See also:** [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [reference: clean vs fold](reference.md#removing-a-branch-clean-vs-fold)
+**See also:** [pull a branch out](#11-pull-a-branch-out-of-the-middle) · [reference: clean vs fold vs drop](reference.md#removing-a-branch-clean-vs-fold-vs-drop)
 
 ---
 

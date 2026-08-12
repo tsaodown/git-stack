@@ -65,7 +65,7 @@ current commit (staged-ness preserved) and uses stash+pop when it lands elsewher
 warns and keeps the stash entry rather than aborting. Untracked files travel
 across regardless. See [workflows scenario 4](workflows.md#4-you-need-a-branch-in-the-middle).
 
-## Removing a branch: `clean` vs `fold`
+## Removing a branch: `clean` vs `fold` vs `drop`
 
 ```sh
 git stack fold              # fold the current branch DOWN into its predecessor
@@ -73,9 +73,19 @@ git stack fold 020 --up     # fold leaf 020 UP into its successor
 git stack fold --slug retry # keep the survivor's position, rename it
 git stack fold 020 --at 15  # renumber the merged result to a free leaf
 git stack fold --dry-run    # preview the plan, change nothing
+
+git stack drop              # discard the current branch, reflow its children
+git stack drop 020 --yes    # discard leaf 020 without the confirm prompt
+git stack drop --dry-run    # preview the plan, change nothing
 ```
 
-Two different "get rid of a branch" verbs:
+Three "get rid of a branch" verbs, split by **what happens to the work**:
+
+| Verb | The branch's diff | When |
+|---|---|---|
+| `clean` | already landed | after a PR merges |
+| `fold` | **kept**, squashed into a neighbor | the change is right, the branch isn't |
+| `drop` | **discarded** | the change was a mistake |
 
 - **`clean`** prunes branches whose upstream is `[gone]` (already merged/closed) and
   reflows the survivors. Use it after a PR merges.
@@ -84,6 +94,17 @@ Two different "get rid of a branch" verbs:
   then reflows the children onto the survivor. A plain delete would orphan the
   children from the context they were written against; folding keeps every
   surviving branch's tree intact, so children cherry-pick clean.
+- **`drop`** *throws the work away* — the destructive sibling of `fold`. It deletes
+  the branch and cherry-picks its children **tip-only** onto its predecessor, so a
+  child that genuinely built on the dropped work raises a normal conflict to resolve
+  and `continue`. It degrades at every position (middle → predecessor, bottom →
+  base, tip → pure delete, lone → delete and land on base), so there's one command
+  rather than a recipe per case. Snapshots first, refuses a dirty tree, needs
+  `--yes` off a TTY, and `--force` waives the multi-commit guard. Fully local. Its
+  PR gate covers the **victim only** — children are ungated — so it asks for
+  [`pr desync <victim>`](pr-sync.md#git-stack-pr-desync-branch--close-one-pr-keep-the-rest),
+  not a whole-stack teardown. See
+  [workflows scenario 11](workflows.md#11-pull-a-branch-out-of-the-middle).
 
 By default `fold` goes **down** (into the predecessor); `--up` folds into the
 successor instead. The result lands at the survivor's leaf but is **named after
