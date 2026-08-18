@@ -4155,17 +4155,23 @@ _validate_prefix() {
 #
 #   _prompt_prefill <label> <prev_value> <out_var>
 #
-# On bash 4+ the prior value is pre-filled on the input line (readline `-i`), so
-# the user edits rather than retypes. On bash 3.2 (no `read -i`) it degrades to a
-# blank prompt whose label already carries the rejected value + reason, so the
+# On bash 4+ the prior value is pre-filled on the input line (readline `-i`) and
+# the prompt is handed to readline itself (`read -p`), so the user edits rather
+# than retypes. On bash 3.2 (no `read -i`) it degrades to a printf'd prompt on a
+# blank line whose label already carries the rejected value + reason, so the
 # information isn't lost — only the in-place edit is. Returns non-zero on EOF
 # (Ctrl-D) so callers can abort; the read value lands in <out_var>.
 _prompt_prefill() {
   local label="$1" prev="$2" out="$3" reply=""
-  printf '%s%s%s ' "$C_DIM" "$label" "$C_RESET" >&2
   if (( BASH_VERSINFO[0] >= 4 )) && [[ -n "$prev" ]]; then
-    read -e -i "$prev" -r reply < /dev/tty || return 1
+    # Readline must own the prompt: printing it separately leaves readline
+    # thinking the line starts at column 0, so deleting the prefill to empty
+    # redraws over the prompt and erases it. Wrap the color escapes in
+    # \001/\002 so readline counts only the visible width.
+    local rlp=$'\001'"$C_DIM"$'\002'"$label"$'\001'"$C_RESET"$'\002'' '
+    read -e -p "$rlp" -i "$prev" -r reply < /dev/tty || return 1
   else
+    printf '%s%s%s ' "$C_DIM" "$label" "$C_RESET" >&2
     read -r reply < /dev/tty || return 1
   fi
   printf -v "$out" '%s' "$reply"
