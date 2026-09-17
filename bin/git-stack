@@ -2336,8 +2336,11 @@ EOF
 ${b}usage:${r} git stack ${sub}create${r} [<prefix>] [<slug>] [${fl}--onto${r} <ref>] [${fl}--stash${r}]
 
 Start a brand-new stack: first branch (leaf \`010\`) off the resolved base
-(${fl}stack.base${r} → origin/<default> → local default), or ${fl}--onto${r} <ref>. Errors if
-the prefix already has branches (use ${sub}add${r}). Checks out the new branch.
+(${fl}stack.base${r} → origin/<default> → local default), or ${fl}--onto${r} <ref>. A branch
+${fl}--onto${r} target is remembered as \`stack.<prefix>.base\` and becomes this
+stack's own base going forward, ahead of ${fl}stack.base${r} in every later
+resolution (a SHA/tag roots one-shot and remembers nothing). Errors if the
+prefix already has branches (use ${sub}add${r}). Checks out the new branch.
 
 On a TTY, a missing <prefix> or <slug> is prompted for (re-prompts on invalid
 input, keeping what you typed); off a TTY it's a usage error. A dirty tree
@@ -2450,9 +2453,9 @@ EOF
 ${b}usage:${r} git stack ${sub}pr sync${r} [${fl}--no-push${r}] [${fl}--ready${r}] [${fl}--dry-run${r}] [${fl}--no-template${r}]
 
 Sync the GitHub PR chain to the local stack. Pushes any unpushed branches,
-opens a draft PR for each (base = previous branch, or ${fl}stack.base${r} for the
-bottom), titled \`[N/M] <last commit subject>\`, with the repo's PR template as
-the body.
+opens a draft PR for each (base = previous branch, or the resolved base —
+${fl}stack.<prefix>.base${r} → ${fl}stack.base${r} → default — for the bottom), titled
+\`[N/M] <last commit subject>\`, with the repo's PR template as the body.
 
 On existing PRs, keeps the [N/M] prefix and a fenced stack-nav footer up to
 date. Re-run after any stack change. Requires \`gh\` authenticated for
@@ -2721,6 +2724,9 @@ ${b}Configuration:${r}
   git config stack.prefix <prefix>/
   git config stack.base <branch>     ${d}# parent branch for \`list\` (default:
                                        init.defaultBranch, then main, then master)${r}
+  git config stack.<prefix>.base <branch>  ${d}# per-stack base override, set by
+                                             \`create\`/\`restack --onto <branch>\`;
+                                             wins over stack.base for that stack${r}
   git config stack.historyKeep 100   ${d}# auto-prune older snapshots; 0 disables${r}
 EOF
 }
@@ -2811,12 +2817,57 @@ cmd_prefix() {
   detect_prefix
 }
 
+# ADR 0018: given an --onto target, print the bare branch name it denotes (local
+# or origin/<b>), stripping any origin/ prefix. Returns 1 for a SHA/tag/anything
+# that isn't a branch — those root one-shot and record no per-stack base.
+_stack_base_from_onto() {
+  local bare="${1#origin/}"
+  if git show-ref -q --verify "refs/remotes/origin/$bare" \
+     || git show-ref -q --verify "refs/heads/$bare"; then
+    printf '%s\n' "$bare"
+    return 0
+  fi
+  return 1
+}
+
+# ADR 0018: record (or clear) a stack's per-stack base. Writes stack.<prefix>.base
+# when <branch> differs from the resolved default; unsets it when equal, so the key
+# never merely restates the default. No-op on an empty <branch>.
+_stack_base_set() {
+  local prefix="$1" branch="$2"
+  [[ -n "$branch" ]] || return 0
+  local default_name=""
+  default_name=$(_resolve_parent_name 2>/dev/null || true)
+  if [[ "$branch" == "$default_name" ]]; then
+    git config --unset "stack.${prefix}.base" 2>/dev/null || true
+  else
+    git config "stack.${prefix}.base" "$branch"
+  fi
+}
+
 # Resolve the parent (base) branch name. Order:
-#   1. git config stack.base (e.g. "main", "develop")
-#   2. git config init.defaultBranch  (if such a local branch exists)
-#   3. local "main", then local "master"
+#   1. stack.<prefix>.base (ADR 0018), when a non-empty prefix is given
+#   2. git config stack.base (e.g. "main", "develop")
+#   3. git config init.defaultBranch  (if such a local branch exists)
+#   4. local "main", then local "master"
 # Prints the bare branch name (no "origin/" prefix), or returns 1.
 _resolve_parent_name() {
+  local prefix="${1-}"
+  # Tier 1 (ADR 0018): this stack's own base. A set-but-unresolvable value (parent
+  # merged + deleted) warns and falls through to the repo-global tiers below.
+  if [[ -n "$prefix" ]]; then
+    local pv=""
+    pv=$(git config --get "stack.${prefix}.base" 2>/dev/null || true)
+    if [[ -n "$pv" ]]; then
+      pv="${pv#origin/}"
+      if git show-ref -q --verify "refs/remotes/origin/$pv" \
+         || git show-ref -q --verify "refs/heads/$pv"; then
+        printf '%s\n' "$pv"
+        return 0
+      fi
+      warn "stack '${prefix}' base '$pv' no longer exists; falling back to the default (unset with: git config --unset \"stack.${prefix}.base\")"
+    fi
+  fi
   local cfg
   cfg=$(git config --get stack.base 2>/dev/null || true)
   if [[ -n "$cfg" ]]; then
@@ -2924,7 +2975,7 @@ _stack_overview_fields() {
     [[ -n "$current" && "$b" == "$current" ]] && { marker="*"; break; }
   done
   local base="" ahead="" behind="" base_name base_ref
-  if base_name=$(_resolve_parent_name) && base_ref=$(_resolve_parent_ref "$base_name"); then
+  if base_name=$(_resolve_parent_name "$prefix") && base_ref=$(_resolve_parent_ref "$base_name"); then
     base="$base_ref"
     if git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
       ahead=$(git rev-list --count "${base_ref}..refs/heads/${tip}" 2>/dev/null || echo "?")
@@ -3104,7 +3155,7 @@ cmd_view() {
   fi
 
   local parent_name parent_ref parent_state
-  if parent_name=$(_resolve_parent_name); then
+  if parent_name=$(_resolve_parent_name "$prefix"); then
     if parent_ref=$(_resolve_parent_ref "$parent_name"); then
       parent_state=$(_parent_state "${branches[0]}" "$parent_ref")
       printf '%sparent:%s %s%s%s  %s\n\n' \
@@ -3566,7 +3617,7 @@ cmd_clean() {
   # exists, falls back to a local trunk when offline, and is empty only when no
   # trunk resolves at all.
   local base_name="" base_ref=""
-  base_name=$(_resolve_parent_name 2>/dev/null) || base_name=""
+  base_name=$(_resolve_parent_name "$prefix" 2>/dev/null) || base_name=""
   if [[ -n "$base_name" ]]; then
     base_ref=$(_resolve_parent_ref "$base_name" 2>/dev/null) || base_ref=""
   fi
@@ -3906,6 +3957,15 @@ cmd_rename() {
     if [[ "$cfg_clean" == "$old_pfx" ]]; then
       git config stack.prefix "${new_pfx}/"
       log "  ${C_DIM}config:${C_RESET} stack.prefix -> ${new_pfx}/"
+    fi
+  fi
+
+  # ADR 0018: carry the per-stack base to the new prefix key.
+  if git config --get "stack.${old_pfx}/.base" >/dev/null 2>&1; then
+    if git config --rename-section "stack.${old_pfx}/" "stack.${new_pfx}/" 2>/dev/null; then
+      log "  ${C_DIM}config:${C_RESET} stack.${old_pfx}/.base -> stack.${new_pfx}/.base"
+    else
+      warn "could not migrate stack.${old_pfx}/.base to stack.${new_pfx}/ — set it manually"
     fi
   fi
 
@@ -4353,6 +4413,8 @@ _placement_resolve() {
 # ref. On success sets _PL_LEAF, _PL_PRED_REF, _PL_PRED_LABEL (an empty
 # placement predecessor means "use the stack base", resolved here).
 # Usage: _resolve_placement <cmd-context> <mode> <arg> <width> <branch>...
+# Reads `prefix` via bash dynamic scoping from its cmd_add caller's frame (not a
+# param); a future caller from another frame must have a `prefix` local in scope.
 _resolve_placement() {
   local cmd="$1"; shift
   local out rc=0
@@ -4376,7 +4438,7 @@ _resolve_placement() {
   local pred="${out#*$'\t'}"
   if [[ -z "$pred" ]]; then
     local parent_name
-    parent_name=$(_resolve_parent_name) \
+    parent_name=$(_resolve_parent_name "$prefix") \
       || die "$cmd: cannot determine parent branch (set stack.base or create main/master)"
     _PL_PRED_REF=$(_resolve_parent_ref "$parent_name") \
       || die "$cmd: cannot resolve parent ref for '$parent_name'"
@@ -4684,7 +4746,7 @@ cmd_add() {
   if (( ${#branches[@]} == 0 )) && (( n_pos == 0 )); then
     new_num=$(_next_leaf_num)
     local parent_name
-    parent_name=$(_resolve_parent_name) \
+    parent_name=$(_resolve_parent_name "$prefix") \
       || die "add: cannot determine parent branch (set stack.base or create main/master)"
     predecessor_ref=$(_resolve_parent_ref "$parent_name") \
       || die "add: cannot resolve parent ref for '$parent_name'"
@@ -4699,7 +4761,7 @@ cmd_add() {
     new_num="$_PICKED_LEAF_NUM"
     if [[ -z "$_PICKED_PREDECESSOR" ]]; then
       local parent_name
-      parent_name=$(_resolve_parent_name) \
+      parent_name=$(_resolve_parent_name "$prefix") \
         || die "add: cannot determine parent branch (set stack.base or create main/master)"
       predecessor_ref=$(_resolve_parent_ref "$parent_name") \
         || die "add: cannot resolve parent ref for '$parent_name'"
@@ -4953,6 +5015,17 @@ cmd_create() {
   _carry_finish
 
   log "${C_GREEN}create${C_RESET}  ${C_CYAN}${new_branch}${C_RESET} ${C_DIM}(off ${predecessor_label})${C_RESET}"
+
+  # ADR 0018: remember an explicit branch root so pr sync (and the rest) target it.
+  # A SHA/tag target records nothing. Always reconcile so a stale key from a prior
+  # stack under this reused prefix (create refuses a non-empty prefix, so any key
+  # here is stale) is cleared rather than silently inherited.
+  local _base_branch=""
+  if [[ -n "$OPT_ONTO" ]] && _base_branch=$(_stack_base_from_onto "$OPT_ONTO"); then
+    _stack_base_set "$prefix" "$_base_branch"
+  else
+    _stack_base_set "$prefix" "$(_resolve_parent_name)"
+  fi
 }
 
 cmd_move() {
@@ -5238,7 +5311,7 @@ move: no <branch> given and HEAD is detached"
       local prev_ref
       if (( cur_idx == 0 )); then
         local parent_name
-        parent_name=$(_resolve_parent_name) \
+        parent_name=$(_resolve_parent_name "$prefix") \
           || die "move: cannot determine parent branch (set stack.base or create main/master)"
         prev_ref=$(_resolve_parent_ref "$parent_name")
       else
@@ -5307,7 +5380,7 @@ move: no <branch> given and HEAD is detached"
   STACK_OPT_NO_SYNC="$OPT_NO_SYNC"
   if (( first_affected == 0 )); then
     local parent_name parent_ref
-    parent_name=$(_resolve_parent_name) \
+    parent_name=$(_resolve_parent_name "$prefix") \
       || die "move: cannot determine parent branch (set stack.base or create main/master)"
     parent_ref=$(_resolve_parent_ref "$parent_name") \
       || die "move: cannot resolve parent ref for '$parent_name'"
@@ -5921,7 +5994,7 @@ fold: no <branch> given and HEAD is detached"
   local base_ref
   if (( lo == 0 )); then
     local parent_name
-    parent_name=$(_resolve_parent_name) \
+    parent_name=$(_resolve_parent_name "$prefix") \
       || die "fold: cannot determine parent branch (set stack.base or create main/master)"
     base_ref=$(_resolve_parent_ref "$parent_name")
   else
@@ -6157,7 +6230,7 @@ drop: no <branch> given and HEAD is detached"
   local pred_ref pred_label is_base=0
   if (( victim_idx == 0 )); then
     local parent_name
-    parent_name=$(_resolve_parent_name) \
+    parent_name=$(_resolve_parent_name "$prefix") \
       || die "drop: cannot determine parent branch (set stack.base or create main/master)"
     pred_ref=$(_resolve_parent_ref "$parent_name") \
       || die "drop: cannot resolve parent ref for '$parent_name'"
@@ -6375,7 +6448,7 @@ cmd_doctor() {
   _load_stack_branches "$prefix" branches "no stack branches under '$prefix'"
 
   local parent_name parent_ref
-  parent_name=$(_resolve_parent_name) \
+  parent_name=$(_resolve_parent_name "$prefix") \
     || die "doctor: cannot determine parent branch (set stack.base or create main/master)"
   parent_ref=$(_resolve_parent_ref "$parent_name") \
     || die "doctor: cannot resolve parent ref for '$parent_name'"
@@ -6854,6 +6927,19 @@ cmd_restack() {
     return 0
   fi
 
+  # ADR 0018: a direct, whole-stack re-root remembers its new base. Gated so
+  # clean/amend internal restacks (they set _SNAPSHOT_SUPPRESS) and --from partial
+  # reflows never write; a SHA/tag target records nothing.
+  # Recorded BEFORE the reflow below on purpose, so the value survives a
+  # conflict-resolve-and-continue; tradeoff: a subsequent `git stack abort` leaves
+  # the key pointing at the intended base, not the pre-restack one.
+  if [[ -n "$OPT_ONTO" && "$from_idx" -eq 0 && "${_SNAPSHOT_SUPPRESS:-0}" -eq 0 ]]; then
+    local _base_branch=""
+    if _base_branch=$(_stack_base_from_onto "$OPT_ONTO"); then
+      _stack_base_set "$prefix" "$_base_branch"
+    fi
+  fi
+
   STACK_BRANCHES=("${branches[@]}")
   STACK_ORIG_SHAS=()
   local first_capture
@@ -7078,8 +7164,15 @@ cmd_pr_sync() {
   local M=${#branches[@]}
 
   local base0
-  base0=$(_resolve_parent_name) \
+  base0=$(_resolve_parent_name "$prefix") \
     || die "could not resolve stack base branch (set git config stack.base)"
+
+  # ADR 0018: a non-default base is only usable as a GitHub PR base if it's pushed.
+  # Only enforce when there's an origin to check against (offline/local repos skip).
+  if git remote get-url origin >/dev/null 2>&1 \
+     && ! git show-ref -q --verify "refs/remotes/origin/${base0}"; then
+    die "pr sync: base branch '${base0}' is not on origin; push it first (git push -u origin ${base0})"
+  fi
 
   # --- pass 0: push ---
   local b
@@ -7674,7 +7767,7 @@ cmd_pr_list() {
   _load_stack_branches "$prefix" branches "no stack branches found for prefix '$prefix'"
 
   local base0
-  base0=$(_resolve_parent_name) \
+  base0=$(_resolve_parent_name "$prefix") \
     || die "could not resolve stack base branch (set git config stack.base)"
 
   if (( opt_fetch )); then

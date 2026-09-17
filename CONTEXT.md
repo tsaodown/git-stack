@@ -53,9 +53,13 @@ stacks are width 2 (`01`). A stack has one width, derived from its first leaf.
 _Avoid_: padding, size.
 
 **Base**:
-The branch the whole stack sits on top of — `main`/`master` or `stack.base`.
-The lowest branch in the stack is rebased onto the base; everything else is
-rebased onto its **predecessor**.
+The branch the whole stack sits on top of. The lowest branch in the stack is
+rebased onto the base; everything else is rebased onto its **predecessor**.
+Resolved per-stack: `stack.<prefix>.base` (this stack's own base, set when a stack
+is rooted elsewhere via `create --onto` / `restack --onto`) → `stack.base` (a
+repo-global override) → `init.defaultBranch` → `main`/`master` (ADR 0018). A stale
+per-stack base — the parent merged and was deleted — warns and falls back to the
+default.
 _Avoid_: parent (see Flagged ambiguities), trunk, target, upstream.
 
 **Predecessor**:
@@ -209,9 +213,11 @@ hint.
 
 **create** `<prefix> <slug>`:
 Start a new stack — its first branch `prefix/<first-leaf>-slug` rooted on the
-**base** (`--onto <ref>` to root elsewhere). Refuses if the prefix already has
-branches (directs to **add**). Checks out the new branch. Replaces the bootstrap
-path of the old `new`.
+**base** (`--onto <ref>` to root elsewhere). When `--onto` names a branch, that
+choice is remembered as the stack's per-stack base (`stack.<prefix>.base`, ADR
+0018) so `pr sync` and the rest target it; a bare SHA/tag stays a one-shot root.
+Refuses if the prefix already has branches (directs to **add**). Checks out the new
+branch. Replaces the bootstrap path of the old `new`.
 
 **add** `<slug>`:
 Add a branch to the **current** stack (placement via flag or picker, as the old
@@ -262,10 +268,11 @@ are already threaded. When the base advanced, `clean` still announces it loudly
 (`base <base> moved <range>; restacking …`).
 
 The base is resolved with the **shared resolver** (`_resolve_parent_*`), so
-`clean` honors `stack.base` like every other verb, returns `origin/<base>` when a
-remote exists, and falls back to a local trunk when offline (no `--local` flag
-needed). With no trunk resolvable at all, it skips the bottom check and
-re-threads internal drift only, warning that it did not rebase onto a trunk.
+`clean` honors the per-stack base and `stack.base` like every other verb (ADR
+0018), returns `origin/<base>` when a remote exists, and falls back to a local
+trunk when offline (no `--local` flag needed). With no trunk resolvable at all, it
+skips the bottom check and re-threads internal drift only, warning that it did not
+rebase onto a trunk.
 
 Mutation order is plan-then-guard-then-mutate: the read-only walk computes the
 whole plan first; a planned reflow then requires a clean tree **before** any
@@ -293,7 +300,10 @@ clean vs **restack**: reach for `clean` to fix the whole stack (prune + remote
 cleanup + re-thread). Reach for `restack` for the surgical / offline cases it
 keeps exclusively: re-thread with **no network**, `--from <branch>` for a partial
 reflow, `--onto <ref>` to re-root onto an **arbitrary** ref (not the base), and
-`--push`. `restack` is also the internal primitive `amend` calls (ADR 0007).
+`--push`. A direct whole-stack `restack --onto <branch>` (from the bottom) also
+updates the stack's remembered base (ADR 0018); an internal `clean`/`amend`
+restack, a `--from` partial reflow, or a SHA/tag target does not. `restack` is also
+the internal primitive `amend` calls (ADR 0007).
 
 ### Branch-level
 

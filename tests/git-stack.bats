@@ -154,6 +154,55 @@ teardown() { teardown_repo; }
   assert_sha_eq feat/02-b "$(git rev-parse feat/01-a)"
 }
 
+# ADR 0018: a direct, whole-stack re-root (--onto with no --from, from_idx==0)
+# remembers its new base. Gated off for clean/amend's internal restacks and
+# for --from partial reflows; a SHA/tag --onto records nothing.
+@test "restack --onto <branch>: direct re-root rewrites the per-stack base" {
+  git checkout -q -B develop; printf 'dev\n' > dev-file; git add dev-file; git commit -q -m dev
+  git checkout -q -B release main; printf 'rel\n' > rel-file; git add rel-file; git commit -q -m rel
+  git checkout -q main
+  make_disjoint_stack feat 010-a 020-b
+  git config "stack.feat/.base" develop
+  git checkout -q feat/010-a
+  run git stack restack --onto release --no-color
+  assert_status 0
+  assert_eq "$(git config --get 'stack.feat/.base')" "release"
+}
+
+@test "restack --onto <sha>: records nothing" {
+  make_stack_branches feat 010-a 020-b
+  local sha; sha=$(git rev-parse main)
+  git checkout -q feat/010-a
+  run git stack restack --onto "$sha" --no-color
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+}
+
+@test "clean's internal reflow does not write a per-stack base" {
+  # Rooted on a non-default branch (feat-base, not main), and the pre-set key
+  # is spelled with an "origin/" prefix. If clean's internal restack ever wrote
+  # (gate removed), it would go through _stack_base_from_onto, which strips
+  # "origin/" before writing back — normalizing the key to bare "feat-base" and
+  # producing a real, detectable diff. A same-spelled pre-set value would make
+  # the write idempotent and this test vacuous, like the case it replaces.
+  git checkout -q -B feat-base; printf 'fb\n' > fb-file; git add fb-file; git commit -q -m fb
+  git checkout -q main
+  make_remote_origin
+  git push -q origin feat-base
+  git checkout -q feat-base
+  make_disjoint_stack feat 010-a 020-b
+  git config "stack.feat/.base" origin/feat-base
+
+  # advance + push feat-base so clean's whole-stack reflow reroots onto it
+  git checkout -q feat-base; printf 'fb2\n' >> fb-file; git add fb-file; git commit -q -m fb2
+  git push -q origin feat-base
+  git checkout -q feat/020-b
+
+  run git stack clean --no-color
+  assert_status 0
+  assert_eq "$(git config --get 'stack.feat/.base')" "origin/feat-base"
+}
+
 @test "amend: message-only amend with empty child reflows without spurious conflict" {
   # cmd_amend rewrites the parent BEFORE cmd_restack captures orig SHAs, so the
   # empty child's recorded orig no longer matches the parent's — the upfront
@@ -451,6 +500,17 @@ HOOK
   git rev-parse --verify --quiet refs/heads/newfeat/02-b
   run git rev-parse --verify --quiet refs/heads/feat/01-a
   [ "$status" -ne 0 ]
+}
+
+@test "rename: migrates stack.<prefix>.base to the new prefix" {
+  git checkout -q -B develop; git commit --allow-empty -q -m dev; git checkout -q main
+  make_stack_branches feat 010-a 020-b
+  git config "stack.feat/.base" develop
+  git checkout -q feat/010-a
+  run git stack rename feature --no-push
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+  assert_eq "$(git config --get 'stack.feature/.base')" "develop"
 }
 
 # ---------- detect_prefix error specificity ----------
@@ -1141,6 +1201,31 @@ HOOK
   [ "$creates" -eq 3 ]
 }
 
+@test "pr sync: bottom PR targets the per-stack base, not main" {
+  git checkout -q -B develop
+  printf 'dev\n' >> file; git add file; git commit -q -m dev
+  make_stack_branches feat 010-foo 020-bar
+  make_remote_origin
+  git config "stack.feat/.base" develop
+  run git stack pr sync --no-color
+  assert_status 0
+  assert_output_contains "feat/010-foo -> develop"
+  assert_output_contains "feat/020-bar -> feat/010-foo"
+  gh_log_grep "pr create" | grep -- "--head feat/010-foo" | grep -q -- "--base develop"
+}
+
+@test "pr sync: fails clearly when the per-stack base is not on origin" {
+  make_stack_branches feat 010-a 020-b
+  make_remote_origin
+  git branch develop main            # local only, never pushed
+  git config "stack.feat/.base" develop
+  git checkout -q feat/020-b
+  run git stack pr sync --no-color
+  refute [ "$status" -eq 0 ]
+  assert_output_contains "develop"
+  assert_output_contains "origin"
+}
+
 @test "pr sync: idempotent re-run makes no remote changes" {
   make_stack_branches feat 01-foo 02-bar 03-baz
   make_remote_origin
@@ -1276,6 +1361,7 @@ HOOK
   # No make_remote_origin — branches don't exist on origin
   git init -q --bare "${TEST_REPO}.origin"
   git remote add origin "${TEST_REPO}.origin"
+  git push -q origin main          # base on origin; the stack branches stay unpushed
   run git stack pr sync --no-push --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"not synced on origin"* ]]
@@ -2581,6 +2667,60 @@ $old_footer"
   [ "$(git rev-parse exp/010-e1)" = "$onto" ]
 }
 
+@test "create --onto <branch>: records stack.<prefix>.base" {
+  git checkout -q -B develop; git commit --allow-empty -q -m dev; git checkout -q main
+  run git stack create feat myslug --onto develop
+  assert_status 0
+  assert_eq "$(git config --get 'stack.feat/.base')" "develop"
+}
+
+@test "create onto default: records nothing" {
+  run git stack create feat myslug
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+}
+
+@test "create --onto <sha>: records nothing (one-shot root)" {
+  local sha; sha=$(git rev-parse HEAD)
+  run git stack create feat myslug --onto "$sha"
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+}
+
+# A key present at create time can only be stale: create refuses a prefix that
+# already has branches, so nothing under this prefix wrote it this time around.
+@test "create: clears a stale per-stack base left by a prior (merged/drained) stack" {
+  git checkout -q -B develop; git commit --allow-empty -q -m dev; git checkout -q main
+  git config "stack.feat/.base" develop
+  run git stack create feat myslug --no-color
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+  # The stale key must not leak into where the branch is actually rooted either:
+  # create resolves its starting point with the no-arg (global-default) resolver,
+  # never the stale tier-1 key, so the new branch sits on main, not develop.
+  assert_eq "$(git rev-parse feat/010-myslug)" "$(git rev-parse main)"
+}
+
+@test "create --onto <sha>: clears a stale per-stack base too" {
+  git checkout -q -B develop; git commit --allow-empty -q -m dev; git checkout -q main
+  git config "stack.feat/.base" develop
+  local sha; sha=$(git rev-parse HEAD)
+  run git stack create feat myslug --onto "$sha" --no-color
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+}
+
+@test "create --onto then pr sync: bottom PR targets the recorded base end-to-end" {
+  git checkout -q -B develop; printf 'dev\n' >> file; git add file; git commit -q -m dev
+  git checkout -q main
+  git stack create feat myslug --onto develop
+  printf 'work\n' >> file; git add file; git commit -q -m work
+  make_remote_origin
+  run git stack pr sync --no-color
+  assert_status 0
+  assert_output_contains "-> develop"
+}
+
 # ---------- add / create: carry a dirty tree onto the new branch ----------
 
 @test "add: dirty tree on the top branch is carried onto the new branch (at-HEAD, no stash)" {
@@ -3546,6 +3686,18 @@ make_disjoint_stack() {
   assert_branch_parent_is feat/02-b "$base_sha"
   refute git cat-file -e "feat/02-b:01-a-file"
   assert git cat-file -e "feat/03-c:03-c-file"
+}
+
+@test "drop bottom: children reflow onto the per-stack base" {
+  git checkout -q -B develop; printf 'dev\n' >> dev-file; git add dev-file; git commit -q -m dev
+  local dev_sha; dev_sha=$(git rev-parse HEAD)
+  make_disjoint_stack feat 010-a 020-b
+  git config "stack.feat/.base" develop
+  git checkout -q feat/010-a
+  run git stack drop --yes --no-color
+  assert_status 0
+  # feat/020-b is now the bottom; its first commit must sit directly on develop.
+  assert_branch_parent_is feat/020-b "$dev_sha"
 }
 
 @test "drop: tip branch is a pure delete; HEAD lands on predecessor" {
@@ -4771,4 +4923,57 @@ make_conflicting_dups() {
   run git stack __complete bogus-kind
   assert_status 0
   assert_eq "$output" "" "unknown kind"
+}
+
+# ---------- ADR 0018: per-stack base resolver ----------
+
+@test "resolve_parent_name: per-stack base wins when set and resolvable" {
+  git checkout -q -B develop
+  git commit --allow-empty -q -m dev
+  git config "stack.feat/.base" develop
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _resolve_parent_name "$1"' _ "feat/"
+  assert_status 0
+  assert_eq "$output" "develop"
+}
+
+@test "resolve_parent_name: no prefix arg ignores per-stack keys" {
+  git config "stack.feat/.base" develop
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _resolve_parent_name'
+  assert_status 0
+  assert_eq "$output" "main"
+}
+
+@test "resolve_parent_name: gone per-stack base warns and falls back to default" {
+  git config "stack.feat/.base" long-gone-branch
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _resolve_parent_name "$1" 2>/dev/null' _ "feat/"
+  assert_status 0
+  assert_eq "$output" "main"
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _resolve_parent_name "$1" 2>&1 >/dev/null' _ "feat/"
+  assert_output_contains "no longer exists"
+}
+
+@test "stack_base_from_onto: local branch, origin branch, and non-branch" {
+  git checkout -q -B develop; git checkout -q main
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _stack_base_from_onto "$1"' _ develop
+  assert_status 0
+  assert_eq "$output" "develop"
+
+  git update-ref refs/remotes/origin/rel "$(git rev-parse HEAD)"
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _stack_base_from_onto "$1"' _ origin/rel
+  assert_status 0
+  assert_eq "$output" "rel"
+
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _stack_base_from_onto "$1"' _ "$(git rev-parse HEAD)"
+  assert_status 1
+}
+
+@test "stack_base_set: writes when non-default, unsets when default" {
+  git checkout -q -B develop; git checkout -q main
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _stack_base_set "$1" "$2"' _ "feat/" develop
+  assert_status 0
+  assert_eq "$(git config --get 'stack.feat/.base')" "develop"
+
+  run env GIT_STACK_BIN_DIR="$GIT_STACK_BIN_DIR" bash -c 'source "${GIT_STACK_BIN_DIR}/git-stack"; _stack_base_set "$1" "$2"' _ "feat/" main
+  assert_status 0
+  refute git config --get "stack.feat/.base"
 }
