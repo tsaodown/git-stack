@@ -293,7 +293,9 @@ with extras it can't prove merged (genuinely unmerged own work) makes `clean`
 **refuse atomically in the pre-flight**, before any prune — pointing at
 squash/rebase-then-retry, with `restack --onto <base> --force` as the explicit
 deliberate-drop escape. There is no `clean --force`; force stays in `restack`.
-Replaces `close` and the `gstkcl`/`gstkrom`/`gstkromp` shell helpers.
+Replaces the `close` verb. (Post-ADR-0018 `clean` reflows onto the stack's *own*
+base, not necessarily the trunk; the old `gstkrom` "re-root onto the repo default"
+is now `restack --onto-default` — ADR 0019.)
 _Avoid_: "close" (the prune-only predecessor).
 
 clean vs **restack**: reach for `clean` to fix the whole stack (prune + remote
@@ -421,8 +423,10 @@ than a bare unknown-subcommand.
 
 `gstkcr` create · `gstkad` add · `gstkp` pick · `gstkl` list · `gstkv` view ·
 `gstkco` checkout · `gstks` sync · `gstkcl` clean · `gstkdr` drop ·
-`gstkab` abort · `gstkcon` continue. Dropped: `gstkn` (was new), `gstkpa` (push --all),
-`gstkrom`/`gstkromp`, and the `gstkcl` *shell function* (now the `clean` verb).
+`gstkab` abort · `gstkcon` continue · `gstkrom` restack --onto-default.
+Dropped: `gstkn` (was new), `gstkpa` (push --all), `gstkromp`, and the `gstkcl`
+*shell function* (now the `clean` verb). `gstkrom` returned in ADR 0019 as a plain
+alias into the `restack --onto-default` verb (not the old compound shell helper).
 `gstkp` moves from push to pick; `gstks` moves from status to sync.
 Added later: `gstkrsl` reslug — deliberately not `gstkrs`, which reads as a
 member of the `gstkr`/`gstkrp`/`gstkro` restack family (`gstkr` + one modifier

@@ -15,6 +15,7 @@ OPT_NO_SYNC=0
 OPT_NO_PUSH=0
 OPT_FROM=""
 OPT_ONTO=""
+OPT_ONTO_DEFAULT=0
 OPT_PREFIX=""
 REMAINING_ARGS=()
 
@@ -436,6 +437,7 @@ parse_common_flags() {
   OPT_NO_PUSH=0
   OPT_FROM=""
   OPT_ONTO=""
+  OPT_ONTO_DEFAULT=0
   OPT_PREFIX=""
   REMAINING_ARGS=()
   while (( $# > 0 )); do
@@ -446,6 +448,7 @@ parse_common_flags() {
       --no-push)    OPT_NO_PUSH=1; shift ;;
       --from)       shift; [[ $# -gt 0 ]] || die "--from needs an argument"; OPT_FROM="$1"; shift ;;
       --onto)       shift; [[ $# -gt 0 ]] || die "--onto needs an argument"; OPT_ONTO="$1"; shift ;;
+      --onto-default) OPT_ONTO_DEFAULT=1; shift ;;
       --prefix)     shift; [[ $# -gt 0 ]] || die "--prefix needs an argument"; OPT_PREFIX="$1"; shift ;;
       --color)      USE_COLOR_PREF="always"; color_init; shift ;;
       --no-color)   USE_COLOR_PREF="never";  color_init; shift ;;
@@ -2403,11 +2406,13 @@ EOF
       ;;
     restack)
       cat <<EOF
-${b}usage:${r} git stack ${sub}restack${r} [${fl}--from${r} <branch>] [${fl}--onto${r} <ref>] [${fl}--push${r}] [${fl}--force${r}]
+${b}usage:${r} git stack ${sub}restack${r} [${fl}--from${r} <branch>] [${fl}--onto${r} <ref> | ${fl}--onto-default${r}] [${fl}--push${r}] [${fl}--force${r}]
 
 Reset+cherry-pick ${fl}--from${r} (default: current branch's child) and each branch
 above it onto its predecessor's new HEAD. With ${fl}--onto${r} <ref>, rebase ${fl}--from${r}
-(default: bottom of stack) onto <ref> first, then propagate up. With ${fl}--push${r},
+(default: bottom of stack) onto <ref> first, then propagate up. ${fl}--onto-default${r}
+(alias ${d}gstkrom${r}) best-effort fetches the repo default and re-roots the whole
+stack onto ${d}origin/<default>${r}, clearing any per-stack base override. With ${fl}--push${r},
 force-with-lease push each branch as it finishes.
 
 Refuses if any branch has more than one commit since its predecessor; pass
@@ -3466,8 +3471,10 @@ _confirm() {
 
 # Tidy a stack: prune local branches whose upstream is [gone], delete remote
 # branches under the prefix that have no local counterpart (confirm-gated —
-# declining skips only that step), then reflow the survivors onto
-# origin/<default>. Replaces `close` + the old `gstkcl`/`gstkrom` helpers.
+# declining skips only that step), then reflow the survivors onto the stack's
+# base (stack.<prefix>.base → origin/<default>). Replaces the old `close` verb.
+# (Re-rooting onto the repo default specifically — the old `gstkrom` — is
+# `restack --onto-default`; ADR 0018 made clean honor the per-stack base instead.)
 # Walk the survivors and report the lowest index at which a branch is no longer
 # threaded on its predecessor's tip (pred_tip(0)=base_ref, pred_tip(i)=tip of
 # survivor[i-1]). Echoes that index, or nothing when the whole stack is threaded.
@@ -6887,6 +6894,27 @@ cmd_restack() {
   require_clean_tree
   require_no_op_in_progress
 
+  # ADR 0019: `--onto-default` (alias gstkrom) re-roots the whole stack onto the
+  # freshly-fetched repo default, reversing a per-stack base override. It resolves
+  # an --onto target and then rides the ordinary --onto path — which is also what
+  # resets stack.<prefix>.base, since that target is the repo default.
+  if (( OPT_ONTO_DEFAULT )); then
+    [[ -z "$OPT_ONTO" ]] || die "--onto-default cannot be combined with --onto"
+    local _default
+    _default=$(_resolve_parent_name) \
+      || die "--onto-default: cannot determine the default branch (set stack.base or create main/master)"
+    # Best-effort refresh: an unreachable remote must not abort the restack — we
+    # fall back to whatever origin/<default> (or the local branch) already points
+    # at. Git's own stderr is left visible so a rejected update is never silent.
+    git fetch --quiet origin "$_default" \
+      || warn "could not fetch origin/$_default; restacking onto the existing ref"
+    if git show-ref -q --verify "refs/remotes/origin/$_default"; then
+      OPT_ONTO="origin/$_default"
+    else
+      OPT_ONTO="$_default"
+    fi
+  fi
+
   local prefix
   prefix=$(detect_prefix "$OPT_PREFIX")
   local branches=()
@@ -8281,6 +8309,7 @@ alias gstkcl='git stack clean'
 alias gstkr='git stack restack'
 alias gstkrp='git stack restack --push'
 alias gstkro='git stack restack --onto'
+alias gstkrom='git stack restack --onto-default'
 alias gstkcon='git stack continue'
 alias gstkab='git stack abort'
 alias gstkam='git stack amend'
@@ -8314,6 +8343,7 @@ abbr -a -g gstkcl git stack clean
 abbr -a -g gstkr git stack restack
 abbr -a -g gstkrp git stack restack --push
 abbr -a -g gstkro git stack restack --onto
+abbr -a -g gstkrom git stack restack --onto-default
 abbr -a -g gstkcon git stack continue
 abbr -a -g gstkab git stack abort
 abbr -a -g gstkam git stack amend

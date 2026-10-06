@@ -44,7 +44,8 @@ Either path puts a single executable on your `PATH`.
 ## Shell integration
 
 `git stack` ships short aliases — one per verb (`gstkcr` create, `gstkad` add,
-`gstkv` view, `gstks` sync, `gstkcl` clean, `gstkr` restack, `gstkam` amend, …).
+`gstkv` view, `gstks` sync, `gstkcl` clean, `gstkr` restack, `gstkam` amend,
+`gstkrom` restack onto the fresh repo default, …).
 To install them, add the line for your shell and reload:
 
 **bash** — append to `~/.bashrc`:

@@ -178,6 +178,81 @@ teardown() { teardown_repo; }
   refute git config --get "stack.feat/.base"
 }
 
+# ADR 0019: `restack --onto-default` (alias gstkrom) best-effort fetches the repo
+# default, re-roots the whole stack onto origin/<default>, and — because it targets
+# the repo default — resets the per-stack base back to it.
+@test "restack --onto-default: resets the per-stack base to the repo default" {
+  git checkout -q -B develop; printf 'dev\n' > dev-file; git add dev-file; git commit -q -m dev
+  git checkout -q main
+  make_disjoint_stack feat 010-a 020-b
+  git config "stack.feat/.base" develop
+  git checkout -q feat/010-a
+  run git stack restack --onto-default --no-color
+  assert_status 0
+  refute git config --get "stack.feat/.base"
+}
+
+@test "restack --onto-default: fetches, then reroots onto the advanced origin/<default>" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  local old; old=$(git rev-parse origin/main)
+  # Advance main, push it, but force the local remote-tracking ref back to stale so
+  # only an in-command fetch can discover the new tip.
+  git checkout -q main
+  printf 'base\n' >> base.txt; git add base.txt; git commit -q -m "advance main"
+  local new; new=$(git rev-parse main)
+  git push -q origin main
+  git update-ref refs/remotes/origin/main "$old"
+  git reset -q --hard "$old"
+  git checkout -q feat/01-a
+  run git stack restack --onto-default --no-color
+  assert_status 0
+  assert_branch_parent_is feat/01-a "$new"
+}
+
+@test "restack --onto-default: fetch failure still reroots onto the local origin/<default>" {
+  make_stack_branches feat 01-a 02-b
+  make_remote_origin
+  git fetch -q origin main
+  local base; base=$(git rev-parse origin/main)
+  git remote set-url origin /no/such/repo
+  git checkout -q feat/01-a
+  run git stack restack --onto-default --no-color
+  assert_status 0
+  assert_output_contains "could not fetch"
+  assert_branch_parent_is feat/01-a "$base"
+}
+
+@test "restack --onto-default: falls back to local <default> when origin/<default> is absent" {
+  make_stack_branches feat 01-a 02-b
+  local base; base=$(git rev-parse main)
+  git checkout -q feat/01-a
+  run git stack restack --onto-default --no-color
+  assert_status 0
+  assert_branch_parent_is feat/01-a "$base"
+}
+
+@test "restack --onto-default: honors stack.base over the trunk" {
+  # The resolved default is repo-global (stack.base → init.defaultBranch → main),
+  # so in a stack.base=develop repo --onto-default lands on develop, not main.
+  git checkout -q -B develop; printf 'dev\n' > dev-file; git add dev-file; git commit -q -m dev
+  git checkout -q main
+  make_disjoint_stack feat 010-a 020-b
+  git config stack.base develop
+  git checkout -q feat/010-a
+  run git stack restack --onto-default --no-color
+  assert_status 0
+  assert_branch_parent_is feat/010-a "$(git rev-parse develop)"
+}
+
+@test "restack --onto-default: rejects a combined --onto <ref>" {
+  make_stack_branches feat 01-a 02-b
+  git checkout -q feat/01-a
+  run git stack restack --onto-default --onto main --no-color
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"onto-default"* ]]
+}
+
 @test "clean's internal reflow does not write a per-stack base" {
   # Rooted on a non-default branch (feat-base, not main), and the pre-set key
   # is spelled with an "origin/" prefix. If clean's internal restack ever wrote
@@ -2304,7 +2379,9 @@ $old_footer"
   [[ "$output" == *"alias gstkv='git stack view'"* ]]
   [[ "$output" == *"alias gstkam='git stack amend'"* ]]
   [[ "$output" == *"alias gstkcl='git stack clean'"* ]]
-  # gstkcl is now a plain alias (the clean verb), no longer a shell function.
+  [[ "$output" == *"alias gstkrom='git stack restack --onto-default'"* ]]
+  # Aliases only, never shell functions (ADR 0001 invariant): gstkrom is a plain
+  # alias into the --onto-default verb, gstkcl is the clean verb.
   [[ "$output" != *"gstkrom()"* ]]
   [[ "$output" != *"gstkromp()"* ]]
   [[ "$output" != *"gstkcl()"* ]]
@@ -2343,8 +2420,8 @@ $old_footer"
   assert_output_contains "abbr -a -g gstk git stack"
   assert_output_contains "abbr -a -g gstkcl git stack clean"
   assert_output_contains "abbr -a -g gstkcr git stack create"
-  # No removed helpers and no bash-style function definitions.
-  refute grep -qF "gstkrom" <<<"$output"
+  assert_output_contains "abbr -a -g gstkrom git stack restack --onto-default"
+  # gstkrom is a plain abbr, never a bash-style function definition.
   refute grep -qF "function gstkcl" <<<"$output"
   refute grep -qF "gstkrom()" <<<"$output"
 }
@@ -2375,14 +2452,15 @@ $old_footer"
   [[ "$output" == *"unsupported shell"* ]]
 }
 
-@test "init bash: alias count matches the verb map (26, no shell functions)" {
-  # 26 simple aliases; no compound shell functions after the redesign.
+@test "init bash: alias count matches the verb map (27, no shell functions)" {
+  # 27 simple aliases; no compound shell functions (ADR 0001 invariant, kept when
+  # gstkrom returned as a plain alias into --onto-default per ADR 0019).
   run git stack init bash
   [ "$status" -eq 0 ]
   local alias_count func_count
   alias_count=$(printf '%s\n' "$output" | grep -c '^alias gstk' || true)
   func_count=$(printf '%s\n' "$output" | grep -c '^gstk.*()' || true)
-  [ "$alias_count" -eq 26 ]
+  [ "$alias_count" -eq 27 ]
   [ "$func_count" -eq 0 ]
 }
 

@@ -2,6 +2,7 @@
 
 - **Status:** Implemented (2026-06-01)
 - **Context doc:** [CONTEXT.md → Commands](../../CONTEXT.md#commands)
+- **Superseded in part:** [ADR 0019](0019-restack-onto-default.md) restores `gstkrom` as `restack --onto-default` (ADR 0018 voided the "`clean` covers it" premise behind dropping it)
 
 ## Context
 
