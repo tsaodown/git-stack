@@ -226,14 +226,16 @@ clean`, which fetches, prunes, and reflows onto `origin/<default>` in one verb.
 ## Configuration
 
 ```sh
-git config stack.prefix feat/        # override prefix auto-detection
-git config stack.base main           # the base branch the stack sits on (default: main/master)
-git config stack.historyKeep 100     # auto-prune snapshots older than the Nth (0 disables)
+git config stack.prefix feat/          # override prefix auto-detection
+git config --global stack.namespace eft # prepend eft/ to prefixes you type in create/rename
+git config stack.base main             # the base branch the stack sits on (default: main/master)
+git config stack.historyKeep 100       # auto-prune snapshots older than the Nth (0 disables)
 ```
 
 | Key | Effect | Default |
 |-----|--------|---------|
 | `stack.prefix` | Force the [prefix](concepts.md#prefix) instead of auto-detecting from the current branch | auto-detect |
+| `stack.namespace` | Root prepended to prefixes you type in `create`/`rename`, so `create feat auth` → `eft/feat/010-auth`; lead with `/` to escape it for one stack | none |
 | `stack.base` | The [base](concepts.md#base) branch the stack rebases onto | `init.defaultBranch` → `main` → `master` |
 | `stack.historyKeep` | How many [snapshots](concepts.md#snapshot) to retain before auto-pruning | `100` (`0` disables) |
 

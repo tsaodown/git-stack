@@ -489,7 +489,7 @@ a branch is checked out elsewhere, or any target name already exists.
 It then renames the pushed branches on the remote too, so nothing is left stranded
 under the old prefix. That remote half matters more here than elsewhere: a branch
 `move` leaves its stale remote in the *same* prefix, where [`clean`](#7-the-bottom-pr-merged)
-reaps it — but an old *prefix* is a namespace `clean` never scans, so `rename` has
+reaps it — but an old *prefix* is one `clean` never scans, so `rename` has
 to collect its own litter. `--no-push` skips it.
 
 **`rename` never syncs PRs.** Republishing is always an explicit `pr sync`. Since

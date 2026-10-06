@@ -9,6 +9,14 @@ GIT_STACK_TEST_BIN_DIR="${BATS_TEST_DIRNAME}/bin"
 setup_repo() {
   TEST_REPO=$(mktemp -d)
   cd "$TEST_REPO"
+  # Isolate the runner's real git config: tests assert on bare prefixes, so a
+  # developer's own global `stack.namespace` (or any global/system key) must not
+  # leak in. An empty per-test global file + no system config keeps runs
+  # deterministic whether or not the dev has set the feature's own key.
+  TEST_GIT_CONFIG_GLOBAL="${TEST_REPO}.gitconfig-global"
+  : > "$TEST_GIT_CONFIG_GLOBAL"
+  export GIT_CONFIG_GLOBAL="$TEST_GIT_CONFIG_GLOBAL"
+  export GIT_CONFIG_NOSYSTEM=1
   # gh stub first so it shadows any real gh; git-stack bin second.
   PATH="${GIT_STACK_TEST_BIN_DIR}:${GIT_STACK_BIN_DIR}:$PATH"
   export PATH
@@ -36,6 +44,9 @@ teardown_repo() {
   fi
   if [[ -n "${GH_STUB_DIR-}" && -d "$GH_STUB_DIR" ]]; then
     rm -rf "$GH_STUB_DIR"
+  fi
+  if [[ -n "${TEST_GIT_CONFIG_GLOBAL-}" && -f "$TEST_GIT_CONFIG_GLOBAL" ]]; then
+    rm -f "$TEST_GIT_CONFIG_GLOBAL"
   fi
 }
 

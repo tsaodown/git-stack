@@ -588,6 +588,37 @@ HOOK
   assert_eq "$(git config --get 'stack.feature/.base')" "develop"
 }
 
+@test "rename: stack.namespace prepends to the new prefix (ADR 0020)" {
+  git config stack.namespace eft
+  make_stack_branches eft/old 010-a 020-b
+  git checkout -q eft/old/010-a
+  run git stack rename new --no-push --no-color
+  assert_status 0
+  assert_branch_exists "eft/new/010-a"
+  assert_branch_exists "eft/new/020-b"
+  assert_branch_absent "eft/old/010-a"
+}
+
+@test "rename: a leading / escapes the namespace" {
+  git config stack.namespace eft
+  make_stack_branches eft/old 010-a 020-b
+  git checkout -q eft/old/010-a
+  run git stack rename /flat --no-push --no-color
+  assert_status 0
+  assert_branch_exists "flat/010-a"
+  assert_branch_absent "eft/flat/010-a"
+}
+
+@test "rename: refuses a new prefix that is just the namespace root" {
+  git config stack.namespace eft
+  make_stack_branches eft/old 010-a 020-b
+  git checkout -q eft/old/010-a
+  run git stack rename eft --no-push --no-color
+  assert_status 1
+  assert_output_contains "namespace root"
+  assert_branch_exists "eft/old/010-a"
+}
+
 # ---------- detect_prefix error specificity ----------
 
 @test "detect_prefix: detached HEAD message" {
@@ -2732,6 +2763,63 @@ $old_footer"
   run git stack create --no-color
   [ "$status" -ne 0 ]
   [[ "$output" == *"usage: git stack create"* ]]
+}
+
+@test "create: stack.namespace prepends to a typed prefix (ADR 0020)" {
+  git config stack.namespace eft
+  run git stack create feat auth --no-color
+  assert_status 0
+  assert_branch_exists "eft/feat/010-auth"
+  assert_eq "$(git symbolic-ref --short HEAD)" "eft/feat/010-auth" HEAD
+}
+
+@test "create: a leading / escapes the namespace" {
+  git config stack.namespace eft
+  run git stack create /hotfix urgent --no-color
+  assert_status 0
+  assert_branch_exists "hotfix/010-urgent"
+  assert_branch_absent "eft/hotfix/010-urgent"
+}
+
+@test "create: an already-namespaced prefix is not doubled" {
+  git config stack.namespace eft
+  run git stack create eft/feat auth --no-color
+  assert_status 0
+  assert_branch_exists "eft/feat/010-auth"
+  assert_branch_absent "eft/eft/feat/010-auth"
+}
+
+@test "create: refuses a prefix that is just the namespace root" {
+  git config stack.namespace eft
+  run git stack create eft auth --no-color
+  assert_status 1
+  assert_output_contains "namespace root"
+}
+
+@test "create: a leading / roots a stack at the namespace root itself" {
+  git config stack.namespace eft
+  run git stack create /eft auth --no-color
+  assert_status 0
+  assert_branch_exists "eft/010-auth"
+}
+
+@test "create: a multi-segment namespace is prepended whole" {
+  git config stack.namespace team/eft
+  run git stack create feat auth --no-color
+  assert_status 0
+  assert_branch_exists "team/eft/feat/010-auth"
+}
+
+@test "create: no namespace set leaves the typed prefix unchanged" {
+  run git stack create feat auth --no-color
+  assert_status 0
+  assert_branch_exists "feat/010-auth"
+}
+
+@test "create: no namespace set still rejects a leading / (back-compat)" {
+  run git stack create /hotfix urgent --no-color
+  assert_status 1
+  assert_output_contains "must not start with /"
 }
 
 @test "create --onto: roots the first branch on the given ref" {

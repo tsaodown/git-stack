@@ -28,8 +28,22 @@ _Avoid_: series, chain (reserve "chain" for the **PR chain** on GitHub).
 
 **Prefix**:
 The shared leading segment of a stack's branch names — everything before the
-leaf (e.g. `feat/` in `feat/010-auth`).
-_Avoid_: namespace, group.
+leaf (e.g. `feat/` in `feat/010-auth`). The prefix *is* the stack's name: it is
+what you type as the first argument to **create**, and what identifies which
+stack a branch belongs to.
+_Avoid_: group.
+
+**Namespace**:
+A personal root prepended to every typed **prefix**, set by `git config
+stack.namespace` (usually `--global`, e.g. `eft`). Distinct from the prefix: it
+sits *above* every stack name, so `create feat auth` under `stack.namespace=eft`
+lands on `eft/feat/010-auth` without you retyping `eft/` (ADR 0020). Expansion
+is idempotent (an already-rooted `eft/feat` is left alone) and a leading `/`
+escapes it (`create /hotfix …` roots outside the namespace; `create /eft …` is
+the explicit way to root a stack *at* the root). Typing just the root (`eft`,
+`eft/`, or Enter on the prefilled prompt) names no stack under it and is refused.
+Only typed prefixes are expanded — **create** and **rename** args/prompts; never
+auto-detected or stored prefixes, which are already full.
 
 **Leaf**:
 The numeric segment that orders a branch within its stack (the `010` in
@@ -217,7 +231,8 @@ Start a new stack — its first branch `prefix/<first-leaf>-slug` rooted on the
 choice is remembered as the stack's per-stack base (`stack.<prefix>.base`, ADR
 0018) so `pr sync` and the rest target it; a bare SHA/tag stays a one-shot root.
 Refuses if the prefix already has branches (directs to **add**). Checks out the new
-branch. Replaces the bootstrap path of the old `new`.
+branch. Replaces the bootstrap path of the old `new`. The typed prefix is expanded
+under the **namespace** (ADR 0020) before anything else.
 
 **add** `<slug>`:
 Add a branch to the **current** stack (placement via flag or picker, as the old
@@ -393,7 +408,7 @@ _Avoid_: "rename" unqualified (that is the prefix verb), relabel, retitle.
 `rename`, `restack`, `amend`, `continue`, `abort`, `doctor`, `history`,
 and `pr sync` / `pr list` keep their current meanings, except that **rename** no
 longer runs **pr sync** (ADR 0013): it renames local *and* remote refs — a
-renamed **prefix**'s stale remotes land in a namespace **clean** never scans, so
+renamed **prefix**'s stale remotes land under a prefix **clean** never scans, so
 nothing else would reap them — then stops, leaving republishing to an explicit
 **pr sync**. Its `--allow-pr-rebuild` is removed (nothing rebuilds), and its
 open-PR guard now points at the **pr desync** trio. **move** is **fully

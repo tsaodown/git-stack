@@ -40,7 +40,19 @@ bootstrap). See the command vocabulary in
 
 The shared leading segment of a stack's branch names — everything before the
 leaf. In `feat/010-auth` the prefix is `feat/`. A stack has exactly one prefix;
-renaming it (`git stack rename`) moves the whole stack at once.
+renaming it (`git stack rename`) moves the whole stack at once. The prefix is
+the stack's name: it's the first thing you type at `create`.
+
+## Namespace
+
+A personal root prepended to every prefix you type, set with `git config
+--global stack.namespace <root>` (e.g. `eft`). It sits *above* the prefix: with
+`stack.namespace=eft`, `create feat auth` lands on `eft/feat/010-auth` — you
+name the stack `feat` and skip retyping `eft/`. It applies only to prefixes you
+type in `create`/`rename`; a leading `/` (`create /hotfix …`) escapes it for a
+one-off stack outside the namespace (`create /eft …` roots one *at* the root).
+Typing just the root itself (`eft`) names no stack under it and is refused.
+Unset by default.
 
 ## Leaf
 

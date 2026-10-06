@@ -2345,8 +2345,12 @@ stack's own base going forward, ahead of ${fl}stack.base${r} in every later
 resolution (a SHA/tag roots one-shot and remembers nothing). Errors if the
 prefix already has branches (use ${sub}add${r}). Checks out the new branch.
 
+If ${fl}stack.namespace${r} is set, <prefix> is prepended with that root (e.g. \`eft\`), so
+you type only the stack name; lead with / to root one stack outside it.
+
 On a TTY, a missing <prefix> or <slug> is prompted for (re-prompts on invalid
-input, keeping what you typed); off a TTY it's a usage error. A dirty tree
+input, keeping what you typed; the prefix prompt prefills the namespace); off a
+TTY it's a usage error. A dirty tree
 prompts to carry the uncommitted work into the new stack; ${fl}--stash${r} carries it
 without prompting (required to carry non-interactively).
 EOF
@@ -2537,11 +2541,12 @@ ${b}usage:${r} git stack ${sub}rename${r} <new-prefix> [${fl}--dry-run${r}] [${f
 
 Atomically rename every branch in the stack from <old>/<leaf> to <new>/<leaf>,
 carrying backup refs along by default. Refuses if state file exists, branch
-checked out elsewhere, or any target name collides.
+checked out elsewhere, or any target name collides. If ${fl}stack.namespace${r} is set,
+<new-prefix> is prepended with that root (lead with / to escape it).
 
 Then renames the pushed branches on the remote, so nothing is left orphaned
-under the old prefix — unlike a reordered branch, whose stale remote stays in
-the same namespace for ${sub}clean${r} to reap, a renamed prefix's would land where
+under the old prefix — unlike a reordered branch, whose stale remote stays
+under the same prefix for ${sub}clean${r} to reap, a renamed prefix's would land where
 ${sub}clean${r} never looks. ${fl}--no-push${r} skips that remote half.
 
 ${b}Never syncs PRs${r}: republishing is always an explicit ${sub}pr sync${r}. Refuses if any
@@ -2727,6 +2732,9 @@ ${b}Single-commit assumption:${r}
 
 ${b}Configuration:${r}
   git config stack.prefix <prefix>/
+  git config stack.namespace <root>  ${d}# prepend <root>/ to prefixes you type in
+                                       \`create\`/\`rename\` (e.g. eft); lead with
+                                       / to escape it for one stack${r}
   git config stack.base <branch>     ${d}# parent branch for \`list\` (default:
                                        init.defaultBranch, then main, then master)${r}
   git config stack.<prefix>.base <branch>  ${d}# per-stack base override, set by
@@ -3877,6 +3885,8 @@ cmd_rename() {
     esac
   done
   [[ -n "$new_pfx" ]] || die "usage: git stack rename <new-prefix> [--dry-run] [--no-history] [--no-push]"
+  _expand_prefix "$new_pfx" new_pfx || die "rename: $_VALIDATE_MSG"
+  [[ -n "$new_pfx" ]] || die "rename: new prefix is empty"
 
   require_in_repo
   require_clean_tree
@@ -3988,7 +3998,7 @@ cmd_rename() {
   # The phase's trailing `pr sync` is suppressed unconditionally (ADR 0013):
   # republishing is an explicit `pr sync`, never a side effect. The remote
   # rename itself stays — unlike a reordered branch, a renamed prefix's stale
-  # remotes land in a namespace `clean` never scans, so nothing else would ever
+  # remotes land under a prefix `clean` never scans, so nothing else would ever
   # reap them. The guard above guarantees no open head PR is present for the
   # rename to close, which is what makes dropping the sync safe here.
   if (( ! OPT_NO_PUSH )); then
@@ -4203,6 +4213,56 @@ _validate_slug() {
 # prefix argument (no trailing slash required). Returns 0 if valid; else sets
 # _VALIDATE_MSG and returns 1. Does NOT check emptiness-of-stack (that needs a
 # repo + ref scan) — cmd_create does that separately.
+# The configured namespace root (git config stack.namespace), normalized with
+# no surrounding slashes. Empty when unset — the signal for "no namespacing".
+_namespace_root() {
+  local ns
+  ns=$(git config --get stack.namespace 2>/dev/null || true)
+  ns="${ns#/}"; ns="${ns%/}"
+  printf '%s\n' "$ns"
+}
+
+# Expand a human-typed prefix under the configured namespace (ADR 0020) into
+# <out_var>, so a user who roots every stack under e.g. `eft/` types only the
+# stack name. Only call on values a human typed (create/rename args + prompts) —
+# never on auto-detected or config-stored prefixes, which are already full.
+#   - No namespace set        → identity.
+#   - Leading "/"             → absolute escape: strip the slash, skip the
+#                               namespace (the explicit way to root a stack
+#                               outside it, incl. AT the root itself: `/eft`).
+#   - Typed value == the root → reject: names no stack under the root. Returns 1
+#                               with _VALIDATE_MSG set (mirrors _validate_prefix's
+#                               return-not-die contract); callers re-prompt/die.
+#   - Already under the root  → identity (idempotent; no eft/eft/… doubling).
+#   - Otherwise               → "<root>/<typed>".
+# Empty <typed> passes through unchanged for _validate_prefix to reject generically.
+_expand_prefix() {
+  local _typed="$1" _out="$2"
+  _VALIDATE_MSG=""
+  # No namespace (or empty input) → identity, so behavior is unchanged when the
+  # feature is off; a leading "/" then stays untouched for _validate_prefix to
+  # reject as before. The escape and root rules below apply only under a namespace.
+  local _ns
+  _ns=$(_namespace_root)
+  if [[ -z "$_ns" || -z "$_typed" ]]; then
+    printf -v "$_out" '%s' "$_typed"
+    return 0
+  fi
+  if [[ "$_typed" == /* ]]; then
+    printf -v "$_out" '%s' "${_typed#/}"
+    return 0
+  fi
+  if [[ "$_typed" == "$_ns" || "$_typed" == "$_ns/" ]]; then
+    _VALIDATE_MSG="'$_ns' is just the namespace root; type a stack name under it, or lead with / to root a stack at '$_ns'"
+    return 1
+  fi
+  if [[ "$_typed" == "$_ns/"* ]]; then
+    printf -v "$_out" '%s' "$_typed"
+    return 0
+  fi
+  printf -v "$_out" '%s' "${_ns}/${_typed}"
+}
+
 _validate_prefix() {
   local p="${1%/}"
   _VALIDATE_MSG=""
@@ -4897,6 +4957,7 @@ cmd_create() {
   # Values passed as arguments hard-fail on bad input (non-interactive contract
   # preserved); missing values are prompted later on a TTY, else a usage die.
   if [[ -n "$prefix_arg" ]]; then
+    _expand_prefix "$prefix_arg" prefix_arg || die "create: $_VALIDATE_MSG"
     _validate_prefix "$prefix_arg" || die "create: $_VALIDATE_MSG"
   elif (( ! have_tty )); then
     die "usage: git stack create <prefix> <slug> [--onto <ref>] [--stash]"
@@ -4959,10 +5020,18 @@ cmd_create() {
     (( ${#branches[@]} == 0 )) \
       || die "create: stack '$prefix' already has ${#branches[@]} branch(es); use 'git stack add <slug>' ${C_DIM}[gstkad]${C_RESET} to add to it"
   else
-    local _prev=""
+    # Prefill the namespace root (if any) so the user extends it rather than
+    # retyping it; _expand_prefix below still handles the no-prefill cases.
+    local _prev="" _ns="" _typed=""
+    _ns=$(_namespace_root)
+    [[ -n "$_ns" ]] && _prev="${_ns}/"
     while :; do
-      _prompt_prefill "prefix:" "$_prev" prefix_arg || die "create: aborted"
-      _prev="$prefix_arg"
+      _prompt_prefill "prefix:" "$_prev" _typed || die "create: aborted"
+      _prev="$_typed"
+      if ! _expand_prefix "$_typed" prefix_arg; then
+        printf '  %s\n' "$_VALIDATE_MSG" >&2
+        continue
+      fi
       if ! _validate_prefix "$prefix_arg"; then
         printf '  %s\n' "$_VALIDATE_MSG" >&2
         continue
@@ -6863,7 +6932,7 @@ cmd_doctor() {
   #
   # No remote tail: doctor is fully local (ADR 0017). Its renumbered branches
   # leave their stale remotes under the same prefix, where `clean` reaps
-  # them — so unlike `rename`, which moves refs into a namespace `clean` never
+  # them — so unlike `rename`, which moves refs under a prefix `clean` never
   # scans, doctor has no litter of its own to collect. Empty rename pairs are
   # what keep _doctor_finish (shared with fold) from appending remote-sync.
 
