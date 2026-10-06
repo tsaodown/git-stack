@@ -4215,24 +4215,23 @@ _validate_prefix() {
 #
 #   _prompt_prefill <label> <prev_value> <out_var>
 #
-# On bash 4+ the prior value is pre-filled on the input line (readline `-i`) and
-# the prompt is handed to readline itself (`read -p`), so the user edits rather
-# than retypes. On bash 3.2 (no `read -i`) it degrades to a printf'd prompt on a
-# blank line whose label already carries the rejected value + reason, so the
-# information isn't lost — only the in-place edit is. Returns non-zero on EOF
-# (Ctrl-D) so callers can abort; the read value lands in <out_var>.
+# Readline always owns the prompt (via `read -e -p`), so the line editor is live
+# — arrow-key navigation, kill/yank, history — on both bash 3.2 and 4+. Only the
+# in-place prefill of the prior value (`read -i`) needs bash 4+; on 3.2 the entry
+# starts empty, with the rejected value + reason still carried in the label so
+# the information isn't lost. Returns non-zero on EOF (Ctrl-D) so callers can
+# abort; the read value lands in <out_var>.
 _prompt_prefill() {
   local label="$1" prev="$2" out="$3" reply=""
+  # Readline must own the prompt: printing it separately leaves readline thinking
+  # the line starts at column 0, so editing back to empty redraws over the prompt
+  # and erases it. Wrap the color escapes in \001/\002 so readline counts only
+  # the visible width.
+  local rlp=$'\001'"$C_DIM"$'\002'"$label"$'\001'"$C_RESET"$'\002'' '
   if (( BASH_VERSINFO[0] >= 4 )) && [[ -n "$prev" ]]; then
-    # Readline must own the prompt: printing it separately leaves readline
-    # thinking the line starts at column 0, so deleting the prefill to empty
-    # redraws over the prompt and erases it. Wrap the color escapes in
-    # \001/\002 so readline counts only the visible width.
-    local rlp=$'\001'"$C_DIM"$'\002'"$label"$'\001'"$C_RESET"$'\002'' '
     read -e -p "$rlp" -i "$prev" -r reply < /dev/tty || return 1
   else
-    printf '%s%s%s ' "$C_DIM" "$label" "$C_RESET" >&2
-    read -r reply < /dev/tty || return 1
+    read -e -p "$rlp" -r reply < /dev/tty || return 1
   fi
   printf -v "$out" '%s' "$reply"
 }
@@ -5598,11 +5597,8 @@ _doctor_resolve_duplicate_group() {
     done
     local example="" k
     for ((k = 1; k <= n; k++)); do example="${example:+$example }$k"; done
-    printf '  %snew order (space/comma-separated, e.g. "%s"), RET=keep, q=quit:%s ' \
-      "$C_DIM" "$example" "$C_RESET" >&2
-
     local input
-    if ! read -r input < /dev/tty; then
+    if ! _prompt_prefill "  new order (space/comma-separated, e.g. \"${example}\"), RET=keep, q=quit:" "" input; then
       return 0
     fi
 
@@ -6008,8 +6004,7 @@ fold: no <branch> given and HEAD is detached"
   if (( ! opt_yes && ! opt_dry_run )) && [[ -z "$opt_slug" && -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
     local _cur_slug="${victim##*/}"; _cur_slug="${_cur_slug#*-}"
     local _entered=""
-    printf '%sresult slug [%s]:%s ' "$C_DIM" "$_cur_slug" "$C_RESET" >&2
-    if read -r _entered < /dev/tty && [[ -n "$_entered" ]]; then
+    if _prompt_prefill "result slug [${_cur_slug}]:" "" _entered && [[ -n "$_entered" ]]; then
       opt_slug="$_entered"
     fi
   fi
@@ -8028,12 +8023,9 @@ _pick_or_enter_leaf() {
       [[ -e /dev/tty ]] || return 1
       printf '%s\n' "$prompt" >&2
       printf '  suggested: %s\n' "${cands[*]}" >&2
-      if [[ -n "$default" ]]; then
-        printf '  enter a leaf [default %s]: ' "$default" >&2
-      else
-        printf '  enter a leaf: ' >&2
-      fi
-      read -r value < /dev/tty || return 1
+      local _leaf_label="  enter a leaf:"
+      [[ -n "$default" ]] && _leaf_label="  enter a leaf [default ${default}]:"
+      _prompt_prefill "$_leaf_label" "" value || return 1
     fi
     [[ -z "$value" && -n "$default" ]] && value="$default"
     if [[ -z "$value" ]]; then

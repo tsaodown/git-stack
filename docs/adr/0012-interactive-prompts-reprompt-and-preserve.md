@@ -33,8 +33,10 @@ contract is unchanged):
    `macos-latest`) there is no `read -i`, so it degrades to a blank re-prompt. No
    information is lost either way: the rejection reason is printed above the
    re-prompt, and for slug/leaf-clash failures that reason names the offending
-   value — only the in-place edit is unavailable on 3.2. Feature-detected on
-   `BASH_VERSINFO[0] >= 4`; one shared helper (`_prompt_prefill`).
+   value — only the in-place *prefill* is unavailable on 3.2. Feature-detected on
+   `BASH_VERSINFO[0] >= 4`; one shared helper (`_prompt_prefill`). Line editing
+   itself (arrow-key navigation, kill/yank) comes from `read -e -p` and works on
+   every bash version — see the 2026-10-05 amendment.
 
 3. **Cancel is Ctrl-C or Ctrl-D** (EOF → `read` returns non-zero → clean
    `aborted`). Empty input re-prompts (it fails validation). No max-retry cap.
@@ -69,3 +71,14 @@ mutation — so a Ctrl-C mid-prompt strands no stash.
   *after* `_load_stack_branches` — the one structural difference from `create`,
   whose empty-by-definition prefix has no such case. The argument and non-TTY paths
   still hard-fail via `_validate_slug`.
+
+## Amendment (2026-10-05) — line editing on every entry
+
+The original `_prompt_prefill` only reached readline (`read -e`) on the bash-4+
+prefill branch; the fallback branch (bash 3.2, *and* any bash-4+ entry with an
+empty `prev` — e.g. a first-time slug/prefix) used a plain `read`, which has no
+line editor, so arrow keys inserted raw `^[[D` escapes instead of moving the
+cursor. `read -e`/`-p` are available on bash 3.2 — only `-i` (prefill) needs
+bash 4+ — so the helper now always uses `read -e -p` and gates only `-i`. The
+other free-text prompts (fold result slug, the no-fzf leaf entry, the doctor
+reorder prompt) route through the same helper, so line editing is uniform.
