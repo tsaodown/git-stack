@@ -40,8 +40,9 @@ sits *above* every stack name, so `create feat auth` under `stack.namespace=eft`
 lands on `eft/feat/010-auth` without you retyping `eft/` (ADR 0020). Expansion
 is idempotent (an already-rooted `eft/feat` is left alone) and a leading `/`
 escapes it (`create /hotfix …` roots outside the namespace; `create /eft …` is
-the explicit way to root a stack *at* the root). Typing just the root (`eft`,
-`eft/`, or Enter on the prefilled prompt) names no stack under it and is refused.
+the explicit way to root a stack *at* the root). Typing just the root (`eft` or
+`eft/`) names no stack under it and is refused. The interactive prefix prompt
+shows the root as a label hint (`prefix (eft/):`) rather than prefilling it.
 Only typed prefixes are expanded — **create** and **rename** args/prompts; never
 auto-detected or stored prefixes, which are already full.
 

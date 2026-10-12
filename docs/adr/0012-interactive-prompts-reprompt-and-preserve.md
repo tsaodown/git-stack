@@ -82,3 +82,34 @@ cursor. `read -e`/`-p` are available on bash 3.2 — only `-i` (prefill) needs
 bash 4+ — so the helper now always uses `read -e -p` and gates only `-i`. The
 other free-text prompts (fold result slug, the no-fzf leaf entry, the doctor
 reorder prompt) route through the same helper, so line editing is uniform.
+
+## Amendment (2026-10-12) — Esc cancels; the namespace shows in the label
+
+Supersedes point 3 (cancel was Ctrl-C/Ctrl-D only). Esc now cancels an
+interactive prompt. `_prompt_prefill` binds Esc (emacs keymap) to clear the line
+and send EOF, so `read -e` returns non-zero and the caller aborts. It needs
+readline's `keyseq-timeout` to tell a lone Esc from an arrow-key prefix, which
+arrived in readline 6.3 / bash 4.3; on older readline (stock-macOS bash 3.2
+included) Esc stays inert and Ctrl-C/Ctrl-D remain the abort keys. Line editing
+and the prefill gate are unchanged.
+
+Every interactive read routes through `_prompt_prefill` so Esc behaves
+uniformly: the y/N confirms (`_confirm`, the create carry prompt, `_doctor_prompt`,
+the fold/drop confirms) and the no-fzf numbered pickers (`_pick_one`,
+`_pick_branch`) joined the free-text prompts already there. The carry prompt
+therefore now takes a line (Enter), not a single char. fzf pickers already
+canceled on Esc (exit 130).
+
+What Esc does per prompt:
+- **create / add / reslug / fold** (prefix, slug, result slug) and the **fold/drop
+  confirms** → abort the command (`… aborted`).
+- **doctor** per-item prompts → map to `q`, quitting the whole doctor run (every
+  prompt already offers `q`); the reorder prompt likewise quits.
+- **clean**'s remote-delete `_confirm` → declines that step (clean still reflows),
+  matching its prior EOF behavior.
+
+The create prefix prompt now **shows** the namespace root in its label —
+`prefix (eft/):` — instead of prefilling an editable `eft/` (the ADR 0020
+interplay). The hint is visible on every bash version (the prefill was bash-4+
+only), `_expand_prefix` still adds the root to what you type, and leading `/`
+still escapes it.

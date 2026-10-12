@@ -182,11 +182,8 @@ _carry_finish() {
 _prompt_carry_into_stack() {
   printf '%suncommitted changes:%s\n' "$C_DIM" "$C_RESET" >&2
   git status --short --untracked-files=no >&2
-  printf 'carry these into the new stack? %s[y/N]%s ' \
-    "$C_DIM" "$C_RESET" >&2
   local ans=""
-  read -r -n 1 ans < /dev/tty || { echo >&2; return 1; }
-  echo >&2
+  _prompt_prefill "carry these into the new stack? [y/N]" "" ans || return 1
   [[ "$ans" == y || "$ans" == Y ]]
 }
 
@@ -2349,8 +2346,8 @@ If ${fl}stack.namespace${r} is set, <prefix> is prepended with that root (e.g. \
 you type only the stack name; lead with / to root one stack outside it.
 
 On a TTY, a missing <prefix> or <slug> is prompted for (re-prompts on invalid
-input, keeping what you typed; the prefix prompt prefills the namespace); off a
-TTY it's a usage error. A dirty tree
+input, keeping what you typed; the prefix prompt shows the namespace; Esc
+cancels); off a TTY it's a usage error. A dirty tree
 prompts to carry the uncommitted work into the new stack; ${fl}--stash${r} carries it
 without prompting (required to carry non-interactively).
 EOF
@@ -3470,9 +3467,8 @@ _warn_duplicate_leaves() {
 _confirm() {
   local prompt="$1"
   [[ -e /dev/tty ]] || return 1
-  printf '%s%s [y/N]%s ' "$C_DIM" "$prompt" "$C_RESET" >&2
-  local ans
-  read -r ans < /dev/tty || return 1
+  local ans=""
+  _prompt_prefill "$prompt [y/N]" "" ans || return 1
   ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')
   [[ "${ans:0:1}" == "y" ]]
 }
@@ -4277,8 +4273,19 @@ _validate_prefix() {
   return 0
 }
 
-# Prompt for a single required value on /dev/tty, re-editing a rejected prior
-# entry in place where the shell supports it.
+# Bind Esc to abort a `read -e` line: jump to start, kill to end, send EOF so
+# `read` returns non-zero. Needs readline's keyseq-timeout (bash 4.3+) to tell a
+# lone Esc from an arrow-key prefix; older readline leaves Esc inert, so Ctrl-C/
+# Ctrl-D stay the abort keys there. Emacs keymap only, so a vi inputrc is safe.
+_bind_esc_cancel() {
+  (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )) \
+    || return 0
+  bind -m emacs '"\e": "\C-a\C-k\C-d"' 2>/dev/null || true
+}
+
+# Prompt for a line of input on /dev/tty, re-editing a rejected prior entry in
+# place where the shell supports it. Shared by the free-text prompts and the
+# y/N confirms and numbered pickers, so Esc cancels them uniformly.
 #
 #   _prompt_prefill <label> <prev_value> <out_var>
 #
@@ -4286,10 +4293,11 @@ _validate_prefix() {
 # — arrow-key navigation, kill/yank, history — on both bash 3.2 and 4+. Only the
 # in-place prefill of the prior value (`read -i`) needs bash 4+; on 3.2 the entry
 # starts empty, with the rejected value + reason still carried in the label so
-# the information isn't lost. Returns non-zero on EOF (Ctrl-D) so callers can
-# abort; the read value lands in <out_var>.
+# the information isn't lost. Returns non-zero on cancel (Esc where supported,
+# else Ctrl-D/EOF) so callers can abort; the read value lands in <out_var>.
 _prompt_prefill() {
   local label="$1" prev="$2" out="$3" reply=""
+  _bind_esc_cancel
   # Readline must own the prompt: printing it separately leaves readline thinking
   # the line starts at column 0, so editing back to empty redraws over the prompt
   # and erases it. Wrap the color escapes in \001/\002 so readline counts only
@@ -5020,13 +5028,13 @@ cmd_create() {
     (( ${#branches[@]} == 0 )) \
       || die "create: stack '$prefix' already has ${#branches[@]} branch(es); use 'git stack add <slug>' ${C_DIM}[gstkad]${C_RESET} to add to it"
   else
-    # Prefill the namespace root (if any) so the user extends it rather than
-    # retyping it; _expand_prefix below still handles the no-prefill cases.
-    local _prev="" _ns="" _typed=""
+    # Show the namespace root (if any) in the label so the user types just the
+    # stack name; _expand_prefix adds the root (lead with / to escape it).
+    local _prev="" _ns="" _typed="" _label="prefix:"
     _ns=$(_namespace_root)
-    [[ -n "$_ns" ]] && _prev="${_ns}/"
+    [[ -n "$_ns" ]] && _label="prefix (${_ns}/):"
     while :; do
-      _prompt_prefill "prefix:" "$_prev" _typed || die "create: aborted"
+      _prompt_prefill "$_label" "$_prev" _typed || die "create: aborted"
       _prev="$_typed"
       if ! _expand_prefix "$_typed" prefix_arg; then
         printf '  %s\n' "$_VALIDATE_MSG" >&2
@@ -5039,7 +5047,7 @@ cmd_create() {
       prefix="${prefix_arg%/}/"
       _load_stack_branches "$prefix" branches
       if (( ${#branches[@]} != 0 )); then
-        printf "  stack '%s' already has %d branch(es); pick another prefix (Ctrl-C to cancel and use 'add')\n" \
+        printf "  stack '%s' already has %d branch(es); pick another prefix (Esc to cancel and use 'add')\n" \
           "$prefix" "${#branches[@]}" >&2
         continue
       fi
@@ -5675,7 +5683,7 @@ _doctor_resolve_duplicate_group() {
     for ((k = 1; k <= n; k++)); do example="${example:+$example }$k"; done
     local input
     if ! _prompt_prefill "  new order (space/comma-separated, e.g. \"${example}\"), RET=keep, q=quit:" "" input; then
-      return 0
+      return 1
     fi
 
     if [[ -z "${input// /}" ]]; then
@@ -5895,15 +5903,15 @@ _doctor_delete_branch() {
   git update-ref -d "refs/heads/$b"
 }
 
-# Read one char from /dev/tty, lowercase it, echo to stdout. Empty string on
-# bare RET. Returns 1 if /dev/tty isn't readable.
+# Prompt on /dev/tty, lowercase the reply, echo its first char to stdout. Empty
+# string on bare RET. Returns 1 if /dev/tty isn't readable. Esc cancels to `q`
+# so it quits the doctor run (the prompts all offer q).
 # Usage: _doctor_prompt <prompt-string>
 _doctor_prompt() {
   local prompt="$1"
   [[ -e /dev/tty ]] || return 1
-  printf '%s%s%s' "$C_DIM" "$prompt" "$C_RESET" >&2
-  local ans
-  read -r ans < /dev/tty || return 1
+  local ans=""
+  _prompt_prefill "$prompt" "" ans || { printf 'q\n'; return 0; }
   # Portable lowercase (bash 3.2 on macOS lacks ${var,,}).
   ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')
   ans="${ans:0:1}"
@@ -6080,9 +6088,8 @@ fold: no <branch> given and HEAD is detached"
   if (( ! opt_yes && ! opt_dry_run )) && [[ -z "$opt_slug" && -e /dev/tty && ( -t 0 || -t 2 ) ]]; then
     local _cur_slug="${victim##*/}"; _cur_slug="${_cur_slug#*-}"
     local _entered=""
-    if _prompt_prefill "result slug [${_cur_slug}]:" "" _entered && [[ -n "$_entered" ]]; then
-      opt_slug="$_entered"
-    fi
+    _prompt_prefill "result slug [${_cur_slug}]:" "" _entered || die "fold: aborted"
+    [[ -n "$_entered" ]] && opt_slug="$_entered"
   fi
 
   # Resolve the result branch name (leaf + slug). The result keeps the survivor's
@@ -6181,18 +6188,18 @@ fold: no <branch> given and HEAD is detached"
       # and re-dim after, so the names genuinely stand out.
       local _hl="${C_RESET}${C_BOLD}${C_CYAN}" _fr="${C_RESET}${C_DIM}"
       if [[ "$new_survivor" != "$survivor" ]]; then
-        printf '%sfold %s%s%s\n  into %s%s%s\n  → result %s%s%s (deletes both originals). proceed?%s [Y/n] ' \
+        printf '%sfold %s%s%s\n  into %s%s%s\n  → result %s%s%s (deletes both originals).%s\n' \
           "$C_DIM" "$_hl" "$_v" "$_fr" \
           "$_hl" "$_s" "$_fr" \
           "$_hl" "$_r" "$_fr" "$C_RESET" >&2
       else
-        printf '%sfold %s%s%s\n  into %s%s%s (deletes %s%s%s). proceed?%s [Y/n] ' \
+        printf '%sfold %s%s%s\n  into %s%s%s (deletes %s%s%s).%s\n' \
           "$C_DIM" "$_hl" "$_v" "$_fr" \
           "$_hl" "$_s" "$_fr" \
           "$_hl" "$_v" "$_fr" "$C_RESET" >&2
       fi
-      local _ans
-      read -r _ans < /dev/tty || die "fold: aborted"
+      local _ans=""
+      _prompt_prefill "proceed? [Y/n]" "" _ans || die "fold: aborted"
       _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')
       [[ "${_ans:0:1}" == "n" ]] && die "fold: aborted"
     else
@@ -6374,14 +6381,14 @@ drop: no <branch> given and HEAD is detached"
       local _v="${victim#"$prefix"}" _p="${pred_label#"$prefix"}"
       local _hl="${C_RESET}${C_BOLD}${C_CYAN}" _fr="${C_RESET}${C_DIM}"
       if (( n_children > 0 )); then
-        printf '%sdrop %s%s%s\n  discards its work; reflow %d child(ren) onto %s%s%s. proceed?%s [Y/n] ' \
+        printf '%sdrop %s%s%s\n  discards its work; reflow %d child(ren) onto %s%s%s.%s\n' \
           "$C_DIM" "$_hl" "$_v" "$_fr" "$n_children" "$_hl" "$_p" "$_fr" "$C_RESET" >&2
       else
-        printf '%sdrop %s%s%s\n  discards its work (pure delete). proceed?%s [Y/n] ' \
+        printf '%sdrop %s%s%s\n  discards its work (pure delete).%s\n' \
           "$C_DIM" "$_hl" "$_v" "$_fr" "$C_RESET" >&2
       fi
-      local _ans
-      read -r _ans < /dev/tty || die "drop: aborted"
+      local _ans=""
+      _prompt_prefill "proceed? [Y/n]" "" _ans || die "drop: aborted"
       _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')
       [[ "${_ans:0:1}" == "n" ]] && die "drop: aborted"
     else
@@ -8073,9 +8080,8 @@ _pick_one() {
     printf '  %2d) %s\n' "$i" "$opt" >&2
     i=$((i + 1))
   done
-  printf 'pick [1-%d]: ' "$#" >&2
-  local n
-  read -r n < /dev/tty || return 1
+  local n=""
+  _prompt_prefill "pick [1-$#]:" "" n || return 1
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )) || return 1
   printf '%s\n' "${!n}"
 }
@@ -8185,9 +8191,8 @@ _pick_branch() {
     fi
     i=$((i + 1))
   done
-  printf 'pick [1-%d]: ' "$#" >&2
-  local n
-  read -r n < /dev/tty || return 1
+  local n=""
+  _prompt_prefill "pick [1-$#]:" "" n || return 1
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )) || return 1
   printf '%s\n' "${!n}"
 }
